@@ -1,0 +1,58 @@
+name: Fetch and Scan Top 100 Repositories
+
+on:
+  workflow_dispatch:
+    inputs:
+      language:
+        description: "Language to fetch repositories for"
+        required: true
+        default: "C++"
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    outputs:
+      repo_list: ${{ steps.collect.outputs.repo_list }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.10
+
+      - name: Fetch Top 100 Repositories
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LANGUAGE: ${{ github.event.inputs.language }}
+        run: |
+          python scripts/fetch_top_repos.py
+
+      - id: collect
+        run: |
+          repos=$(cat output/top_repos.json | jq -c '.')
+          echo "repo_list=$repos" >> $GITHUB_OUTPUT
+
+  trigger:
+    needs: fetch
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo: ${{ fromJson(needs.fetch.outputs.repo_list) }}
+
+    steps:
+      - name: Trigger Conan+Trivy Workflow
+        uses: peter-evans/workflow-dispatch@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          workflow: main.yml
+          ref: main
+          inputs:
+            src_repository: ${{ matrix.repo }}
+            src_branch: main
+            conan_repository: Noddy03/Conan_Trivy_full_SBOM_scan
+            conan_branch: main
+            src_type: c++
