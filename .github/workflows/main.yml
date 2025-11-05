@@ -42,49 +42,38 @@ jobs:
           do 
              echo "TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')" >> $GITHUB_ENV
             echo "Timestamp initialized at $TIMESTAMP"
-            - name: Setup Python 3.10
-              uses: actions/setup-python@v4
-              with:
-              python-version: '3.10'
-
-            - name: Setup Node.js 20
-              uses: actions/setup-node@v3
-               with:
-                node-version: '20'
-            - name: Checkout source repository
-              uses: actions/checkout@v4
-              with:
+           uses: actions/setup-python@v4
+           with:
+           python-version: '3.10'
+           uses: actions/setup-node@v3
+           with:
+              node-version: '20'
+           uses: actions/checkout@v4
+           with:
                 repository: ${{ inputs.src_repository }}
                 ref: ${{ inputs.src_branch }}
                 path: project-src
-
-            - name: Checkout Conan repository
-              uses: actions/checkout@v4
-              with:
+           uses: actions/checkout@v4
+            with:
                 repository: ${{ inputs.conan_repository }}
                 ref: ${{ inputs.conan_branch }}
                 path: conan-src
-            - name: Install Conan and dependencies
-              run: |
+            run: |
                 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Installing Conan..."
                 python -m pip install --upgrade pip
                 pip install conan
                 conan profile detect --force
-                
-             - name: Generate Conan lockfile
-                run: |
+          
+            run: |
                   echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Generating Conan lockfile..."
                   conan lock create conanfile.py --lockfile-out=conan.lock
                   working-directory: conan-src
-
-            - name: Copy Conan lockfile to source directory
-               run: |
+            run: |
                   echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Copying Conan lockfile..."
                   cp conan-src/conan.lock project-src/conan.lock
                   
-            - name: Run Trivy SBOM generation and vulnerability scan
-              uses: aquasecurity/trivy-action@master
-              with:
+          uses: aquasecurity/trivy-action@master
+           with:
                 scan-type: fs
                 scan-ref: ./project-src
                 format: cyclonedx
@@ -93,45 +82,35 @@ jobs:
                 ignore-unfixed: true
                 vuln-type: os,library
                 severity: CRITICAL,HIGH,MEDIUM
-                
-            - name: Compliance SBOM NTIA
-              run: |
-                  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running compliance check..."
-                    docker run --rm \
-                    -v $PWD/project-src:/project-src \
-                  ghcr.io/interlynk-io/sbomqs:latest compliance \
-                  --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+          run: |
+              echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running compliance check..."
+              docker run --rm \
+               -v $PWD/project-src:/project-src \
+               ghcr.io/interlynk-io/sbomqs:latest compliance \
+               --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
 
-            - name: Compliance SBOM
-              run: |
-                  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running BSI TR-03183-2 v2 compliance check..."
-                  docker run --rm \
-                  -v $PWD/project-src:/project-src \
-                  ghcr.io/interlynk-io/sbomqs:latest compliance \
-                   --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
-                   
-                - name: Score SBOM
-                  run: |
-                  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Scoring SBOM..."
-                  docker run --rm \
-                    -v $PWD/project-src:/project-src \
-                    ghcr.io/interlynk-io/sbomqs:latest score \
-                  /project-src/trivy-report.json --json > project-src/score_evaluation.json
-
-              - name: Sanitize artifact name
-                id: sanitize
-                  run: |
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Sanitizing artifact name..."
-                      SAFE_NAME="${{ inputs.src_repository }}"
-                      SAFE_NAME="${SAFE_NAME//\//_}"
-                    echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
-
-            - name: Upload SBOM reports
-              uses: actions/upload-artifact@v4
-              with:
+          run: |
+               echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running BSI TR-03183-2 v2 compliance check..."
+               docker run --rm \
+               -v $PWD/project-src:/project-src \
+               ghcr.io/interlynk-io/sbomqs:latest compliance \
+                --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
+          run: |
+                echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Scoring SBOM..."
+                 docker run --rm \
+                 -v $PWD/project-src:/project-src \
+                 ghcr.io/interlynk-io/sbomqs:latest score \
+                 /project-src/trivy-report.json --json > project-src/score_evaluation.json
+           run: |
+                 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Sanitizing artifact name..."
+                 SAFE_NAME="${{ inputs.src_repository }}"
+                 SAFE_NAME="${SAFE_NAME//\//_}"
+                 echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
+          uses: actions/upload-artifact@v4
+           with:
               name: sbom-reports-${{ steps.sanitize.outputs.name }}
               path: project-src/*.json
               if-no-files-found: warn
 
-              i+=1
-              done 
+          i+=1
+          done 
