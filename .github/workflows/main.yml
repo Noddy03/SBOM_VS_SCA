@@ -1,4 +1,4 @@
-name: TEST array sequential 
+name: Conan + Trivy Full SBOM Scan
 
 on:
   workflow_dispatch:
@@ -31,86 +31,143 @@ jobs:
       security-events: write
       actions: read
 
-    steps:       
+    steps:
       # -----------------------------
       # TIMESTAMP FUNCTION
       # -----------------------------
-      - name: test sequential recursion
-        id: recurision 
-        run: | 
-          for i in 3 
-          do 
-             echo "TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')" >> $GITHUB_ENV
-            echo "Timestamp initialized at $TIMESTAMP"
-           uses: actions/setup-python@v4
-           with:
-           python-version: '3.10'
-           uses: actions/setup-node@v3
-           with:
-              node-version: '20'
-           uses: actions/checkout@v4
-           with:
-                repository: ${{ inputs.src_repository }}
-                ref: ${{ inputs.src_branch }}
-                path: project-src
-           uses: actions/checkout@v4
-            with:
-                repository: ${{ inputs.conan_repository }}
-                ref: ${{ inputs.conan_branch }}
-                path: conan-src
-            run: |
-                echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Installing Conan..."
-                python -m pip install --upgrade pip
-                pip install conan
-                conan profile detect --force
-          
-            run: |
-                  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Generating Conan lockfile..."
-                  conan lock create conanfile.py --lockfile-out=conan.lock
-                  working-directory: conan-src
-            run: |
-                  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Copying Conan lockfile..."
-                  cp conan-src/conan.lock project-src/conan.lock
-                  
-          uses: aquasecurity/trivy-action@master
-           with:
-                scan-type: fs
-                scan-ref: ./project-src
-                format: cyclonedx
-                scanners: vuln
-                output: project-src/trivy-report.json
-                ignore-unfixed: true
-                vuln-type: os,library
-                severity: CRITICAL,HIGH,MEDIUM
-          run: |
-              echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running compliance check..."
-              docker run --rm \
-               -v $PWD/project-src:/project-src \
-               ghcr.io/interlynk-io/sbomqs:latest compliance \
-               --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+      - name: Define timestamp function
+        id: timestamp
+        run: |
+          echo "TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')" >> $GITHUB_ENV
+          echo "Timestamp initialized at $TIMESTAMP"
 
-          run: |
-               echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running BSI TR-03183-2 v2 compliance check..."
-               docker run --rm \
-               -v $PWD/project-src:/project-src \
-               ghcr.io/interlynk-io/sbomqs:latest compliance \
-                --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
-          run: |
-                echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Scoring SBOM..."
-                 docker run --rm \
-                 -v $PWD/project-src:/project-src \
-                 ghcr.io/interlynk-io/sbomqs:latest score \
-                 /project-src/trivy-report.json --json > project-src/score_evaluation.json
-           run: |
-                 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Sanitizing artifact name..."
-                 SAFE_NAME="${{ inputs.src_repository }}"
-                 SAFE_NAME="${SAFE_NAME//\//_}"
-                 echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
-          uses: actions/upload-artifact@v4
-           with:
-              name: sbom-reports-${{ steps.sanitize.outputs.name }}
-              path: project-src/*.json
-              if-no-files-found: warn
+      # -----------------------------
+      # SETUP ENVIRONMENT
+      # -----------------------------
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-          i+=1
-          done 
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v3
+        with:
+                node-version: '20'
+
+      # -----------------------------
+      # CHECKOUT REPOSITORIES
+      # -----------------------------
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.src_repository }}
+          ref: ${{ inputs.src_branch }}
+          path: project-src
+
+      - name: Checkout Conan repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.conan_repository }}
+          ref: ${{ inputs.conan_branch }}
+          path: conan-src
+
+      # -----------------------------
+      # INSTALL DEPENDENCIES
+      # -----------------------------
+      - name: Install Conan and dependencies
+        run: |
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Installing Conan..."
+          python -m pip install --upgrade pip
+          pip install conan
+          conan profile detect --force
+
+      # -----------------------------
+      # GENERATE CONAN LOCKFILE
+      # -----------------------------
+      - name: Generate Conan lockfile
+        run: |
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Generating Conan lockfile..."
+          conan lock create conanfile.py --lockfile-out=conan.lock
+        working-directory: conan-src
+
+      - name: Copy Conan lockfile to source directory
+        run: |
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Copying Conan lockfile..."
+          cp conan-src/conan.lock project-src/conan.lock
+
+      # -----------------------------
+      # GENERATE SBOM & SCAN WITH TRIVY
+      # -----------------------------
+      - name: Run Trivy SBOM generation and vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: ./project-src
+          format: cyclonedx
+          scanners: vuln
+          output: project-src/trivy-report.json
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH,MEDIUM
+
+      # -----------------------------
+      # COMPLIANCE & SCORING (SBOMQS)
+      # -----------------------------
+      - name: Compliance SBOM NTIA
+        run: |
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running compliance check..."
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+
+      - name: Compliance SBOM (BSI TR-03183-2 v2)
+        run: |
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running BSI TR-03183-2 v2 compliance check..."
+            docker run --rm \
+              -v $PWD/project-src:/project-src \
+              ghcr.io/interlynk-io/sbomqs:latest compliance \
+             --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
+
+
+      - name: Score SBOM
+        run: |
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Scoring SBOM..."
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest score \
+            /project-src/trivy-report.json --json > project-src/score_evaluation.json
+
+      # -----------------------------
+      # (OPTIONAL) GITHUB SECURITY TAB UPLOAD
+      # -----------------------------
+      - name: Generate SARIF report for GitHub Code Scanning
+        run: |
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Generating SARIF report..."
+          trivy fs --scanners vuln --format sarif -o project-src/trivy-results.sarif ./project-src
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: project-src/trivy-results.sarif
+
+      # -----------------------------
+      # SANITIZE ARTIFACT NAME
+      # -----------------------------
+      - name: Sanitize artifact name
+        id: sanitize
+        run: |
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Sanitizing artifact name..."
+          SAFE_NAME="${{ inputs.src_repository }}"
+          SAFE_NAME="${SAFE_NAME//\//_}"
+          echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
+
+      # -----------------------------
+      # UPLOAD ARTIFACTS
+      # -----------------------------
+      - name: Upload SBOM reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-reports-${{ steps.sanitize.outputs.name }}
+          path: project-src/*.json
+          if-no-files-found: warn
