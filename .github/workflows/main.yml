@@ -36,8 +36,10 @@ jobs:
       - name: testing array 
         id: array
         run: | 
-          for 1 in 3 
+          for i in 3 
           do  
+              i=0 
+              i++ 
               echo "prova" 
           done 
          
