@@ -29,7 +29,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests jq
 
       - name: Fetch Top 100 Repositories
         env:
@@ -43,24 +43,23 @@ jobs:
           repos=$(cat output/top_repos.json | jq -c '.')
           echo "repo_list=$repos" >> $GITHUB_OUTPUT
 
-# -----------------------------------------------------
-# TRIGGER MAIN SBOM SCAN WORKFLOW (via API)
-# -----------------------------------------------------
-trigger:
-  needs: fetch
-  runs-on: ubuntu-latest
-  strategy:
-    fail-fast: false
-    matrix:
-      repo: ${{ fromJson(needs.fetch.outputs.repo_list) }}
+  # -----------------------------------------------------
+  # TRIGGER MAIN SBOM SCAN WORKFLOW (via API)
+  # -----------------------------------------------------
+  trigger:
+    needs: fetch
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJson(needs.fetch.outputs.repo_list) }}
 
-  steps:
-    - name: Trigger Conan+Trivy Workflow via GitHub API
-      run: |
-        echo "Triggering workflow for repository: ${{ matrix.repo }}"
-        curl -X POST \
-          -H "Accept: application/vnd.github+json" \
-          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-          https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
-          -d '{"ref":"main","inputs":{"src_repository":"'"${{ matrix.repo }}"'","src_branch":"main","conan_repository":"Noddy03/Conan_Trivy_full_SBOM_scan","conan_branch":"main","src_type":"'"${{ github.event.inputs.language }}"'"}}}'
-
+    steps:
+      - name: Trigger Conan+Trivy Workflow via GitHub API
+        run: |
+          echo "Triggering workflow for repository: ${{ matrix.repo }}"
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
+            -d '{"ref":"main","inputs":{"src_repository":"'"${{ matrix.repo }}"'","src_branch":"main","conan_repository":"Noddy03/Conan_Trivy_full_SBOM_scan","conan_branch":"main","src_type":"'"${{ github.event.inputs.language }}"'"}}}'
