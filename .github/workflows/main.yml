@@ -102,7 +102,7 @@ jobs:
                   ghcr.io/interlynk-io/sbomqs:latest compliance \
                   --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
 
-            - name: Compliance SBOM (BSI TR-03183-2 v2)
+            - name: Compliance SBOM
               run: |
                   echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running BSI TR-03183-2 v2 compliance check..."
                   docker run --rm \
