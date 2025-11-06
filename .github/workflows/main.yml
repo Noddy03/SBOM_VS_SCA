@@ -1,4 +1,4 @@
-name: Fetch Top Repositories + Conan/Trivy SBOM Scan
+name: Fetch Top IoT C++ Repositories + Conan/Trivy SBOM Scan
 
 on:
   workflow_dispatch:
@@ -10,10 +10,10 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------
-  # 1. FETCH TOP REPOSITORIES
+  # 1. FETCH TOP IoT REPOSITORIES
   # ---------------------------------------------------------
   fetch_top_repos:
-    name: Fetch top 50 GitHub repositories
+    name: Fetch top 50 IoT GitHub repositories (C++)
     runs-on: ubuntu-latest
 
     outputs:
@@ -23,21 +23,23 @@ jobs:
       - name: Install jq (for JSON parsing)
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Fetch top 50 repositories
+      - name: Fetch top 50 IoT repositories (C++)
         id: fetch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Fetching top 50 repositories with >5000 stars..."
+          echo "Fetching top 50 IoT-related repositories written in C++..."
           REPOS=$(gh api /search/repositories \
             --method GET \
-            -F q="stars:>5000 language:C++ fork:false archived:false" \
+            -F q="IoT language:C++ fork:false archived:false" \
             -F sort=stars \
             -F order=desc \
             -F per_page=50 \
             --jq '.items[].full_name')
+          
           echo "Repositories fetched:"
           echo "$REPOS"
+          
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
