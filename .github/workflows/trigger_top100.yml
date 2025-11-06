@@ -47,46 +47,55 @@ jobs:
           path: output/top_public_repos.json
 
       # -----------------------------
-      # LOAD REPOS INTO SPACE-SEPARATED STRING
+      # LOAD REPOS INTO ARRAY SAFELY
       # -----------------------------
-      - name: Load repos into string
+      - name: Load repos into array
         id: load_repos
         run: |
-          REPOS=$(jq -r '.[]' output/top_public_repos.json | tr '\n' ' ')
-          echo "REPOS=$REPOS" >> $GITHUB_ENV
-          echo "Loaded repos: $REPOS"
+          mapfile -t repos_array < <(jq -r '.[]' output/top_public_repos.json)
+          echo "REPOS_ARRAY=${repos_array[*]}" >> $GITHUB_ENV
+          echo "Loaded ${#repos_array[@]} repositories"
 
       # -----------------------------
-      # TRIGGER WORKFLOW AND COLLECT ARTIFACTS
+      # TRIGGER WORKFLOW AND WAIT FOR COMPLETION
       # -----------------------------
       - name: Trigger SBOM workflow and collect artifacts
         run: |
           mkdir -p collected-artifacts
-          for repo in $REPOS; do
+          WORKFLOW_REPO="Noddy03/Conan_Trivy_full_SBOM_scan"  # <--- repo containing main.yml
+          WORKFLOW_NAME="Conan + Trivy Full SBOM Scan"
+
+          for repo in "${REPOS_ARRAY[@]}"; do
             echo "Triggering SBOM scan for $repo..."
-            
             # Trigger workflow
-            run_id=$(gh workflow run "Conan + Trivy Full SBOM Scan" \
+            run_info=$(gh workflow run "$WORKFLOW_NAME" \
+              --repo "$WORKFLOW_REPO" \
               --ref main \
               -f src_repository="$repo" \
               -f src_branch="main" \
               -f src_type="c++" \
-              -f conan_repository="Noddy03/Conan_Trivy_full_SBOM_scan" \
+              -f conan_repository="$WORKFLOW_REPO" \
               -f conan_branch="main" \
-              --json id | jq -r '.id')
-            
-            if [[ -z "$run_id" ]]; then
-              echo "Failed to trigger workflow for $repo"
+              --json id,html_url)
+
+            run_id=$(echo "$run_info" | jq -r '.id')
+            run_url=$(echo "$run_info" | jq -r '.html_url')
+
+            if [[ -z "$run_id" || "$run_id" == "null" ]]; then
+              echo "❌ Failed to trigger workflow for $repo"
+              echo "Response: $run_info"
               continue
             fi
-            
-            echo "Workflow triggered for $repo, run ID: $run_id"
-            
-            # Wait for workflow to finish
+
+            echo "✅ Workflow triggered for $repo, run ID: $run_id"
+            echo "View run: $run_url"
+
+            # Wait for workflow to complete
+            echo "⏳ Waiting for workflow $run_id to finish..."
             gh run watch "$run_id"
-            
-            # Download artifacts
-            echo "Downloading artifacts for $repo..."
+
+            # Download workflow artifacts
+            echo "📥 Downloading artifacts for $repo..."
             gh run download "$run_id" --dir "collected-artifacts/$repo"
 
             # Optional: throttle to avoid API limits
@@ -101,3 +110,4 @@ jobs:
         with:
           name: all-sbom-reports
           path: collected-artifacts
+          if-no-files-found: warn
