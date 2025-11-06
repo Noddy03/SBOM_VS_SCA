@@ -1,102 +1,71 @@
-name: Fetch, Trigger & Collect SBOMs
+name: Fetch, Trigger & Collect SBOM Scans
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 * * *"  # daily run, optional
 
 jobs:
   fetch_trigger_collect:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
     steps:
       # -----------------------------
-      # SETUP
+      # SETUP ENVIRONMENT
       # -----------------------------
-      - name: Setup Python and tools
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
+      - name: Checkout this workflow repository
+        uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl unzip
+      - name: Setup jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Setup GitHub CLI
+        uses: cli/cli-action@v2
 
       # -----------------------------
       # FETCH TOP PUBLIC REPOS
       # -----------------------------
-      - name: Fetch top public C++ repositories
+      - name: Fetch top public repos
         run: |
-          LANGUAGE="C++"
           mkdir -p output
-          curl -s -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/search/repositories?q=language:${LANGUAGE}&sort=stars&order=desc&per_page=100" \
-            | jq '[.items[] | select(.private == false) | .full_name]' > output/top_public_repos.json
-
-      - name: Read repos into array
-        id: set_output
-        run: |
-          repos=$(jq -c '.' output/top_public_repos.json)
-          echo "repo_count=$(jq length output/top_public_repos.json)" >> $GITHUB_OUTPUT
-          echo "repos=$repos" >> $GITHUB_OUTPUT
+          curl -s https://raw.githubusercontent.com/your-org/top_public_repos/main/top_public_repos.json \
+            -o output/top_public_repos.json
+          echo "Top repos fetched:"
+          cat output/top_public_repos.json
 
       # -----------------------------
-      # TRIGGER & WAIT SBOM SCAN
+      # TRIGGER SBOM SCAN WORKFLOW & COLLECT ARTIFACTS
       # -----------------------------
-      - name: Trigger and wait SBOM scans
-        run: |
-          repos_array=$(jq -r '.[]' output/top_public_repos.json)
-          for repo in $repos_array; do
-            echo "Triggering SBOM scan for $repo..."
-            
-            # Trigger workflow
-            run_id=$(gh workflow run "Conan + Trivy Full SBOM Scan" \
-              --repo $repo \
-              --ref main \
-              --field src_repository=$repo \
-              --field src_type=c++ \
-              --json | jq -r '.id')
-
-            echo "Workflow triggered, run ID: $run_id"
-
-            # Wait for workflow to finish
-            status="in_progress"
-            while [[ "$status" != "completed" ]]; do
-              sleep 15
-              status=$(gh run view $run_id --repo $repo --json status -q '.status')
-              echo "Waiting... current status: $status"
-            done
-
-            conclusion=$(gh run view $run_id --repo $repo --json conclusion -q '.conclusion')
-            echo "Workflow completed with conclusion: $conclusion"
-
-            if [[ "$conclusion" == "success" ]]; then
-              # -----------------------------
-              # COLLECT ARTIFACTS
-              # -----------------------------
-              echo "Collecting SBOM artifacts for $repo..."
-              safe_repo=$(echo "$repo" | tr '/' '_')
-              repo_folder="collected_sboms/$safe_repo"
-              mkdir -p "$repo_folder"
-
-              artifacts=$(gh run-artifacts list $run_id --repo $repo --json name,id | jq -r '.[] | "\(.id) \(.name)"')
-              echo "$artifacts" | while read artifact_id artifact_name; do
-                echo "Downloading artifact: $artifact_name"
-                gh run-artifacts download $artifact_id --repo $repo --dir "$repo_folder"
-              done
-            else
-              echo "Workflow failed for $repo, skipping artifact collection."
-            fi
-
-          done
+      - name: Trigger and collect SBOM scan workflow
         env:
-          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
+        run: |
+          # Read JSON array into Bash array
+          mapfile -t repos_array < <(jq -r '.[]' output/top_public_repos.json)
 
-      # -----------------------------
-      # UPLOAD ALL COLLECTED SBOMs
-      # -----------------------------
-      - name: Upload collected SBOMs
-        uses: actions/upload-artifact@v4
-        with:
-          name: all_sboms
-          path: collected_sboms/
+          mkdir -p collected_artifacts
+
+          for repo in "${repos_array[@]}"; do
+            echo "Triggering SBOM scan for $repo..."
+
+            # Trigger workflow and get run ID
+            run_id=$(gh workflow run "Conan + Trivy Full SBOM Scan" \
+              --ref main \
+              -f src_repository="$repo" \
+              -f src_branch="main" \
+              --json number \
+              | jq -r '.number')
+
+            echo "Triggered workflow run ID: $run_id for $repo"
+
+            # Wait for workflow to complete
+            echo "Waiting for workflow $run_id to complete..."
+            gh run wait $run_id
+
+            # Download artifacts
+            echo "Downloading artifacts for $repo..."
+            gh run download $run_id --dir collected_artifacts/"$(echo $repo | tr '/' '_')"
+
+            echo "Artifacts collected for $repo"
+          done
