@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        repo: [${{ fromJSON('["' + needs.fetch_top_repos.outputs.repo_list + '"]') }}]
+        repo: $[${{ fromJSON('["' + needs.fetch_top_repos.outputs.repo_list + '"]') }}]
     steps:
       # -----------------------------
       # TIMESTAMP
