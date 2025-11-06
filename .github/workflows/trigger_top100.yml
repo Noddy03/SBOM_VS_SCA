@@ -67,8 +67,7 @@ jobs:
 
           for repo in "${repos_array[@]}"; do
             echo "Triggering SBOM scan for $repo..."
-
-            # Create JSON payload for workflow inputs
+            
             json_input=$(jq -n \
               --arg src_repo "$repo" \
               --arg src_branch "main" \
@@ -76,14 +75,13 @@ jobs:
               --arg conan_repo "$WORKFLOW_REPO" \
               --arg conan_branch "main" \
               '{src_repository: $src_repo, src_branch: $src_branch, src_type: $src_type, conan_repository: $conan_repo, conan_branch: $conan_branch}')
-
-            # Trigger workflow in the correct repository
-            run_id=$(gh workflow run "$WORKFLOW_NAME" \
+            
+            # Trigger workflow via stdin JSON
+            run_id=$(echo "$json_input" | gh workflow run "$WORKFLOW_NAME" \
               --repo "$WORKFLOW_REPO" \
               --ref main \
-              --json <(echo "$json_input") \
               --json | jq -r '.id')
-
+            
             if [[ -z "$run_id" ]]; then
               echo "Failed to trigger workflow for $repo"
               continue
@@ -92,12 +90,12 @@ jobs:
             echo "Workflow triggered for $repo, run ID: $run_id"
 
             # Wait for workflow to complete
-            echo "Waiting for workflow $run_id to finish..."
             gh run watch "$run_id" --repo "$WORKFLOW_REPO"
 
             # Download workflow artifacts
             echo "Downloading artifacts for $repo..."
             gh run download "$run_id" --repo "$WORKFLOW_REPO" --dir "collected-artifacts/$repo"
+
             sleep 2
           done
 
