@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       conan_repository:
-        description: 'Repository containing conanfile.py'
+        description: 'Repository containing conanfile.py' 
         required: true
         default: 'Noddy03/Conan_Trivy_full_SBOM_scan'
       conan_branch:
@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        repo: $[${{ fromJSON('["' + needs.fetch_top_repos.outputs.repo_list + '"]') }}]
+        repo: ${{ fromJSON('["' + needs.fetch_top_repos.outputs.repo_list + '"]') }}
     steps:
       # -----------------------------
       # TIMESTAMP
