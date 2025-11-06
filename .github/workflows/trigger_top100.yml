@@ -47,24 +47,24 @@ jobs:
           path: output/top_public_repos.json
 
       # -----------------------------
-      # LOAD REPOS INTO ARRAY SAFELY
+      # LOAD REPOS INTO SPACE-SEPARATED STRING
       # -----------------------------
-      - name: Load repos into array
+      - name: Load repos into string
         id: load_repos
         run: |
-          mapfile -t repos_array < <(jq -r '.[]' output/top_public_repos.json)
-          echo "repos_array=${repos_array[*]}" >> $GITHUB_ENV
-          echo "Loaded ${#repos_array[@]} repositories"
+          REPOS=$(jq -r '.[]' output/top_public_repos.json | tr '\n' ' ')
+          echo "REPOS=$REPOS" >> $GITHUB_ENV
+          echo "Loaded repos: $REPOS"
 
       # -----------------------------
-      # TRIGGER WORKFLOW AND WAIT FOR COMPLETION
+      # TRIGGER WORKFLOW AND COLLECT ARTIFACTS
       # -----------------------------
       - name: Trigger SBOM workflow and collect artifacts
         run: |
           mkdir -p collected-artifacts
-          for repo in "${repos_array[@]}"; do
+          for repo in $REPOS; do
             echo "Triggering SBOM scan for $repo..."
-
+            
             # Trigger workflow
             run_id=$(gh workflow run "Conan + Trivy Full SBOM Scan" \
               --ref main \
@@ -73,24 +73,22 @@ jobs:
               -f src_type="c++" \
               -f conan_repository="Noddy03/Conan_Trivy_full_SBOM_scan" \
               -f conan_branch="main" \
-              --json id \
-              | jq -r '.id')
-
+              --json id | jq -r '.id')
+            
             if [[ -z "$run_id" ]]; then
               echo "Failed to trigger workflow for $repo"
               continue
             fi
-
+            
             echo "Workflow triggered for $repo, run ID: $run_id"
-
-            # Wait for workflow to complete
-            echo "Waiting for workflow $run_id to finish..."
+            
+            # Wait for workflow to finish
             gh run watch "$run_id"
-
-            # Download workflow artifacts
+            
+            # Download artifacts
             echo "Downloading artifacts for $repo..."
             gh run download "$run_id" --dir "collected-artifacts/$repo"
-            
+
             # Optional: throttle to avoid API limits
             sleep 2
           done
