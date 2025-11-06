@@ -1,10 +1,11 @@
 name: Collect SBOMs by Repository
 
 on:
+  workflow_dispatch:
   workflow_run:
     workflows: ["main.yml"]
-    types: 
-           - completed
+    types:
+      - completed
 
 jobs:
   collect:
@@ -12,6 +13,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq unzip curl
 
       - name: Setup Python
         uses: actions/setup-python@v4
@@ -23,38 +29,54 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests jq
 
+      - name: Wait for a few minutes (ensure all artifacts are available)
+        run: |
+          echo "Waiting 2 minutes to ensure all artifacts are fully uploaded..."
+          sleep 120
+
       - name: Collect SBOM artifacts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           mkdir -p collected_sboms
+          echo "Fetching workflow runs for main.yml"
 
-          # Get the last 200 workflow runs of main.yml (adjust if needed)
           runs=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/$REPO/actions/workflows/main.yml/runs?per_page=400 | jq -r '.workflow_runs[] | "\(.id) \(.head_repository.full_name)"')
+            https://api.github.com/repos/$REPO/actions/workflows/main.yml/runs?per_page=400 \
+            | jq -r '.workflow_runs[] | select(.status=="completed") | "\(.id) \(.head_repository.full_name)"')
+
+          if [ -z "$runs" ]; then
+            echo "⚠️ No completed runs found. Exiting."
+            exit 0
+          fi
 
           echo "$runs" | while read run_id repo_name; do
-            echo "Processing run $run_id for repo $repo_name"
+            [ -z "$run_id" ] && continue
+            echo "📦 Processing run $run_id for $repo_name"
 
-            # Create a folder for this repo
             safe_repo_name=$(echo "$repo_name" | tr '/' '_')
             repo_folder="collected_sboms/$safe_repo_name"
             mkdir -p "$repo_folder"
 
-            # Get artifacts for the workflow run
             artifacts=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              https://api.github.com/repos/$REPO/actions/runs/$run_id/artifacts | jq -r '.artifacts[] | "\(.id) \(.name)"')
+              https://api.github.com/repos/$REPO/actions/runs/$run_id/artifacts \
+              | jq -r '.artifacts[]? | "\(.id) \(.name)"')
+
+            if [ -z "$artifacts" ]; then
+              echo "⚠️ No artifacts for $repo_name"
+              continue
+            fi
 
             echo "$artifacts" | while read artifact_id artifact_name; do
-              echo "Downloading artifact $artifact_name ($artifact_id) into $repo_folder"
+              echo "⬇️ Downloading $artifact_name from $repo_name"
               curl -s -L -H "Authorization: token $GITHUB_TOKEN" \
                 -o temp.zip \
                 https://api.github.com/repos/$REPO/actions/artifacts/$artifact_id/zip
 
-              unzip -o temp.zip -d "$repo_folder"
+              unzip -o temp.zip -d "$repo_folder" >/dev/null
               rm temp.zip
             done
           done
