@@ -52,16 +52,17 @@ jobs:
       - name: Setup Node.js 20
         uses: actions/setup-node@v3
         with:
-                node-version: '20'
+          node-version: '20'
 
       # -----------------------------
-      # CHECKOUT REPOSITORIES
+      # CHECKOUT REPOSITORIES (with PAT)
       # -----------------------------
       - name: Checkout source repository
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.src_repository }}
           ref: ${{ inputs.src_branch }}
+          token: ${{ secrets.PERSONAL_TOKEN }}    # Use PAT here
           path: project-src
 
       - name: Checkout Conan repository
@@ -69,6 +70,7 @@ jobs:
         with:
           repository: ${{ inputs.conan_repository }}
           ref: ${{ inputs.conan_branch }}
+          token: ${{ secrets.PERSONAL_TOKEN }}    # Use PAT here
           path: conan-src
 
       # -----------------------------
@@ -115,7 +117,6 @@ jobs:
       # -----------------------------
       - name: Compliance SBOM NTIA
         run: |
-          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running compliance check..."
           docker run --rm \
             -v $PWD/project-src:/project-src \
             ghcr.io/interlynk-io/sbomqs:latest compliance \
@@ -123,16 +124,13 @@ jobs:
 
       - name: Compliance SBOM (BSI TR-03183-2 v2)
         run: |
-            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running BSI TR-03183-2 v2 compliance check..."
-            docker run --rm \
-              -v $PWD/project-src:/project-src \
-              ghcr.io/interlynk-io/sbomqs:latest compliance \
-             --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
-
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
 
       - name: Score SBOM
         run: |
-          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Scoring SBOM..."
           docker run --rm \
             -v $PWD/project-src:/project-src \
             ghcr.io/interlynk-io/sbomqs:latest score \
@@ -143,7 +141,6 @@ jobs:
       # -----------------------------
       - name: Generate SARIF report for GitHub Code Scanning
         run: |
-          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Generating SARIF report..."
           trivy fs --scanners vuln --format sarif -o project-src/trivy-results.sarif ./project-src
 
       - name: Upload SARIF to GitHub Security tab
@@ -157,7 +154,6 @@ jobs:
       - name: Sanitize artifact name
         id: sanitize
         run: |
-          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Sanitizing artifact name..."
           SAFE_NAME="${{ inputs.src_repository }}"
           SAFE_NAME="${SAFE_NAME//\//_}"
           echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
