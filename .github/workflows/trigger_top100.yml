@@ -24,7 +24,7 @@ jobs:
       # SET GH CLI TOKEN (PAT)
       # -----------------------------
       - name: Set GH CLI authentication
-        run: echo "GH_TOKEN=${{ secrets.PERSONAL_TOKEN }}" >> $GITHUB_ENV
+        run: echo "GH_TOKEN=${{ secrets.SBOM_TOKEN_PERSONAL }}" >> $GITHUB_ENV
 
       # -----------------------------
       # FETCH TOP PUBLIC C++ REPOS
@@ -38,16 +38,26 @@ jobs:
             | jq '[.items[] | select(.private == false) | .full_name]' > output/top_public_repos.json
 
       # -----------------------------
-      # Save repos to file
+      # Upload repo list artifact
       # -----------------------------
-      - name: Save repos to file
-        run: |
-          mkdir -p output
-          jq -r '.[]' output/top_public_repos.json > output/repos_list.txt
-          echo "Saved $(wc -l < output/repos_list.txt) repositories to file."
+      - name: Upload repository list
+        uses: actions/upload-artifact@v4
+        with:
+          name: top-repos
+          path: output/top_public_repos.json
 
       # -----------------------------
-      # Trigger workflow using JSON input & collect artifacts
+      # Load repos into array safely
+      # -----------------------------
+      - name: Load repos into array
+        id: load_repos
+        run: |
+          mapfile -t repos_array < <(jq -r '.[]' output/top_public_repos.json)
+          echo "repos_array=${repos_array[*]}" >> $GITHUB_ENV
+          echo "Loaded ${#repos_array[@]} repositories"
+
+      # -----------------------------
+      # Trigger workflow and collect artifacts
       # -----------------------------
       - name: Trigger SBOM workflow and collect artifacts
         run: |
@@ -55,10 +65,10 @@ jobs:
           WORKFLOW_REPO="Noddy03/Conan_Trivy_full_SBOM_scan"
           WORKFLOW_NAME="Conan + Trivy Full SBOM Scan"
 
-          while IFS= read -r repo; do
+          for repo in "${repos_array[@]}"; do
             echo "Triggering SBOM scan for $repo..."
 
-            # Build JSON input
+            # Create JSON payload for workflow inputs
             json_input=$(jq -n \
               --arg src_repo "$repo" \
               --arg src_branch "main" \
@@ -67,36 +77,29 @@ jobs:
               --arg conan_branch "main" \
               '{src_repository: $src_repo, src_branch: $src_branch, src_type: $src_type, conan_repository: $conan_repo, conan_branch: $conan_branch}')
 
-            # Trigger workflow with JSON
-            run_info=$(echo "$json_input" | gh workflow run "$WORKFLOW_NAME" \
+            # Trigger workflow in the correct repository
+            run_id=$(gh workflow run "$WORKFLOW_NAME" \
               --repo "$WORKFLOW_REPO" \
               --ref main \
-              --json -)
+              --json <(echo "$json_input") \
+              --json | jq -r '.id')
 
-            run_id=$(echo "$run_info" | jq -r '.id')
-            run_url=$(echo "$run_info" | jq -r '.html_url')
-
-            if [[ -z "$run_id" || "$run_id" == "null" ]]; then
-              echo "❌ Failed to trigger workflow for $repo"
-              echo "Response: $run_info"
+            if [[ -z "$run_id" ]]; then
+              echo "Failed to trigger workflow for $repo"
               continue
             fi
 
-            echo "✅ Workflow triggered for $repo, run ID: $run_id"
-            echo "View run: $run_url"
+            echo "Workflow triggered for $repo, run ID: $run_id"
 
             # Wait for workflow to complete
-            echo "⏳ Waiting for workflow $run_id to finish..."
-            gh run watch "$run_id"
+            echo "Waiting for workflow $run_id to finish..."
+            gh run watch "$run_id" --repo "$WORKFLOW_REPO"
 
             # Download workflow artifacts
-            echo "📥 Downloading artifacts for $repo..."
-            gh run download "$run_id" --dir "collected-artifacts/$repo"
-
-            # Optional: throttle to avoid API limits
+            echo "Downloading artifacts for $repo..."
+            gh run download "$run_id" --repo "$WORKFLOW_REPO" --dir "collected-artifacts/$repo"
             sleep 2
-
-          done < output/repos_list.txt
+          done
 
       # -----------------------------
       # Upload all collected SBOM artifacts
@@ -107,4 +110,3 @@ jobs:
           name: all-sbom-reports
           path: collected-artifacts
           if-no-files-found: warn
-
