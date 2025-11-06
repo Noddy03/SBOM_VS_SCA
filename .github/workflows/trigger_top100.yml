@@ -72,7 +72,7 @@ jobs:
             }
 
       - name: Log triggered repository
-        run: echo "✅ Triggered scan for repository: ${{ matrix.repo }}"
+        run: echo "✅ Triggered scan for repository:${{ matrix.repo }}"
 
   # -----------------------------------------------------
   # WAIT UNTIL ALL main.yml RUNS ARE COMPLETE, THEN COLLECT
