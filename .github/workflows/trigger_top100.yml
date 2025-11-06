@@ -67,21 +67,18 @@ jobs:
 
           for repo in "${repos_array[@]}"; do
             echo "Triggering SBOM scan for $repo..."
-            
-            json_input=$(jq -n \
-              --arg src_repo "$repo" \
-              --arg src_branch "main" \
-              --arg src_type "c++" \
-              --arg conan_repo "$WORKFLOW_REPO" \
-              --arg conan_branch "main" \
-              '{src_repository: $src_repo, src_branch: $src_branch, src_type: $src_type, conan_repository: $conan_repo, conan_branch: $conan_branch}')
-            
-            # Trigger workflow via stdin JSON
-            run_id=$(echo "$json_input" | gh workflow run "$WORKFLOW_NAME" \
+
+            # Trigger workflow using -f for each input
+            run_id=$(gh workflow run "$WORKFLOW_NAME" \
               --repo "$WORKFLOW_REPO" \
               --ref main \
+              -f src_repository="$repo" \
+              -f src_branch="main" \
+              -f src_type="c++" \
+              -f conan_repository="$WORKFLOW_REPO" \
+              -f conan_branch="main" \
               --json | jq -r '.id')
-            
+
             if [[ -z "$run_id" ]]; then
               echo "Failed to trigger workflow for $repo"
               continue
