@@ -1,23 +1,20 @@
-name: Fetch Top 100 Public Repositories
+name: Fetch & Trigger SBOM Scans
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Programming language to fetch repositories for"
+        description: "Programming language to fetch top public repos"
         required: true
         default: "C++"
 
 jobs:
-  fetch:
+  fetch_and_trigger:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.collect.outputs.repo_list }}
 
     steps:
-      - name: Checkout workflow repository
-        uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
@@ -28,20 +25,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install jq requests
 
-      - name: Fetch Top 100 Public Repositories
+      - name: Fetch top 100 public repositories
         id: collect
-        env:
-          LANGUAGE: ${{ github.event.inputs.language }}
         run: |
+          LANGUAGE="${{ github.event.inputs.language }}"
           mkdir -p output
-
-          echo "Fetching top 100 public repositories for language: $LANGUAGE"
           curl -s -H "Accept: application/vnd.github+json" \
             "https://api.github.com/search/repositories?q=language:${LANGUAGE}&sort=stars&order=desc&per_page=100" \
-            | jq -r '.items[] | select(.private == false) | .full_name' > output/top_public_repos.txt
+            | jq '[.items[] | select(.private == false) | .full_name]' > output/top_public_repos.json
 
-          # Convert to JSON array for matrix
-          repos=$(jq -R -s -c 'split("\n")[:-1]' output/top_public_repos.txt)
-
-          echo "Found repositories: $repos"
+          repos=$(cat output/top_public_repos.json)
           echo "repo_list=$repos" >> $GITHUB_OUTPUT
+
+  trigger_scans:
+    needs: fetch_and_trigger
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJson(needs.fetch_and_trigger.outputs.repo_list) }}
+
+    steps:
+      - name: Trigger Conan + Trivy SBOM Workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          token: ${{ secrets.PERSONAL_TOKEN }} # PAT with 'repo' + 'workflow' scopes
+          workflow: main.yml                    # your SBOM scan workflow
+          ref: main                             # branch where main.yml exists
+          inputs: |
+            {
+              "src_repository": "${{ matrix.repo }}",
+              "src_branch": "main",
+              "conan_repository": "Noddy03/Conan_Trivy_full_SBOM_scan",
+              "conan_branch": "main",
+              "src_type": "C++"
+            }
