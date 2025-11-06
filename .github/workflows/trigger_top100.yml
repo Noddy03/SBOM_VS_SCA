@@ -1,4 +1,4 @@
-name: Fetch and Scan Top 100 Repositories
+name: Fetch, Scan, and Collect SBOMs (Automated)
 
 on:
   workflow_dispatch:
@@ -26,10 +26,10 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests jq
+          pip install requests
 
       - name: Fetch Top 100 Repositories
         env:
@@ -44,7 +44,7 @@ jobs:
           echo "repo_list=$repos" >> $GITHUB_OUTPUT
 
   # -----------------------------------------------------
-  # TRIGGER MAIN SBOM SCAN WORKFLOW (via API)
+  # TRIGGER MAIN SCAN WORKFLOW
   # -----------------------------------------------------
   trigger:
     needs: fetch
@@ -55,11 +55,50 @@ jobs:
         repo: ${{ fromJson(needs.fetch.outputs.repo_list) }}
 
     steps:
-      - name: Trigger Conan+Trivy Workflow via GitHub API
+      - name: Trigger Conan+Trivy Workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: main.yml
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+          inputs: |
+            src_repository=${{ matrix.repo }}
+            src_branch=main
+            conan_repository=Noddy03/Conan_Trivy_full_SBOM_scan
+            conan_branch=main
+            src_type=${{ github.event.inputs.language }}
+
+  # -----------------------------------------------------
+  # WAIT UNTIL ALL main.yml RUNS ARE COMPLETE
+  # -----------------------------------------------------
+  finalize:
+    needs: trigger
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for all main.yml runs to complete
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "Triggering workflow for repository: ${{ matrix.repo }}"
-          curl -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
-            -d '{"ref":"main","inputs":{"src_repository":"'"${{ matrix.repo }}"'","src_branch":"main","conan_repository":"Noddy03/Conan_Trivy_full_SBOM_scan","conan_branch":"main","src_type":"'"${{ github.event.inputs.language }}"'"}}}'
+          echo "Waiting for all main.yml runs to complete..."
+          while true; do
+            in_progress=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              https://api.github.com/repos/$REPO/actions/workflows/main.yml/runs?per_page=100 \
+              | jq '[.workflow_runs[] | select(.status != "completed")] | length')
+
+            echo "Still $in_progress runs in progress..."
+            if [ "$in_progress" -eq 0 ]; then
+              echo "✅ All runs completed!"
+              break
+            fi
+
+            echo "Sleeping 5 minutes..."
+            sleep 300
+          done
+
+      - name: Trigger collector workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: collect_sboms.yml
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
