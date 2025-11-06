@@ -1,28 +1,45 @@
-name: Top 100 Repos SBOM Scan
+name: Top 100 GitHub Repos SBOM Scan
 
 on:
   workflow_dispatch:
 
 jobs:
+
+  # -----------------------------
+  # FETCH TOP 100 REPOS
+  # -----------------------------
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.get_repos.outputs.repo_list }}
     steps:
-      - name: Fetch Top 100 Repositories
+      - name: Fetch Top 100 GitHub Repositories
         id: get_repos
         run: |
-          echo "Fetching top 100 repositories..."
-          REPOS=$(gh api search/repositories -q 'stars:>5000' -F per_page=100 --jq '.items[].full_name' | paste -sd "," -)
-          echo "repo_list=$REPOS" >> $GITHUB_OUTPUT
+          echo "Fetching top 100 repositories with >5000 stars..."
+          # Fetch top 100 repos (replace with your search criteria if needed)
+          REPOS=$(gh api search/repositories -q 'stars:>5000' -F per_page=100 --jq '.items[].full_name')
+          # Convert newline-separated list to JSON array
+          JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
+          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
 
+  # -----------------------------
+  # RUN SBOM SCAN ON EACH REPO
+  # -----------------------------
   scan_repos:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        repo: ${{ fromJSON(format('[\"{0}\"]', needs.fetch_top_repos.outputs.repo_list | replace(',', '","'))) }}
+        repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     steps:
+
       # -----------------------------
       # CHECKOUT REPOSITORY
       # -----------------------------
@@ -44,7 +61,7 @@ jobs:
           node-version: '20'
 
       # -----------------------------
-      # OPTIONAL: Checkout Conan repository
+      # CHECKOUT CONAN REPO
       # -----------------------------
       - name: Checkout Conan repository
         uses: actions/checkout@v4
@@ -67,15 +84,14 @@ jobs:
       # GENERATE CONAN LOCKFILE
       # -----------------------------
       - name: Generate Conan lockfile
-        run: |
-          conan lock create conanfile.py --lockfile-out=conan.lock
+        run: conan lock create conanfile.py --lockfile-out=conan.lock
         working-directory: conan-src
 
-      - name: Copy Conan lockfile to source directory
+      - name: Copy Conan lockfile to project
         run: cp conan-src/conan.lock project-src/conan.lock
 
       # -----------------------------
-      # TRIVY SBOM SCAN
+      # RUN TRIVY SBOM SCAN
       # -----------------------------
       - name: Run Trivy SBOM generation and vulnerability scan
         uses: aquasecurity/trivy-action@master
@@ -94,15 +110,24 @@ jobs:
       # -----------------------------
       - name: Compliance SBOM NTIA
         run: |
-          docker run --rm -v $PWD/project-src:/project-src ghcr.io/interlynk-io/sbomqs:latest compliance --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
 
       - name: Compliance SBOM BSI
         run: |
-          docker run --rm -v $PWD/project-src:/project-src ghcr.io/interlynk-io/sbomqs:latest compliance --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
 
       - name: Score SBOM
         run: |
-          docker run --rm -v $PWD/project-src:/project-src ghcr.io/interlynk-io/sbomqs:latest score /project-src/trivy-report.json --json > project-src/score_evaluation.json
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest score \
+            /project-src/trivy-report.json --json > project-src/score_evaluation.json
 
       # -----------------------------
       # UPLOAD ARTIFACTS
@@ -114,7 +139,7 @@ jobs:
           SAFE_NAME="${SAFE_NAME//\//_}"
           echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Upload SBOMs
+      - name: Upload SBOM artifacts
         uses: actions/upload-artifact@v4
         with:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
