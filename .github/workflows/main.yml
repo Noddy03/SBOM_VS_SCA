@@ -1,52 +1,69 @@
-name: Fetch Top Repos + Conan/Trivy SBOM Scan
+name: Fetch + Conan/Trivy SBOM Scan
 
 on:
   workflow_dispatch:
     inputs:
+      src_repository:
+        description: 'Source Repository (e.g., user/repo)'
+        required: true
+      src_branch:
+        description: 'Branch of source repository'
+        required: false
+        default: 'main'
+      conan_repository:
+        description: 'Repository containing conanfile.py'
+        required: true
+        default: 'Noddy03/Conan_Trivy_full_SBOM_scan'
+      conan_branch:
+        description: 'Branch for Conan repository'
+        required: false
+        default: 'main'
       src_type:
         description: 'Project Type (java, python, dotnet, cpp, c++)'
         required: false
         default: 'c++'
+      upstream_artifacts:
+        description: 'Optional: Repository with existing SBOM artifacts to fetch'
+        required: false
 
 jobs:
   fetch_top_repos:
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
     outputs:
-      repo_list: ${{ steps.set_output.outputs.repo_list }}
+      repo_list: ${{ steps.top_repos.outputs.repo_list }}
     steps:
-      - name: Install GitHub CLI and jq
+      - name: Fetch top 50 repositories (no token)
+        id: top_repos
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gh jq
-
-      - name: Fetch top 100 repositories with >5000 stars
-        id: set_output
-        run: |
-          echo "Fetching top 100 repositories with >5000 stars..."
-          REPOS=$(gh api search/repositories -q "stars:>5000" -F per_page=100 --jq '.items[].full_name')
+          echo "Fetching top 50 repositories with >5000 stars..."
+          REPOS=$(curl -s "https://api.github.com/search/repositories?q=stars:>5000&sort=stars&order=desc&per_page=50" \
+            | jq -r '.items[].full_name')
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  build_and_scan:
-    needs: fetch_top_repos
+  fetch_upstream_sbom:
+    if: ${{ inputs.upstream_artifacts != '' }}
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
-    env:
-      GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
+    steps:
+      - name: Download upstream SBOM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          repository: ${{ inputs.upstream_artifacts }}
+          path: upstream-sbom
+
+  build_and_scan:
+    needs: [fetch_top_repos, fetch_upstream_sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     steps:
       # -----------------------------
-      # CHECKOUT REPOSITORY
+      # TIMESTAMP
       # -----------------------------
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ matrix.repo }}
-          token: ${{ secrets.PERSONAL_TOKEN }}
-          path: project-src
+      - name: Define timestamp
+        run: echo "TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')" >> $GITHUB_ENV
 
       # -----------------------------
       # SETUP ENVIRONMENT
@@ -59,7 +76,24 @@ jobs:
           node-version: '20'
 
       # -----------------------------
-      # INSTALL CONAN
+      # CHECKOUT REPOSITORIES
+      # -----------------------------
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.src_repository }}
+          ref: ${{ inputs.src_branch }}
+          path: project-src
+
+      - name: Checkout Conan repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.conan_repository }}
+          ref: ${{ inputs.conan_branch }}
+          path: conan-src
+
+      # -----------------------------
+      # INSTALL DEPENDENCIES
       # -----------------------------
       - name: Install Conan
         run: |
@@ -71,14 +105,16 @@ jobs:
       # GENERATE CONAN LOCKFILE
       # -----------------------------
       - name: Generate Conan lockfile
-        run: |
-          conan lock create conanfile.py --lockfile-out=conan.lock
-        working-directory: project-src
+        run: conan lock create conanfile.py --lockfile-out=conan.lock
+        working-directory: conan-src
+
+      - name: Copy Conan lockfile to source directory
+        run: cp conan-src/conan.lock project-src/conan.lock
 
       # -----------------------------
       # TRIVY SBOM SCAN
       # -----------------------------
-      - name: Run Trivy SBOM generation and vulnerability scan
+      - name: Run Trivy SBOM scan
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
@@ -95,29 +131,40 @@ jobs:
       # -----------------------------
       - name: Compliance SBOM NTIA
         run: |
-          docker run --rm -v $PWD/project-src:/project-src ghcr.io/interlynk-io/sbomqs:latest compliance --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
 
       - name: Compliance SBOM BSI
         run: |
-          docker run --rm -v $PWD/project-src:/project-src ghcr.io/interlynk-io/sbomqs:latest compliance --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
 
       - name: Score SBOM
         run: |
-          docker run --rm -v $PWD/project-src:/project-src ghcr.io/interlynk-io/sbomqs:latest score /project-src/trivy-report.json --json > project-src/score_evaluation.json
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest score \
+            /project-src/trivy-report.json --json > project-src/score_evaluation.json
 
       # -----------------------------
-      # UPLOAD ARTIFACTS
+      # UPLOAD ALL SBOMS (INCLUDING UPSTREAM)
       # -----------------------------
       - name: Sanitize artifact name
         id: sanitize
         run: |
-          SAFE_NAME="${{ matrix.repo }}"
+          SAFE_NAME="${{ inputs.src_repository }}"
           SAFE_NAME="${SAFE_NAME//\//_}"
           echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Upload SBOMs
+      - name: Upload all SBOMs
         uses: actions/upload-artifact@v4
         with:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
-          path: project-src/*.json
+          path: |
+            project-src/*.json
+            upstream-sbom/**/*.json
           if-no-files-found: warn
