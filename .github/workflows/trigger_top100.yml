@@ -3,12 +3,13 @@ name: Fetch, Trigger & Collect SBOM Scans
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   fetch_trigger_collect:
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
 
     steps:
       # -----------------------------
@@ -20,7 +21,7 @@ jobs:
           sudo apt-get install -y jq gh curl
 
       # -----------------------------
-      # SET GH CLI TOKEN (no login needed)
+      # SET GH CLI TOKEN (PAT)
       # -----------------------------
       - name: Set GH CLI authentication
         run: echo "GH_TOKEN=${{ secrets.PERSONAL_TOKEN }}" >> $GITHUB_ENV
@@ -37,27 +38,48 @@ jobs:
             | jq '[.items[] | select(.private == false) | .full_name]' > output/top_public_repos.json
 
       # -----------------------------
-      # LOAD REPOS INTO ARRAY
+      # Upload repo list artifact
+      # -----------------------------
+      - name: Upload repository list
+        uses: actions/upload-artifact@v3
+        with:
+          name: top-repos
+          path: output/top_public_repos.json
+
+      # -----------------------------
+      # LOAD REPOS INTO ARRAY SAFELY
       # -----------------------------
       - name: Load repos into array
         id: load_repos
         run: |
-          repos_array=($(jq -r '.[]' output/top_public_repos.json))
+          mapfile -t repos_array < <(jq -r '.[]' output/top_public_repos.json)
           echo "repos_array=${repos_array[*]}" >> $GITHUB_ENV
+          echo "Loaded ${#repos_array[@]} repositories"
 
       # -----------------------------
       # TRIGGER MAIN WORKFLOW FOR EACH REPO
       # -----------------------------
       - name: Trigger Conan + Trivy SBOM workflow
         run: |
-          for repo in $repos_array; do
+          for repo in "${repos_array[@]}"; do
             echo "Triggering SBOM scan for $repo..."
+
             run_number=$(gh workflow run "Conan + Trivy Full SBOM Scan" \
               --ref main \
               -f src_repository="$repo" \
               -f src_branch="main" \
               -f src_type="c++" \
+              -f conan_repository="Noddy03/Conan_Trivy_full_SBOM_scan" \
+              -f conan_branch="main" \
               --json number \
               | jq -r '.number')
-            echo "Workflow triggered for $repo, run number: $run_number"
+
+            if [[ -n "$run_number" ]]; then
+              echo "Workflow triggered for $repo, run number: $run_number"
+            else
+              echo "Failed to trigger workflow for $repo"
+            fi
+
+            # Optional: throttle to avoid API limits
+            sleep 2
           done
