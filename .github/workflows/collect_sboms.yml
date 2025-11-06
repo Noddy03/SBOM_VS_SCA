@@ -2,7 +2,7 @@ name: Collect SBOMs Automatically
 
 on:
   workflow_run:
-    workflows: ["Conan + Trivy Full SBOM Scan"]  # Must match workflow name
+    workflows: ["Conan + Trivy Full SBOM Scan"]  # Name of your SBOM workflow
     types:
       - completed
 
@@ -11,70 +11,57 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # -----------------------------
-      # CHECKOUT
-      # -----------------------------
-      - name: Checkout repository
+      - name: Checkout current repository
         uses: actions/checkout@v4
 
-      # -----------------------------
-      # INSTALL DEPENDENCIES
-      # -----------------------------
-      - name: Install required tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq unzip curl python3-pip
-          python3 -m pip install --upgrade pip
-          pip install requests
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-      # -----------------------------
-      # COLLECT ARTIFACTS
-      # -----------------------------
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install jq requests
+
       - name: Collect SBOM artifacts
         env:
-          GITHUB_TOKEN: ${{ secrets.PERSONAL_TOKEN }}  # Must have repo + workflow scopes
-          REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.PERSONAL_TOKEN }}  # PAT with workflow + repo access
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.workflow_run.head_repository.name }}
         run: |
           mkdir -p collected_sboms
 
-          echo "Fetching latest workflow runs..."
+          # Get the latest completed runs of the SBOM workflow
           runs=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/$REPO/actions/workflows/main.yml/runs?per_page=100 \
+            https://api.github.com/repos/$OWNER/$REPO/actions/workflows/main.yml/runs?status=completed&per_page=50 \
             | jq -r '.workflow_runs[] | "\(.id) \(.head_repository.full_name)"')
 
           echo "$runs" | while read run_id repo_name; do
-            echo "Processing workflow run $run_id for repository $repo_name"
-
+            echo "Processing run $run_id for repo $repo_name"
             safe_repo_name=$(echo "$repo_name" | tr '/' '_')
             repo_folder="collected_sboms/$safe_repo_name"
             mkdir -p "$repo_folder"
 
+            # List artifacts for this workflow run
             artifacts=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              https://api.github.com/repos/$REPO/actions/runs/$run_id/artifacts \
-              | jq -r '.artifacts[]? | "\(.id) \(.name)"')
-
-            if [ -z "$artifacts" ]; then
-              echo "No artifacts found for run $run_id"
-              continue
-            fi
+              https://api.github.com/repos/$OWNER/$REPO/actions/runs/$run_id/artifacts \
+              | jq -r '.artifacts[] | "\(.id) \(.name)"')
 
             echo "$artifacts" | while read artifact_id artifact_name; do
               echo "Downloading artifact $artifact_name ($artifact_id) into $repo_folder"
               curl -s -L -H "Authorization: token $GITHUB_TOKEN" \
                 -o temp.zip \
-                https://api.github.com/repos/$REPO/actions/artifacts/$artifact_id/zip
+                https://api.github.com/repos/$OWNER/$REPO/actions/artifacts/$artifact_id/zip
 
               unzip -o temp.zip -d "$repo_folder"
               rm temp.zip
             done
           done
 
-      # -----------------------------
-      # UPLOAD CONSOLIDATED ARTIFACT
-      # -----------------------------
-      - name: Upload all SBOMs
+      - name: Upload consolidated SBOMs
         uses: actions/upload-artifact@v4
         with:
           name: all_sboms
