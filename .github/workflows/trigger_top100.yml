@@ -12,7 +12,7 @@ jobs:
 
     steps:
       # -----------------------------
-      # SETUP ENVIRONMENT
+      # INSTALL DEPENDENCIES
       # -----------------------------
       - name: Install dependencies
         run: |
@@ -20,13 +20,10 @@ jobs:
           sudo apt-get install -y jq gh curl
 
       # -----------------------------
-      # AUTHENTICATE GH CLI
+      # SET GH CLI TOKEN (no login needed)
       # -----------------------------
-      - name: Authenticate GH CLI
-        env:
-          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
-        run: |
-          echo "$GH_TOKEN" | gh auth login --with-token
+      - name: Set GH CLI authentication
+        run: echo "GH_TOKEN=${{ secrets.PERSONAL_TOKEN }}" >> $GITHUB_ENV
 
       # -----------------------------
       # FETCH TOP PUBLIC C++ REPOS
@@ -55,7 +52,6 @@ jobs:
         run: |
           for repo in $repos_array; do
             echo "Triggering SBOM scan for $repo..."
-            # Trigger workflow_dispatch on main.yml
             run_number=$(gh workflow run "Conan + Trivy Full SBOM Scan" \
               --ref main \
               -f src_repository="$repo" \
