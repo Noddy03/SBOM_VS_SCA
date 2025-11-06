@@ -29,7 +29,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "Fetching top 50 repositories with >5000 stars..."
-          # Correct API endpoint and filtering for active repos
           REPOS=$(gh api /search/repositories \
             --method GET \
             -F q="stars:>5000 language:C++ fork:false archived:false" \
@@ -37,11 +36,8 @@ jobs:
             -F order=desc \
             -F per_page=50 \
             --jq '.items[].full_name')
-
           echo "Repositories fetched:"
           echo "$REPOS"
-
-          # Convert newline-separated list into JSON array
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
@@ -79,15 +75,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
-          ref: main
           path: project-src
+          fetch-depth: 0
+          token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
 
       - name: Checkout Conan repository
         uses: actions/checkout@v4
         with:
           repository: Noddy03/Conan_Trivy_full_SBOM_scan
-          ref: main
           path: conan-src
+          fetch-depth: 0
+          token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
 
       # -----------------------------------------------------
       # INSTALL CONAN + DEPENDENCIES
