@@ -1,9 +1,17 @@
-name: Fetch + Conan/Trivy SBOM Scan (Top 50)
+name: Fetch Top Repositories + Conan/Trivy SBOM Scan
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
 jobs:
+  # ---------------------------------------------------------
+  # 1. FETCH TOP REPOSITORIES
+  # ---------------------------------------------------------
   fetch_top_repos:
     name: Fetch top 50 GitHub repositories
     runs-on: ubuntu-latest
@@ -18,48 +26,92 @@ jobs:
       - name: Fetch top 50 repositories
         id: fetch
         env:
-          GH_TOKEN: ${{ github.token }}   # ✅ built-in token, no PAT needed
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "Fetching top 50 repositories with >5000 stars..."
-          REPOS=$(gh api search/repositories -q "stars:>5000" -F per_page=50 --jq '.items[].full_name')
+          # Correct API endpoint and filtering for active repos
+          REPOS=$(gh api /search/repositories \
+            --method GET \
+            -F q="stars:>5000 language:C++ fork:false archived:false" \
+            -F sort=stars \
+            -F order=desc \
+            -F per_page=50 \
+            --jq '.items[].full_name')
+
+          echo "Repositories fetched:"
+          echo "$REPOS"
+
+          # Convert newline-separated list into JSON array
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  build_and_scan:
-    name: Run Conan + Trivy SBOM Scan
+  # ---------------------------------------------------------
+  # 2. SCAN EACH REPOSITORY USING CONAN + TRIVY
+  # ---------------------------------------------------------
+  sbom_scan:
+    name: SBOM Scan with Conan + Trivy
     needs: fetch_top_repos
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
-    permissions:
-      contents: read
-      security-events: write
-      actions: read
-
     steps:
+      # -----------------------------------------------------
+      # SETUP ENVIRONMENT
+      # -----------------------------------------------------
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      # -----------------------------------------------------
+      # CHECKOUT REPOSITORIES
+      # -----------------------------------------------------
       - name: Checkout source repository
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
           ref: main
-          token: ${{ github.token }}
           path: project-src
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - name: Checkout Conan repository
+        uses: actions/checkout@v4
         with:
-          python-version: "3.10"
+          repository: Noddy03/Conan_Trivy_full_SBOM_scan
+          ref: main
+          path: conan-src
 
+      # -----------------------------------------------------
+      # INSTALL CONAN + DEPENDENCIES
+      # -----------------------------------------------------
       - name: Install Conan
         run: |
           python -m pip install --upgrade pip
           pip install conan
           conan profile detect --force
 
-      - name: Run Trivy SBOM generation and vulnerability scan
+      # -----------------------------------------------------
+      # GENERATE LOCKFILE
+      # -----------------------------------------------------
+      - name: Generate Conan lockfile
+        run: conan lock create conanfile.py --lockfile-out=conan.lock
+        working-directory: conan-src
+
+      - name: Copy Conan lockfile
+        run: cp conan-src/conan.lock project-src/conan.lock
+
+      # -----------------------------------------------------
+      # RUN TRIVY SCAN
+      # -----------------------------------------------------
+      - name: Run Trivy SBOM scan
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
@@ -71,12 +123,22 @@ jobs:
           vuln-type: os,library
           severity: CRITICAL,HIGH,MEDIUM
 
+      # -----------------------------------------------------
+      # COMPLIANCE & SCORING
+      # -----------------------------------------------------
       - name: Compliance SBOM NTIA
         run: |
           docker run --rm \
             -v $PWD/project-src:/project-src \
             ghcr.io/interlynk-io/sbomqs:latest compliance \
             --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+
+      - name: Compliance SBOM BSI
+        run: |
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
 
       - name: Score SBOM
         run: |
@@ -85,6 +147,9 @@ jobs:
             ghcr.io/interlynk-io/sbomqs:latest score \
             /project-src/trivy-report.json --json > project-src/score_evaluation.json
 
+      # -----------------------------------------------------
+      # UPLOAD RESULTS
+      # -----------------------------------------------------
       - name: Sanitize artifact name
         id: sanitize
         run: |
@@ -92,9 +157,9 @@ jobs:
           SAFE_NAME="${SAFE_NAME//\//_}"
           echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Upload SBOM results
+      - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-${{ steps.sanitize.outputs.name }}
+          name: sbom-reports-${{ steps.sanitize.outputs.name }}
           path: project-src/*.json
           if-no-files-found: warn
