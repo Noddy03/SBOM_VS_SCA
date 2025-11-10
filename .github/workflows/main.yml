@@ -163,3 +163,57 @@ jobs:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
           path: project-src/*.json
           if-no-files-found: warn
+
+  # ---------------------------------------------------------
+  # 3. AGGREGATE ALL SBOMQS RESULTS
+  # ---------------------------------------------------------
+  aggregate_results:
+    name: Aggregate SBOMQS Results
+    needs: sbom_scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: results/
+
+      - name: Install Python and Pandas
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3-pip
+          pip install pandas
+
+      - name: Aggregate all JSON results
+        run: |
+          python3 <<'EOF'
+          import json, glob, pandas as pd, os
+
+          records = []
+
+          for path in glob.glob("results/**/score_evaluation.json", recursive=True):
+              repo = os.path.basename(os.path.dirname(path))
+              with open(path) as f:
+                  data = json.load(f)
+              data["repository"] = repo
+              records.append(data)
+
+          # You can also include NTIA and BSI results if desired
+          for std in ["BSI", "NTIA"]:
+              for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
+                  repo = os.path.basename(os.path.dirname(path))
+                  with open(path) as f:
+                      data = json.load(f)
+                  data["repository"] = repo
+                  data["standard"] = std
+                  records.append(data)
+
+          df = pd.json_normalize(records)
+          df.to_csv("sbomqs_summary.csv", index=False)
+          print(f"Aggregated {len(records)} SBOMQS results.")
+          EOF
+
+      - name: Upload aggregated summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbomqs-summary
+          path: sbomqs_summary.csv
