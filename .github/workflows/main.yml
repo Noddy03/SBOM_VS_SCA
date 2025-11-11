@@ -1,9 +1,12 @@
-name: Fetch Top IoT C++ Repositories + Conan/Trivy SBOM Scan
+name: Fetch Top IoT Repositories + Conan/Trivy SBOM Scan
 
 on:
   workflow_dispatch:
-   
-  
+    inputs:
+      language:
+        description: "Programming language to scan (e.g. C++, Python, Java)"
+        required: true
+        default: "C++"
 
 permissions:
   contents: read
@@ -15,7 +18,7 @@ jobs:
   # 1. FETCH TOP IoT REPOSITORIES
   # ---------------------------------------------------------
   fetch_top_repos:
-    name: Fetch top 50 IoT GitHub repositories (C++)
+    name: Fetch top 50 IoT GitHub repositories (${{ github.event.inputs.language }})
     runs-on: ubuntu-latest
 
     outputs:
@@ -25,16 +28,16 @@ jobs:
       - name: Install jq (for JSON parsing)
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Fetch top 50 IoT repositories (C++)
+      - name: Fetch top 50 IoT repositories
         id: fetch
-        
         env:
           GH_TOKEN: ${{ github.token }}
+          LANG: ${{ github.event.inputs.language }}
         run: |
-          echo "Fetching top 50 IoT-related repositories written in C++..."
+          echo "Fetching top 50 IoT-related repositories written in $LANG..."
           REPOS=$(gh api /search/repositories \
             --method GET \
-            -F q="IoT language:'C++' fork:false archived:false" \
+            -F q="IoT language:$LANG fork:false archived:false" \
             -F sort=stars \
             -F order=desc \
             -F per_page=50 \
@@ -47,10 +50,10 @@ jobs:
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------
-  # 2. SCAN EACH REPOSITORY USING CONAN + TRIVY
+  # 2. SBOM SCAN USING CONAN (for C++) OR TRIVY (generic)
   # ---------------------------------------------------------
   sbom_scan:
-    name: SBOM Scan with Conan + Trivy
+    name: SBOM Scan with Trivy + Conan (if C++)
     needs: fetch_top_repos
     runs-on: ubuntu-latest
 
@@ -60,9 +63,6 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-      # -----------------------------------------------------
-      # SETUP ENVIRONMENT
-      # -----------------------------------------------------
       - name: Setup Python 3.10
         uses: actions/setup-python@v4
         with:
@@ -73,10 +73,7 @@ jobs:
         with:
           node-version: '20'
 
-      # -----------------------------------------------------
-      # CHECKOUT REPOSITORIES
-      # -----------------------------------------------------
-      - name: Checkout source repository
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
@@ -84,36 +81,14 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
 
-      - name: Checkout Conan repository
-        uses: actions/checkout@v4
-        with:
-          repository: Noddy03/Conan_Trivy_full_SBOM_scan
-          path: conan-src
-          fetch-depth: 0
-          token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
-
-      # -----------------------------------------------------
-      # INSTALL CONAN + DEPENDENCIES
-      # -----------------------------------------------------
-      - name: Install Conan
+      - name: Conditional Conan setup (only for C++)
+        if: ${{ github.event.inputs.language == 'C++' }}
         run: |
           python -m pip install --upgrade pip
           pip install conan
           conan profile detect --force
+          echo "✅ Conan setup complete for C++ project."
 
-      # -----------------------------------------------------
-      # GENERATE LOCKFILE
-      # -----------------------------------------------------
-      - name: Generate Conan lockfile
-        run: conan lock create conanfile.py --lockfile-out=conan.lock
-        working-directory: conan-src
-
-      - name: Copy Conan lockfile
-        run: cp conan-src/conan.lock project-src/conan.lock
-
-      # -----------------------------------------------------
-      # RUN TRIVY SCAN
-      # -----------------------------------------------------
       - name: Run Trivy SBOM scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -126,9 +101,6 @@ jobs:
           vuln-type: os,library
           severity: CRITICAL,HIGH,MEDIUM
 
-      # -----------------------------------------------------
-      # COMPLIANCE & SCORING
-      # -----------------------------------------------------
       - name: Compliance SBOM NTIA
         run: |
           docker run --rm \
@@ -150,9 +122,6 @@ jobs:
             ghcr.io/interlynk-io/sbomqs:latest score \
             /project-src/trivy-report.json --json > project-src/score_evaluation.json
 
-      # -----------------------------------------------------
-      # UPLOAD RESULTS
-      # -----------------------------------------------------
       - name: Sanitize artifact name
         id: sanitize
         run: |
@@ -168,7 +137,7 @@ jobs:
           if-no-files-found: warn
 
   # ---------------------------------------------------------
-  # 3. AGGREGATE ALL SBOMQS RESULTS
+  # 3. AGGREGATE SBOMQS RESULTS
   # ---------------------------------------------------------
   aggregate_results:
     name: Aggregate SBOMQS Results
@@ -190,9 +159,7 @@ jobs:
         run: |
           python3 <<'EOF'
           import json, glob, pandas as pd, os
-
           records = []
-
           def load_json_safe(path):
               try:
                   with open(path) as f:
@@ -204,16 +171,12 @@ jobs:
               except Exception as e:
                   print(f"⚠️ Skipping invalid JSON in {path}: {e}")
                   return None
-
-          # Collect SBOMQS scores
           for path in glob.glob("results/**/score_evaluation.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
               data = load_json_safe(path)
               if data:
                   data["repository"] = repo
                   records.append(data)
-
-          # Collect compliance results (BSI & NTIA)
           for std in ["BSI", "NTIA"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
                   repo = os.path.basename(os.path.dirname(path))
@@ -222,9 +185,8 @@ jobs:
                       data["repository"] = repo
                       data["standard"] = std
                       records.append(data)
-
           if not records:
-              print("❌ No valid SBOMQS data found. Check if previous jobs generated reports.")
+              print("❌ No valid SBOMQS data found.")
           else:
               df = pd.json_normalize(records)
               df.to_csv("sbomqs_summary.csv", index=False)
