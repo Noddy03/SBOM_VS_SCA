@@ -107,7 +107,7 @@ jobs:
           ignore-unfixed: true
           vuln-type: os,library
           severity: CRITICAL,HIGH,MEDIUM
-          timeout: 20m
+          timeout: 10m
           skip-version-check: true
 
       - name: Compliance SBOM NTIA
