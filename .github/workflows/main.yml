@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       src_type: 
-      description: 'Project Type (java, python, c++)'
+      description: 'Project Type (java, python, C++)'
       required: false
-      default: 'c++'
+      default: 'C++'
   
 
 permissions:
@@ -31,14 +31,14 @@ jobs:
 
       - name: Fetch top 50 IoT repositories (C++)
         id: fetch
-        language_type: src_type
+        
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "Fetching top 50 IoT-related repositories written in C++..."
           REPOS=$(gh api /search/repositories \
             --method GET \
-            -F q="IoT language:language_type fork:false archived:false" \
+            -F q="IoT language:'C++' fork:false archived:false" \
             -F sort=stars \
             -F order=desc \
             -F per_page=50 \
