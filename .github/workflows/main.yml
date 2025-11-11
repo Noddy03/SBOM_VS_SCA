@@ -25,7 +25,7 @@ jobs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
 
     steps:
-      - name: Install jq (for JSON parsing)
+      - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Fetch top 50 IoT repositories
@@ -42,15 +42,15 @@ jobs:
             -F order=desc \
             -F per_page=50 \
             --jq '.items[].full_name')
-          
+
           echo "Repositories fetched:"
           echo "$REPOS"
-          
+
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------
-  # 2. SBOM SCAN USING CONAN  OR TRIVY (generic)
+  # 2. SBOM SCAN USING CONAN OR TRIVY
   # ---------------------------------------------------------
   sbom_scan:
     name: SBOM Scan with Trivy + Conan 
@@ -61,6 +61,8 @@ jobs:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+
+    continue-on-error: true  # <-- ensures this job doesn't fail if a repo scan breaks
 
     steps:
       - name: Setup Python 3.10
@@ -74,6 +76,8 @@ jobs:
           node-version: '20'
 
       - name: Checkout repository
+        id: checkout
+        continue-on-error: true
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
@@ -81,7 +85,9 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
 
-      - name:  Conan setup 
+      - name: Conan setup
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
         run: |
           python -m pip install --upgrade pip
           pip install conan
@@ -89,6 +95,8 @@ jobs:
           echo "✅ Conan setup complete for C++ project."
 
       - name: Run Trivy SBOM scan
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
@@ -99,27 +107,47 @@ jobs:
           ignore-unfixed: true
           vuln-type: os,library
           severity: CRITICAL,HIGH,MEDIUM
+          timeout: 20m
+          skip-version-check: true
 
       - name: Compliance SBOM NTIA
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
         run: |
-          docker run --rm \
-            -v $PWD/project-src:/project-src \
-            ghcr.io/interlynk-io/sbomqs:latest compliance \
-            --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+          if [ -f project-src/trivy-report.json ]; then
+            docker run --rm \
+              -v $PWD/project-src:/project-src \
+              ghcr.io/interlynk-io/sbomqs:latest compliance \
+              --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+          else
+            echo "{}" > project-src/compliance_NTIA.json
+          fi
 
       - name: Compliance SBOM BSI
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
         run: |
-          docker run --rm \
-            -v $PWD/project-src:/project-src \
-            ghcr.io/interlynk-io/sbomqs:latest compliance \
-            --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
+          if [ -f project-src/trivy-report.json ]; then
+            docker run --rm \
+              -v $PWD/project-src:/project-src \
+              ghcr.io/interlynk-io/sbomqs:latest compliance \
+              --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
+          else
+            echo "{}" > project-src/compliance_BSI.json
+          fi
 
       - name: Score SBOM
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
         run: |
-          docker run --rm \
-            -v $PWD/project-src:/project-src \
-            ghcr.io/interlynk-io/sbomqs:latest score \
-            /project-src/trivy-report.json --json > project-src/score_evaluation.json
+          if [ -f project-src/trivy-report.json ]; then
+            docker run --rm \
+              -v $PWD/project-src:/project-src \
+              ghcr.io/interlynk-io/sbomqs:latest score \
+              /project-src/trivy-report.json --json > project-src/score_evaluation.json
+          else
+            echo "{}" > project-src/score_evaluation.json
+          fi
 
       - name: Sanitize artifact name
         id: sanitize
@@ -155,6 +183,7 @@ jobs:
           pip install pandas
 
       - name: Aggregate all JSON results
+        continue-on-error: true
         run: |
           python3 <<'EOF'
           import json, glob, pandas as pd, os
