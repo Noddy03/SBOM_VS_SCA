@@ -37,7 +37,7 @@ jobs:
           echo "Fetching top 50 IoT-related repositories written in $LANG..."
           REPOS=$(gh api /search/repositories \
             --method GET \
-            -F q="IoT language:$LANG fork:true archived:false" \
+            -F q="IoT language:$LANG fork:false archived:false" \
             -F sort=stars \
             -F order=desc \
             -F per_page=50 \
