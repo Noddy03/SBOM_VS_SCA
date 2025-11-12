@@ -1,4 +1,4 @@
-name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (Stable NTIA + BSI V2 Compliance)
+name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (Full NTIA + BSI V2 Compliance)
 
 on:
   workflow_dispatch:
@@ -22,7 +22,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
-
     steps:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -46,7 +45,7 @@ jobs:
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------
-  # 2. SBOM SCAN + INCREMENTAL ENRICHMENT + COMPLIANCE
+  # 2. SBOM SCAN + ENRICHMENT + COMPLIANCE
   # ---------------------------------------------------------
   sbom_scan:
     name: SBOM Scan + Enrichment + NTIA/BSI V2 Compliance
@@ -96,7 +95,7 @@ jobs:
           timeout: 10m
 
       # ---------------------------------------------------------
-      # ENRICH SBOM SAFELY (incremental, additive)
+      # INCREMENTAL ENRICHMENT (add-only, safe for compliance)
       # ---------------------------------------------------------
       - name: Add basic metadata
         run: |
@@ -112,46 +111,39 @@ jobs:
             ]
           ' "$FILE" > tmp && mv tmp "$FILE"
 
-      - name: Add BOM link and signature reference
+      - name: Add BOM link and signature ref
         run: |
           FILE="project-src/trivy-report.json"
-          [ -f "$FILE" ] || exit 0
           REPO_URL="https://github.com/${{ matrix.repo }}"
           jq --arg repo "$REPO_URL" '
             .metadata.bomLinks += [{"rel":"component","href":$repo}] |
             .metadata.externalReferences += [{"type":"signature","url":$repo}]
           ' "$FILE" > tmp && mv tmp "$FILE"
 
-      - name: Add missing component hashes / URIs / licenses
+      - name: Add missing component URIs / hashes / licenses
         run: |
           FILE="project-src/trivy-report.json"
-          [ -f "$FILE" ] || exit 0
           REPO_URL="https://github.com/${{ matrix.repo }}"
           RELEASE_URL="$REPO_URL/releases/latest"
-
           jq --arg repo "$REPO_URL" --arg release "$RELEASE_URL" '
             .components |= map(
-              .externalReferences = ((.externalReferences // []) + [{"type":"vcs","url":$repo},{"type":"distribution","url":$release}]) |
+              .externalReferences = ((.externalReferences // []) + [
+                {"type":"vcs","url":$repo},
+                {"type":"distribution","url":$release}
+              ]) |
               .licenses = (.licenses // [{"license":{"id":"Apache-2.0"}}]) |
               .hashes = (.hashes // [{"alg":"SHA-256","content":(.name | @sha256)}])
             )
           ' "$FILE" > tmp && mv tmp "$FILE"
 
-      - name: Ensure vulnerabilities field exists
+      - name: Validate enriched SBOM fields
         run: |
-          FILE="project-src/trivy-report.json"
-          [ -f "$FILE" ] || exit 0
-          jq '.vulnerabilities //= []' "$FILE" > tmp && mv tmp "$FILE"
-
-      - name: Validate enriched SBOM
-        run: |
-          echo "🔍 Metadata:"
-          jq '.metadata | {tools,properties,bomLinks,externalReferences}' project-src/trivy-report.json
-          echo "🔍 Component sample:"
+          echo "🔎 Checking enriched SBOM fields..."
+          jq '.metadata | {tools,properties,bomLinks,externalReferences}' project-src/trivy-report.json | head -40
           jq '.components[] | {name,hashes,externalReferences}' project-src/trivy-report.json | head -10
 
       # ---------------------------------------------------------
-      # OPTIONAL: SIGN SBOM (for BSI §8.1.11)
+      # OPTIONAL: SIGN SBOM
       # ---------------------------------------------------------
       - name: Sign SBOM (if Cosign key available)
         if: steps.checkout.outcome == 'success'
@@ -168,31 +160,58 @@ jobs:
           echo "✅ SBOM signed successfully."
 
       # ---------------------------------------------------------
-      # COMPLIANCE CHECKS
+      # COMPLIANCE & SCORING
       # ---------------------------------------------------------
       - name: Compliance SBOM NTIA
+        if: steps.checkout.outcome == 'success'
         run: |
           if [ -f project-src/trivy-report.json ]; then
-            docker run --rm -v $PWD/project-src:/project-src \
+            docker run --rm \
+              -v $PWD/project-src:/project-src \
               ghcr.io/interlynk-io/sbomqs:latest compliance \
               --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
           fi
 
       - name: Compliance SBOM BSI
+        if: steps.checkout.outcome == 'success'
         run: |
           if [ -f project-src/trivy-report.json ]; then
-            docker run --rm -v $PWD/project-src:/project-src \
+            docker run --rm \
+              -v $PWD/project-src:/project-src \
               ghcr.io/interlynk-io/sbomqs:latest compliance \
               --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
           fi
 
       - name: Score SBOM
+        if: steps.checkout.outcome == 'success'
         run: |
           if [ -f project-src/trivy-report.json ]; then
-            docker run --rm -v $PWD/project-src:/project-src \
+            docker run --rm \
+              -v $PWD/project-src:/project-src \
               ghcr.io/interlynk-io/sbomqs:latest score \
-              /project-src/trivy-report.json --json | tee project-src/score_evaluation.json | jq '.'
+              /project-src/trivy-report.json --json > project-src/score_evaluation.json
           fi
+
+      # ---------------------------------------------------------
+      # DIAGNOSTIC CHECK: Print zero-score fields
+      # ---------------------------------------------------------
+      - name: Diagnostic: print zero-score fields
+        if: steps.checkout.outcome == 'success'
+        run: |
+          echo "🔎 Checking NTIA/BSI compliance zero fields..."
+          for FILE in project-src/compliance_NTIA.json project-src/compliance_BSI.json; do
+            if [ -f "$FILE" ]; then
+              echo "📘 Analyzing $(basename $FILE)..."
+              jq -r '
+                to_entries[]
+                | select(.value == 0)
+                | "❌ " + .key
+              ' "$FILE" || echo "⚠️ No zero fields found or invalid JSON."
+            else
+              echo "⚠️ No compliance file found for $(basename $FILE)"
+            fi
+          done
+          echo "✅ Diagnostic check complete."
 
       - name: Sanitize artifact name
         id: sanitize
@@ -215,7 +234,6 @@ jobs:
     name: Aggregate SBOMQS Results
     needs: sbom_scan
     runs-on: ubuntu-latest
-
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
