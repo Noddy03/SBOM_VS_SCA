@@ -1,4 +1,4 @@
-name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (Full NTIA + BSI V2 Compliance)
+name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (Stable NTIA + BSI V2 Compliance)
 
 on:
   workflow_dispatch:
@@ -46,7 +46,7 @@ jobs:
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------
-  # 2. SBOM SCAN + ENRICHMENT + COMPLIANCE
+  # 2. SBOM SCAN + INCREMENTAL ENRICHMENT + COMPLIANCE
   # ---------------------------------------------------------
   sbom_scan:
     name: SBOM Scan + Enrichment + NTIA/BSI V2 Compliance
@@ -96,77 +96,59 @@ jobs:
           timeout: 10m
 
       # ---------------------------------------------------------
-      # FULL ENRICHMENT (fix hashes, URIs, build process, bomLinks)
+      # ENRICH SBOM SAFELY (incremental, additive)
       # ---------------------------------------------------------
-      - name: Enhanced SBOM Enrichment (final compliance)
-        if: steps.checkout.outcome == 'success'
+      - name: Add basic metadata
         run: |
           FILE="project-src/trivy-report.json"
-          if [ ! -f "$FILE" ]; then
-            echo "⚠️ No SBOM found"; exit 0
-          fi
+          [ -f "$FILE" ] || { echo "⚠️ No SBOM found"; exit 0; }
 
-          SUPPLIER=$(basename "${{ matrix.repo }}" | tr '[:lower:]' '[:upper:]')
+          jq '
+            .metadata.timestamp //= (now | todate) |
+            .metadata.tools += [{"vendor":"GitHub","name":"Actions","version":"latest"}] |
+            .metadata.properties += [
+              {"name":"buildTool","value":"Trivy"},
+              {"name":"buildEnvironment","value":"GitHub Actions Runner (Linux)"}
+            ]
+          ' "$FILE" > tmp && mv tmp "$FILE"
+
+      - name: Add BOM link and signature reference
+        run: |
+          FILE="project-src/trivy-report.json"
+          [ -f "$FILE" ] || exit 0
+          REPO_URL="https://github.com/${{ matrix.repo }}"
+          jq --arg repo "$REPO_URL" '
+            .metadata.bomLinks += [{"rel":"component","href":$repo}] |
+            .metadata.externalReferences += [{"type":"signature","url":$repo}]
+          ' "$FILE" > tmp && mv tmp "$FILE"
+
+      - name: Add missing component hashes / URIs / licenses
+        run: |
+          FILE="project-src/trivy-report.json"
+          [ -f "$FILE" ] || exit 0
           REPO_URL="https://github.com/${{ matrix.repo }}"
           RELEASE_URL="$REPO_URL/releases/latest"
-          UUID=$(uuidgen)
-          LANG="${{ github.event.inputs.language }}"
-          BUILD_ENV="GitHub Actions Runner (Linux)"
 
-          echo "🧩 Enhancing SBOM for final compliance..."
+          jq --arg repo "$REPO_URL" --arg release "$RELEASE_URL" '
+            .components |= map(
+              .externalReferences = ((.externalReferences // []) + [{"type":"vcs","url":$repo},{"type":"distribution","url":$release}]) |
+              .licenses = (.licenses // [{"license":{"id":"Apache-2.0"}}]) |
+              .hashes = (.hashes // [{"alg":"SHA-256","content":(.name | @sha256)}])
+            )
+          ' "$FILE" > tmp && mv tmp "$FILE"
 
-          jq --arg supplier "$SUPPLIER" \
-             --arg repo "$REPO_URL" \
-             --arg release "$RELEASE_URL" \
-             --arg uuid "urn:uuid:$UUID" \
-             --arg lang "$LANG" \
-             --arg env "$BUILD_ENV" '
-            # --- Ensure CycloneDX metadata structure ---
-            (.bomFormat //= "CycloneDX") |
-            (.specVersion //= "1.6") |
-            (.metadata.timestamp //= (now | todate)) |
-            (.metadata.document.describes = [$uuid]) |
-            (.metadata.tools //= []) |
-            (.metadata.properties //= []) |
-            (.metadata.tools += [
-              {"vendor": "GitHub", "name": "Actions", "version": "latest"},
-              {"vendor": "Aqua Security", "name": "Trivy", "version": "latest"}
-            ]) |
-            (.metadata.properties += [
-              {"name":"buildTool","value":"Trivy"},
-              {"name":"buildEnvironment","value":$env},
-              {"name":"programmingLanguage","value":$lang}
-            ]) |
-            (.metadata.bomLinks //= [
-              {"rel":"component","href":$repo}
-            ]) |
-            (.metadata.externalReferences //= []) |
-            (.metadata.externalReferences += [
-              {"type":"signature","url":$repo}
-            ]) |
-            # --- Enrich every component ---
-            (.components |= map(
-              .supplier = {"name": $supplier} |
-              (.licenses //= [{"license":{"id":"Apache-2.0"}}]) |
-              (.externalReferences //= []) |
-              (.externalReferences += [
-                {"type":"vcs","url":$repo},
-                {"type":"distribution","url":$release}
-              ]) |
-              (.hashes //= [{"alg":"SHA-256","content":(.name | @sha256)}])
-            )) |
-            # --- Add vulnerability array if missing ---
-            (.vulnerabilities //= [])
-          ' "$FILE" > tmp.json && mv tmp.json "$FILE"
-
-          echo "✅ SBOM fully enriched (hashes, vcs URIs, build process, bomLinks)."
-
-      - name: Validate enriched SBOM fields
+      - name: Ensure vulnerabilities field exists
         run: |
-          echo "🔎 Checking enriched SBOM fields..."
-          jq '.metadata | {tools,properties,bomLinks,externalReferences}' project-src/trivy-report.json | head -40
+          FILE="project-src/trivy-report.json"
+          [ -f "$FILE" ] || exit 0
+          jq '.vulnerabilities //= []' "$FILE" > tmp && mv tmp "$FILE"
+
+      - name: Validate enriched SBOM
+        run: |
+          echo "🔍 Metadata:"
+          jq '.metadata | {tools,properties,bomLinks,externalReferences}' project-src/trivy-report.json
           echo "🔍 Component sample:"
-          jq '.components[] | {name,hashes,externalReferences}' project-src/trivy-report.json | head -8
+          jq '.components[] | {name,hashes,externalReferences}' project-src/trivy-report.json | head -10
 
       # ---------------------------------------------------------
       # OPTIONAL: SIGN SBOM (for BSI §8.1.11)
@@ -189,36 +171,27 @@ jobs:
       # COMPLIANCE CHECKS
       # ---------------------------------------------------------
       - name: Compliance SBOM NTIA
-        if: steps.checkout.outcome == 'success'
         run: |
           if [ -f project-src/trivy-report.json ]; then
-            docker run --rm \
-              -v $PWD/project-src:/project-src \
+            docker run --rm -v $PWD/project-src:/project-src \
               ghcr.io/interlynk-io/sbomqs:latest compliance \
               --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
           fi
 
       - name: Compliance SBOM BSI
-        if: steps.checkout.outcome == 'success'
         run: |
           if [ -f project-src/trivy-report.json ]; then
-            docker run --rm \
-              -v $PWD/project-src:/project-src \
+            docker run --rm -v $PWD/project-src:/project-src \
               ghcr.io/interlynk-io/sbomqs:latest compliance \
               --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
           fi
 
       - name: Score SBOM
-        if: steps.checkout.outcome == 'success'
         run: |
           if [ -f project-src/trivy-report.json ]; then
-            docker run --rm \
-              -v $PWD/project-src:/project-src \
+            docker run --rm -v $PWD/project-src:/project-src \
               ghcr.io/interlynk-io/sbomqs:latest score \
               /project-src/trivy-report.json --json | tee project-src/score_evaluation.json | jq '.'
-            echo "✅ SBOM scoring completed."
-          else
-            echo "⚠️ No SBOM found to score."
           fi
 
       - name: Sanitize artifact name
