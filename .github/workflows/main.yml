@@ -1,95 +1,44 @@
-name: Fetch Top IoT Repositories + Trivy SBOM Scan (Full NTIA + BSI V2 Compliance)
+name: SBOM Scan + Enrichment + NTIA/BSI v2 Compliance
 
 on:
   workflow_dispatch:
-    inputs:
-      language:
-        description: "Programming language to scan (e.g. C++, Python, Java)"
-        required: true
-        default: "C++"
-
-permissions:
-  contents: read
-  security-events: write
-  actions: read
+  push:
 
 jobs:
-  # ---------------------------------------------------------
-  # 1. FETCH TOP IoT REPOSITORIES
-  # ---------------------------------------------------------
-  fetch_top_repos:
-    name: Fetch top 50 IoT GitHub repositories (${{ github.event.inputs.language }})
-    runs-on: ubuntu-latest
-    outputs:
-      repo_list: ${{ steps.fetch.outputs.repo_list }}
-
-    steps:
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Fetch top 50 IoT repositories
-        id: fetch
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LANG: ${{ github.event.inputs.language }}
-        run: |
-          echo "🔍 Fetching top 50 IoT-related repositories written in $LANG..."
-          REPOS=$(gh api /search/repositories \
-            --method GET \
-            -F q="IoT language:$LANG fork:true archived:false" \
-            -F sort=stars -F order=desc -F per_page=50 \
-            --jq '.items[].full_name')
-          JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
-          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
-  # ---------------------------------------------------------
-  # 2. SBOM SCAN + ENRICHMENT + NTIA/BSI COMPLIANCE
-  # ---------------------------------------------------------
   sbom_scan:
-    name: SBOM Scan + Enrichment + Compliance Checks
-    needs: fetch_top_repos
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
-        repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
-    continue-on-error: true
+        repo:
+          - WasmEdge/WasmEdge
+          - opendata-stuttgart/sensors-software
+          # Add more repos here
 
     steps:
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y jq uuid-runtime python3-pip coreutils
-          pip install conan
-
-      - name: Checkout repository
-        id: checkout
+      - name: Checkout ${{ matrix.repo }}
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
-          path: project-src
-          fetch-depth: 0
-          token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
 
-      - name: Prepare directory for SBOM scan
+      - name: Install Dependencies
         run: |
-          mkdir -p scan-root
-          cp -r project-src/* scan-root/
+          sudo apt-get update
+          sudo apt-get install -y jq curl
 
-      - name: Run Trivy SBOM scan
-        uses: aquasecurity/trivy-action@0.25.0
+      - name: Scan with Trivy for SBOM
+        uses: aquasecurity/trivy-action@0.20.0
         with:
-          scan-type: filesystem
-          scan-ref: ./scan-root
+          scan-type: fs
           format: cyclonedx
           output: scan-root/trivy-sbom.json
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: CRITICAL,HIGH,MEDIUM
-          timeout: 15m
+          exit-code: 0
 
       - name: Enrich SBOM with metadata and component context
+        id: enrich
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           FILE="scan-root/trivy-sbom.json"
           [ -f "$FILE" ] || { echo "❌ No SBOM found"; exit 0; }
@@ -97,17 +46,21 @@ jobs:
           REPO="${{ matrix.repo }}"
           REPO_URL="https://github.com/$REPO"
           REPO_JSON=$(gh api repos/$REPO --jq '{supplier: .owner.login, openIssues: .open_issues_count, description: .description}')
-
+          
           jq --arg repo "$REPO_URL" --argjson repoInfo "$REPO_JSON" '
             .metadata.timestamp //= (now | todate) |
             .metadata.supplier = $repoInfo.supplier |
 
-            (.metadata.tools //= []) |
-            (.metadata.tools |= (if type == "array" then . else [.] )) |
+            # Ensure tools is an array
+            .metadata.tools = (
+              if (.metadata.tools | type != "array") then [] else .metadata.tools end
+            ) |
             .metadata.tools += [{"vendor": "GitHub", "name": "Actions", "version": "latest"}] |
 
-            (.metadata.properties //= []) |
-            (.metadata.properties |= (if type == "array" then . else [.] )) |
+            # Ensure properties is an array
+            .metadata.properties = (
+              if (.metadata.properties | type != "array") then [] else .metadata.properties end
+            ) |
             .metadata.properties += [
               {"name": "sbom_build_process", "value": "Trivy CI Scan"},
               {"name": "sbom_with_bomlinks", "value": "true"},
@@ -115,79 +68,32 @@ jobs:
               {"name": "comp_with_supplier", "value": $repoInfo.supplier}
             ] |
 
-            (.metadata.bomLinks //= []) |
-            (.metadata.bomLinks |= (if type == "array" then . else [.] )) |
+            # Ensure bomLinks is an array
+            .metadata.bomLinks = (
+              if (.metadata.bomLinks | type != "array") then [] else .metadata.bomLinks end
+            ) |
             .metadata.bomLinks += [{"rel": "vcs", "href": $repo}] |
 
-            (.components |= map(
-              .properties //= [] |
-              .properties |= (if type == "array" then . else []) |
+            # Add component level properties
+            .components |= map(
+              .properties = (
+                if (.properties | type != "array") then [] else .properties end
+              ) |
               .properties += [
                 {"name": "comp_with_source_code_hash", "value": (.hashes[0].content // "false")}
               ]
-            ))
+            )
           ' "$FILE" > enriched.json && mv enriched.json "$FILE"
 
-      - name: Validate enriched SBOM
-        run: |
-          echo "🔎 SBOM Metadata:"
-          jq '.metadata' scan-root/trivy-sbom.json | head -50
-          echo "🔎 First component:"
-          jq '.components[0]' scan-root/trivy-sbom.json | head -20
-
       - name: Sanitize artifact name
-        id: sanitize
+        id: sanitized
         run: |
-          SAFE_NAME=$(echo "${{ matrix.repo }}" | sed 's|/|_|g')
-          echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
+          SAFE_NAME="${{ matrix.repo }}"
+          SAFE_NAME="${SAFE_NAME//\//_}"
+          echo "safe_name=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Upload SBOM artifact
+      - name: Upload enriched SBOM
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-${{ steps.sanitize.outputs.name }}
-          path: scan-root/trivy-sbom.json
-          if-no-files-found: warn
-
-  # ---------------------------------------------------------
-  # 3. AGGREGATE RESULTS
-  # ---------------------------------------------------------
-  aggregate_results:
-    name: Aggregate SBOM Results
-    needs: sbom_scan
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download all SBOM artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: results
-
-      - name: Install Python + Pandas
-        run: |
-          sudo apt-get update && sudo apt-get install -y python3-pip
-          pip install pandas
-
-      - name: Aggregate SBOMs
-        run: |
-          python3 <<'EOF'
-          import json, glob, pandas as pd
-          records = []
-          for path in glob.glob("results/**/trivy-sbom.json", recursive=True):
-              try:
-                  with open(path) as f:
-                      records.append(json.load(f))
-              except Exception as e:
-                  print(f"⚠️ Failed to load {path}: {e}")
-          if records:
-              df = pd.json_normalize(records)
-              df.to_csv("sbom_aggregated_report.csv", index=False)
-              print("🟢 Aggregated into sbom_aggregated_report.csv")
-          else:
-              print("❌ No SBOMs found")
-          EOF
-
-      - name: Upload aggregated report
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom-aggregated-report
-          path: sbom_aggregated_report.csv
+          name: sbom-${{ steps.sanitized.outputs.safe_name }}
+          path: scan-root/*.json
