@@ -79,6 +79,7 @@ jobs:
         run: |
           conan profile detect --force
           echo "Conan profile initialized."
+
       - name: Run Trivy SBOM scan
         if: steps.checkout.outcome == 'success'
         continue-on-error: true
@@ -95,7 +96,7 @@ jobs:
           timeout: 10m
 
       # ---------------------------------------------------------
-      # SBOM ENRICHMENT (safe array handling)
+      # SBOM ENRICHMENT (initial)
       # ---------------------------------------------------------
       - name: Enrich SBOM with metadata
         run: |
@@ -122,6 +123,37 @@ jobs:
               .properties = (if .properties | type == "array" then .properties else [] end) + [{"name": "component_hash", "value": (.hashes[0].content // "unknown")}]
             )
           ' "$FILE" > tmp && mv tmp "$FILE"
+
+      # ---------------------------------------------------------
+      # ADVANCED SBOM ENRICHMENT (for full compliance)
+      # ---------------------------------------------------------
+      - name: Advanced SBOM Metadata Enrichment
+        run: |
+          FILE="project-src/trivy-report.json"
+          [ -f "$FILE" ] || { echo "⚠️ No SBOM found"; exit 0; }
+          cd project-src
+          SUPPLIER=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)/.*|\1|')
+          VERSION=$(git describe --tags --always || echo "unknown")
+          SOURCE_URI=$(git config --get remote.origin.url)
+          SOURCE_HASH=$(git rev-parse HEAD)
+          jq --arg supplier "$SUPPLIER" \
+             --arg version "$VERSION" \
+             --arg uri "$SOURCE_URI" \
+             --arg hash "$SOURCE_HASH" \
+             '
+             .components |= map(
+               .supplier = {"name": $supplier}
+               | .version = $version
+               | .properties += [
+                   {"name": "source_code_uri", "value": $uri},
+                   {"name": "source_code_hash", "value": $hash}
+                 ]
+             ) |
+             .metadata.properties += [
+               {"name": "sbom_build_process", "value": "GitHub Actions CI"},
+               {"name": "sbom_with_signature", "value": "false"}
+             ]
+             ' "$FILE" > ../tmp_sbom && mv ../tmp_sbom "$FILE"
 
       # ---------------------------------------------------------
       # NTIA / BSI COMPLIANCE CHECKS
@@ -185,6 +217,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y python3-pip
           pip install pandas
+
       - name: Aggregate SBOMQS Data
         run: |
           python3 <<EOF
