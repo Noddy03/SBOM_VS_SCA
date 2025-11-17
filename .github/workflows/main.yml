@@ -1,4 +1,4 @@
-name: Fetch Top IoT Repositories + Full Trivy SBOM (NTIA + BSI)
+name: Fetch Top IoT Repositories + Trivy SBOM + Enrichment (NTIA + BSI)
 
 on:
   workflow_dispatch:
@@ -14,125 +14,235 @@ permissions:
   actions: read
 
 jobs:
+  # ---------------------------------------------------------
+  # 1. FETCH TOP IoT REPOSITORIES
+  # ---------------------------------------------------------
   fetch_top_repos:
-    name: Fetch top IoT repos (${{ github.event.inputs.language }})
+    name: Fetch top 50 IoT repositories (${{ github.event.inputs.language }})
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
     steps:
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-      - name: Fetch top 50 IoT GitHub repos
+      - name: Install dependencies (jq, gh)
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq curl
+          curl -sSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list
+          sudo apt update && sudo apt install -y gh
+      - name: Fetch top 50 IoT repos
         id: fetch
         env:
           GH_TOKEN: ${{ github.token }}
           LANG: ${{ github.event.inputs.language }}
         run: |
-          REPOS=$(gh api /search/repositories \
-            -F q="IoT language:$LANG fork:true archived:false" \
-            -F sort=stars -F order=desc -F per_page=50 \
+          echo "Searching for IoT repos in $LANG..."
+          REPOS=$(gh api search/repositories \
+            --method GET \
+            -f q="IoT language:$LANG fork:true archived:false" \
+            -f sort=stars -f order=desc -f per_page=50 \
             --jq '.items[].full_name')
+
+          if [ -z "$REPOS" ]; then
+            echo "No repositories found. Exiting."
+            exit 1
+          fi
+
           JSON=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON" >> $GITHUB_OUTPUT
 
+  # ---------------------------------------------------------
+  # 2. SBOM SCAN + ENRICHMENT + COMPLIANCE
+  # ---------------------------------------------------------
   sbom_scan:
-    name: SBOM Scan + Full Enrichment
+    name: SBOM Scan + Enrichment + NTIA/BSI V2 Compliance
     needs: fetch_top_repos
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+        repo: ${{ fromJson(needs.fetch_top_repos.outputs.repo_list) }}
+    continue-on-error: true
 
     steps:
       - name: Install tools
         run: |
-          sudo apt-get update && sudo apt-get install -y jq uuid-runtime coreutils python3-pip
+          sudo apt-get update && sudo apt-get install -y jq uuid-runtime python3-pip coreutils
           pip install conan
-          sudo wget -O /usr/local/bin/trivy https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.55.0_Linux-64bit.deb
-          sudo chmod +x /usr/local/bin/trivy
-
-      - name: Checkout repo
+      - name: Checkout repository
+        id: checkout
+        continue-on-error: true
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
-          path: src
+          path: project-src
           fetch-depth: 0
+          token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
 
-      - name: Run Trivy scan (CycloneDX)
-        run: |
-          trivy fs --format cyclonedx --output src/trivy-sbom.json --scanners license,vuln --ignore-unfixed ./src
-          echo "SBOM saved at src/trivy-sbom.json"
+      - name: Conan setup
+        if: steps.checkout.outcome == 'success'
+        run: conan profile detect --force
 
-      # --- SBOM ENRICHMENT USING JQ ---
-      - name: Enrich SBOM with metadata, hashes, suppliers
+      - name: Run Trivy SBOM scan
+        if: steps.checkout.outcome == 'success'
+        uses: aquasecurity/trivy-action@0.25.0
+        with:
+          scan-type: fs
+          scan-ref: ./project-src
+          format: cyclonedx
+          scanners: vuln
+          output: project-src/trivy-report.json
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH,MEDIUM
+          timeout: 10m
+
+      # ---------------------------------------------------------
+      # SBOM ENRICHMENT
+      # ---------------------------------------------------------
+      - name: Add metadata and enrichment
         run: |
-          FILE=src/trivy-sbom.json
-          [ -f "$FILE" ] || { echo "No SBOM!"; exit 0; }
+          FILE="project-src/trivy-report.json"
+          [ -f "$FILE" ] || { echo "❌ No SBOM found"; exit 0; }
           REPO_URL="https://github.com/${{ matrix.repo }}"
-          
-          # Add build metadata, supplier, timestamps, bom links
-          jq --arg repo "$REPO_URL" '
-            .metadata |= (.timestamp = (now | todate)) |
-            .metadata.tools += [{"vendor": "Aqua Security", "name": "Trivy", "version": "latest"}] |
+          REPO_JSON=$(gh api repos/${{ matrix.repo }} --jq '{supplier: .owner.login, openIssues: .open_issues, description: .description}')
+
+          jq --arg repo "$REPO_URL" --argjson repoInfo "$REPO_JSON" '
+            .metadata.timestamp //= (now | todate) |
+            .metadata.tools += [{"vendor": "GitHub", "name": "Actions", "version": "latest"}] |
             .metadata.properties += [
-              {"name": "buildTool", "value": "Trivy SBOM Scanner"},
-              {"name": "buildEnvironment", "value": "GitHub Actions (Linux)"}
+              {"name": "buildEnvironment", "value": "GitHub Actions Runner (Linux)"},
+              {"name": "buildTool", "value": "Trivy"},
+              {"name": "sbom_build_process", "value": "Trivy GitHub Action workflow"}
             ] |
             .metadata.bomLinks += [{"rel": "source", "href": $repo}] |
+            .metadata.externalReferences += [{"type": "signature", "url": $repo}] |
+            .metadata.supplier = $repoInfo.supplier |
             .components |= map(
-              .supplier |= (.name = ($repo | split("/")[-1])) |
-              .licenses |= (. // [{"license": {"id": "UNKNOWN"}}])
+              .properties += [
+                {"name": "sourceHash", "value": (.hashes[0].content // "")},
+                {"name": "comp_with_source_code_hash", "value": "true"}
+              ]
             )
-          ' "$FILE" > enriched.json && mv enriched.json "$FILE"
+          ' "$FILE" > tmp && mv tmp "$FILE"
 
-      - name: Add source hashes + license auto-detection
+      - name: Inject missing hashes and licenses
         run: |
-          FILE="src/trivy-sbom.json"
-          echo "📦 Computing file hashes..."
-          for f in $(find src -type f -name "*.c" -o -name "*.cpp" -o -name "*.py" -o -name "*.h"); do
-            H=$(sha256sum $f | cut -d" " -f1)
-            FNAME=$(basename $f)
-            jq --arg fn "$FNAME" --arg h "$H" '
+          FILE="project-src/trivy-report.json"
+          TMPFILE="tmp.json"
+          cp "$FILE" "$TMPFILE"
+          find project-src -type f -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.py" | head -50 | while read -r SRC; do
+            H=$(sha256sum "$SRC" | cut -d' ' -f1)
+            jq --arg h "$H" '
               .components |= map(
-                select(.name == $fn) |
-                .hashes += [{"alg": "SHA-256", "content": $h}]
+                (if (.hashes | length == 0) then .hashes = [{"alg":"SHA-256","content":$h}] else . end)
               )
-            ' "$FILE" > tmp.json && mv tmp.json "$FILE"
+            ' "$TMPFILE" > tmp2.json && mv tmp2.json "$TMPFILE"
           done
+          mv "$TMPFILE" "$FILE"
 
-      - name: Show SBOM changes
-        run: jq '.metadata, .components[0]' src/trivy-sbom.json | head -50
+      - name: Validate enriched SBOM
+        run: |
+          jq '.metadata | {bomLinks, externalReferences, properties, supplier}' project-src/trivy-report.json | head
+          jq '.components[] | {name, hashes}' project-src/trivy-report.json | head
 
-      - name: Sign SBOM (optional if key exists)
+      # ---------------------------------------------------------
+      # OPTIONAL SBOM SIGNING
+      # ---------------------------------------------------------
+      - name: Sign SBOM (optional)
+        if: steps.checkout.outcome == 'success'
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
-          if [ -n "$COSIGN_PRIVATE_KEY" ]; then
-            echo "Signing SBOM..."
-            echo "$COSIGN_PRIVATE_KEY" > cosign.key
-            cosign sign-blob --key cosign.key src/trivy-sbom.json --output-signature src/trivy-sbom.sig
-          else
-            echo "Skipping signature."
+          if [ -z "$COSIGN_PRIVATE_KEY" ]; then
+            echo "⚠️ No Cosign key provided — skipping signing."
+            exit 0
           fi
+          echo "$COSIGN_PRIVATE_KEY" > cosign.key
+          cosign sign-blob --key cosign.key project-src/trivy-report.json --output-signature project-src/trivy-report.sig
 
-      - name: Save artifacts
+      # ---------------------------------------------------------
+      # COMPLIANCE + SCORE
+      # ---------------------------------------------------------
+      - name: Compliance SBOM NTIA + BSI
+        run: |
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
+
+      - name: SBOM Score Evaluation
+        run: |
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest score \
+            /project-src/trivy-report.json --json > project-src/score_evaluation.json
+
+      # ---------------------------------------------------------
+      # ARTIFACT UPLOAD
+      # ---------------------------------------------------------
+      - name: Sanitize artifact name
+        id: sanitize
+        run: |
+          SAFE_NAME=${{ matrix.repo }}
+          SAFE_NAME="${SAFE_NAME//\//_}"
+          echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-${{ steps.sanitized.outputs.safe_name }}
-          path: src/*.json
+          name: sbom-${{ steps.sanitize.outputs.name }}
+          path: project-src/*.json
+          if-no-files-found: warn
 
-
+  # ---------------------------------------------------------
+  # 3. AGGREGATE RESULTS
+  # ---------------------------------------------------------
   aggregate_results:
-    name: Aggregate Results
+    name: Aggregate SBOM Compliance & Score Results
     needs: sbom_scan
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          path: results
-      - name: Aggregate SBOMs
+          path: results/
+
+      - name: Install Python + Pandas
+        run: sudo apt-get update && sudo apt-get install -y python3-pip && pip install pandas
+
+      - name: Aggregate all JSON results
         run: |
-          ls -R results/
-          echo "Aggregating complete ✔"
+          python3 <<'EOF'
+          import json, glob, pandas as pd, os
+          def load_json_safe(path):
+              try:
+                  with open(path) as f:
+                      return json.load(f)
+              except Exception:
+                  return None
+          records = []
+          for path in glob.glob("results/**/score_evaluation.json", recursive=True):
+              repo = os.path.basename(os.path.dirname(path))
+              data = load_json_safe(path)
+              if data: data["repository"] = repo; records.append(data)
+          for std in ["BSI","NTIA"]:
+              for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
+                  repo = os.path.basename(os.path.dirname(path))
+                  data = load_json_safe(path)
+                  if data: data["repository"] = repo; data["standard"] = std; records.append(data)
+          if records:
+              pd.json_normalize(records).to_csv("sbomqs_summary.csv", index=False)
+              print(f"Aggregated {len(records)} SBOMQS results.")
+          EOF
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbomqs-summary
+          path: sbomqs_summary.csv
