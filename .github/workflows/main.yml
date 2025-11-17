@@ -120,8 +120,9 @@ jobs:
       - name: Save artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-${{ matrix.repo//\//_ }}
+          name: sbom-${{ replace(matrix.repo, '/', '_') }}
           path: src/*.json
+
 
   aggregate_results:
     name: Aggregate Results
