@@ -56,7 +56,7 @@ jobs:
     continue-on-error: true
 
     env:
-      SBOM_OUT: project-src/trivy-report.json
+      SBOM_OUT: ${{ github.workspace }}/project-src/trivy-report.json
 
     steps:
       - name: Setup environments
@@ -76,8 +76,7 @@ jobs:
 
       - name: Conan setup
         if: steps.checkout.outcome == 'success'
-        run: |
-          conan profile detect --force
+        run: conan profile detect --force
 
       - name: Run Trivy SBOM scan
         continue-on-error: true
@@ -92,41 +91,42 @@ jobs:
           severity: CRITICAL,HIGH,MEDIUM
           timeout: 15m
 
-      - name: Validate SBOM presence
+      - name: Check SBOM existence
         run: |
           if [ ! -f "${{ env.SBOM_OUT }}" ]; then
-            echo "❌ No SBOM found at ${{ env.SBOM_OUT }}" && exit 0
+            echo "❌ SBOM file not found: ${{ env.SBOM_OUT }}"
+            ls -R "${{ github.workspace }}/project-src" || true
+            exit 0
           fi
+          echo "🟢 SBOM found: ${{ env.SBOM_OUT }}"
 
       # ---------------------------------------------------------
       # Generate Dependency Graph SBOM (CycloneDX)
       # ---------------------------------------------------------
-      - name: Generate CycloneDX component dependency graph
+      - name: Generate CycloneDX Dependency SBOM
         run: |
           cyclonedx-bom -o project-src/deps.bom.json -e -i ./project-src || echo "⚠️ Dependency scan failed"
 
-      - name: Merge Trivy and Dependency SBOM
+      - name: Merge SBOMs
         run: |
           if [ -f project-src/deps.bom.json ]; then
-            cat project-src/deps.bom.json | jq -s '.[0] * .[1]' > project-src/merged-sbom.json
+            jq -s '.[0] * .[1]' ${{ env.SBOM_OUT }} project-src/deps.bom.json > project-src/merged-sbom.json
             mv project-src/merged-sbom.json ${{ env.SBOM_OUT }}
           fi
 
       # ---------------------------------------------------------
-      # Enrich SBOM with Full Metadata (BSI + NTIA)
+      # Enrich SBOM for BSI V2 & NTIA
       # ---------------------------------------------------------
-      - name: Enrich SBOM with required fields
+      - name: Enrich SBOM with required BSI & NTIA fields
         run: |
           FILE="${{ env.SBOM_OUT }}"
-          cd project-src
+          cd "${{ github.workspace }}/project-src"
 
-          # Extract basic info
           SUPPLIER=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)/.*|\1|')
-          VERSION=$(git describe --tags --always || echo "unknown")
+          VERSION=$(git describe --tags --always 2>/dev/null || echo "unknown")
           SOURCE_URI=$(git config --get remote.origin.url)
-          SOURCE_HASH=$(git rev-parse HEAD || echo "unknown")
+          SOURCE_HASH=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 
-          # Enrich components and metadata
           jq --arg supplier "$SUPPLIER" \
              --arg version "$VERSION" \
              --arg uri "$SOURCE_URI" \
@@ -151,10 +151,10 @@ jobs:
              .metadata.bomLinks = [
                { "rel": "vcs", "href": $uri }
              ]
-             ' "$FILE" > ../tmp_sbom && mv ../tmp_sbom "$FILE"
+             ' "$FILE" > tmp_sbom && mv tmp_sbom "$FILE"
 
       # ---------------------------------------------------------
-      # COMPLIANCE CHECKS
+      # Compliance Checks
       # ---------------------------------------------------------
       - name: NTIA Compliance Check
         run: |
@@ -179,14 +179,6 @@ jobs:
             ghcr.io/interlynk-io/sbomqs:latest score \
             /project-src/trivy-report.json --json \
             > project-src/score_evaluation.json
-
-      - name: Check for score threshold
-        run: |
-          SCORE=$(jq '.score' project-src/score_evaluation.json)
-          echo "SBOM Score: $SCORE for ${{ matrix.repo }}"
-          if (( $(echo "$SCORE < 7.0" | bc -l) )); then
-            echo "⚠️ SBOM score for ${{ matrix.repo }} below 7.0"
-          fi
 
       - name: Upload SBOM Reports
         uses: actions/upload-artifact@v4
@@ -225,9 +217,12 @@ jobs:
                   repo = path.split('/')[-2]
                   data['repository'] = repo
                   records.append(data)
-          df = pd.DataFrame(records) if records else pd.DataFrame()
-          df.to_csv('sbomqs_summary.csv', index=False)
-          print(df.head())
+          if records:
+              df = pd.DataFrame(records)
+              df.to_csv('sbomqs_summary.csv', index=False)
+              print("🟢 Summary created: sbomqs_summary.csv")
+          else:
+              print("⚠️ No SBOM scores found.")
           EOF
 
       - name: Upload Summary Report
