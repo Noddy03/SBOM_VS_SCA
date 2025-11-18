@@ -58,6 +58,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y jq uuid-runtime python3-pip coreutils
           pip install conan
+
       - name: Checkout repository
         id: checkout
         continue-on-error: true
@@ -82,7 +83,7 @@ jobs:
           scan-type: fs
           scan-ref: ./project-src
           format: cyclonedx
-          scanners: vuln
+          scanners: vuln,license # Added license scanner
           output: project-src/trivy-report.json
           ignore-unfixed: true
           vuln-type: os,library
@@ -98,38 +99,37 @@ jobs:
           REPO: ${{ matrix.repo }}
         run: |
           set -euo pipefail
-
           SBOM_ORIG="project-src/trivy-report.json"
           WORKDIR="sbom-workdir"
           mkdir -p "$WORKDIR"
-
           if [ ! -f "$SBOM_ORIG" ]; then
             echo "❌ No SBOM found, skipping enrichment."
             exit 0
           fi
-
           echo "🔓 Fixing SBOM permissions..."
           sudo chmod u+w "$SBOM_ORIG"
-
           SBOM="$WORKDIR/trivy-report.json"
           cp "$SBOM_ORIG" "$SBOM"
           chmod u+w "$SBOM"
-
           REPO_URL="https://github.com/$REPO"
           RELEASE_URL="$REPO_URL/releases/latest"
-
           echo "🔬 Enriching SBOM..."
-
-          # 1. Add supplier, missing licenses, external refs
+          
+          # 1. Add missing licenses, supplier, and external refs
           jq --arg repo "$REPO_URL" --arg release "$RELEASE_URL" '
             .components |= map(
               .supplier = (.supplier // {"name": ($repo | split("/") | .[-2])}) |
-              .licenses = (.licenses // [{"license":{"id":"NOASSERTION"}}]) |
+              .licenses = (
+                if (.licenses | length == 0 or .licenses == null)
+                then [{"license": {"id": "NOASSERTION"}}]
+                else .licenses end
+              ) |
               .externalReferences = (.externalReferences // []) + [
                 {"type": "vcs", "url": $repo},
                 {"type": "distribution", "url": $release}
               ]
-            )
+            ) |
+            .metadata.licenses = (.metadata.licenses // [{"license":{"id":"NOASSERTION"}}])
           ' "$SBOM" > "$SBOM.tmp" && mv "$SBOM.tmp" "$SBOM"
 
           # 2. Inject source file hashes and URIs safely
@@ -149,7 +149,7 @@ jobs:
               )
             ' "$SBOM" > "$SBOM.tmp" && mv "$SBOM.tmp" "$SBOM"
           done || true
-
+          
           # 3. Add SBOM metadata and external BOM links
           jq --arg now "$(date -Iseconds)" '
             .metadata.properties += [
@@ -275,12 +275,14 @@ jobs:
               except Exception as e:
                   print(f"⚠️ Skipping invalid JSON in {path}: {e}")
                   return None
+
           records = []
           for path in glob.glob("results/**/score_evaluation.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
               data = load_json_safe(path)
               if data:
                   data["repository"] = repo; records.append(data)
+
           for std in ["BSI","NTIA"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
                   repo = os.path.basename(os.path.dirname(path))
@@ -289,6 +291,7 @@ jobs:
                       data["repository"] = repo
                       data["standard"] = std
                       records.append(data)
+
           if not records:
               print("❌ No valid SBOMQS data found.")
           else:
