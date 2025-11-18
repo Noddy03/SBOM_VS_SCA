@@ -273,45 +273,40 @@ jobs:
 
       - name: Aggregate SBOMQS results to CSV
         run: |
-          python3 <<'PY'
+          python3 << 'PY'
           import json, glob, pandas as pd, os
-
 
           def load_json_safe(p):
             try:
-              txt=open(p).read().strip()
-              return json.loads(txt) if txt else None
+            txt = open(p).read().strip()
+            return json.loads(txt) if txt else None
             except:
-                return None
+              return None
 
-              rows=[]
+          rows = []
 
-            for path in glob.glob("results/**/score_evaluation.json", recursive=True):
-              repo=os.path.basename(os.path.dirname(path))
-              d=load_json_safe(path)
+          # score outputs
+          for path in glob.glob("results/**/score_evaluation.json", recursive=True):
+            repo = os.path.basename(os.path.dirname(path))
+            d = load_json_safe(path)
             if d:
-                d["repository"]=repo
+                d["repository"] = repo
                 rows.append(d)
 
-            for std in ["NTIA","BSI"]:
+          # compliance outputs
+          for std in ["NTIA", "BSI"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
-                repo=os.path.basename(os.path.dirname(path))
-                d=load_json_safe(path)
-              if d:
-                  d["repository"]=repo
-                  d["standard"]=std
-                  rows.append(d)
+                  repo = os.path.basename(os.path.dirname(path))
+                  d = load_json_safe(path)
+                 if d:
+                    d["repository"] = repo
+                    d["standard"] = std
+                    rows.append(d)
 
-              if rows:
-                df=pd.json_normalize(rows)
-                df.to_csv( "sbomqs_summary.csv", index=False)
-                print("✔ wrote sbomqs_summary.csv")
-            else:
-                    print("⚠ no results found")
-                  PY
-
-      - name: Upload aggregated summary
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbomqs-summary
-          path: sbomqs_summary.csv
+          if rows:
+              df = pd.json_normalize(rows)
+              df.to_csv("sbomqs_summary.csv", index=False)
+              print("✔ wrote sbomqs_summary.csv")
+          else:
+              print("⚠ no results found")
+PY
