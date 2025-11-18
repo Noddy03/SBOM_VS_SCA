@@ -14,9 +14,6 @@ permissions:
   actions: read
 
 jobs:
-  # ---------------------------------------------------------
-  # 1. FETCH TOP IoT REPOSITORIES
-  # ---------------------------------------------------------
   fetch_top_repos:
     name: Fetch top 50 IoT GitHub repositories (${{ github.event.inputs.language }})
     runs-on: ubuntu-latest
@@ -32,7 +29,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           LANG: ${{ github.event.inputs.language }}
         run: |
-          echo "Fetching top 50 IoT-related repositories written in $LANG..."
           REPOS=$(gh api /search/repositories \
             --method GET \
             -F q="IoT language:$LANG fork:false archived:false" \
@@ -41,109 +37,102 @@ jobs:
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  # ---------------------------------------------------------
-  # 2. SBOM SCAN + ENRICHMENT + COMPLIANCE
-  # ---------------------------------------------------------
   sbom_scan:
-    name: SBOM Scan + Enrichment + NTIA/BSI V2 Compliance
+    name: SBOM Scan + Enrichment + Compliance
     needs: fetch_top_repos
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+      fail-fast: false
     continue-on-error: true
-
     steps:
-      - name: Setup environments
+      - name: Install Prerequisites
         run: |
           sudo apt-get update && sudo apt-get install -y jq uuid-runtime python3-pip coreutils
           pip install conan
 
-      - name: Checkout repository
-        id: checkout
-        continue-on-error: true
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
           path: project-src
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
-          token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
+        continue-on-error: true
+        id: checkout
 
-      - name: Conan setup
+      - name: Setup Conan (if needed)
         if: steps.checkout.outcome == 'success'
         run: |
           conan profile detect --force
-          echo "🔧 Conan setup complete."
 
-      - name: Run Trivy SBOM scan
+      - name: Run Trivy SBOM Scan
         if: steps.checkout.outcome == 'success'
-        continue-on-error: true
         uses: aquasecurity/trivy-action@0.25.0
         with:
           scan-type: fs
           scan-ref: ./project-src
           format: cyclonedx
-          scanners: vuln
+          severity: CRITICAL,HIGH,MEDIUM
           output: project-src/trivy-report.json
           ignore-unfixed: true
-          vuln-type: os,library
-          severity: CRITICAL,HIGH,MEDIUM
-          timeout: 10m
+          scanners: vuln
+        continue-on-error: true
 
-      # ---------------------------------------------------------
-      # SBOM ENRICHMENT (NTIA + BSI compliance)
-      # ---------------------------------------------------------
-      - name: Enrich SBOM for NTIA/BSI compliance
+      - name: Safe SBOM Enrichment (NTIA + BSI)
+        if: steps.checkout.outcome == 'success'
+        env:
+          REPO: ${{ matrix.repo }}
         run: |
           set -euo pipefail
 
-          SBOM="project-src/trivy-report.json"
-          REPO_URL="https://github.com/${{ matrix.repo }}"
-          RELEASE_URL="$REPO_URL/releases/latest"
+          SBOM_ORIG="project-src/trivy-report.json"
+          WORKDIR="sbom-workdir"
+          mkdir -p "$WORKDIR"
 
-          if [ ! -f "$SBOM" ]; then
+          # Check SBOM exists
+          if [ ! -f "$SBOM_ORIG" ]; then
             echo "❌ No SBOM found, skipping enrichment."
             exit 0
           fi
 
-          echo "🔧 Fixing permissions..."
-          chmod -R u+w project-src/
+          SBOM="$WORKDIR/trivy-report.json"
+          cp "$SBOM_ORIG" "$SBOM"
+          chmod u+w "$SBOM"
 
-          echo "🔬 Enriching SBOM with NTIA and BSI-required fields..."
+          REPO_URL="https://github.com/$REPO"
+          RELEASE_URL="$REPO_URL/releases/latest"
 
-          TMP="$SBOM.tmp"
-          cp "$SBOM" "$TMP"
+          echo "🔬 Enriching SBOM..."
 
-          # 1. Add supplier, licenses, external references
+          # 1. Add supplier, missing licenses, external refs
           jq --arg repo "$REPO_URL" --arg release "$RELEASE_URL" '
             .components |= map(
               .supplier = (.supplier // {"name": ($repo | split("/") | .[-2])}) |
               .licenses = (.licenses // [{"license":{"id":"NOASSERTION"}}]) |
-              .externalReferences += [
+              .externalReferences = (.externalReferences // []) + [
                 {"type": "vcs", "url": $repo},
                 {"type": "distribution", "url": $release}
               ]
             )
-          ' "$TMP" > "$TMP.1" && mv "$TMP.1" "$TMP"
+          ' "$SBOM" > "$SBOM.tmp" && mv "$SBOM.tmp" "$SBOM"
 
-          # 2. Inject source file hashes and URIs
-          echo "🧮 Injecting source file hashes..."
+          # 2. Inject source file hashes and URI matches
           find project-src -type f -print0 | head -zn 50 | while IFS= read -r -d '' FILEPATH; do
             HASH=$(sha256sum "$FILEPATH" | awk '{print $1}')
-            RELPATH=$(realpath --relative-to=project-src "$FILEPATH")
+            RELPATH=${FILEPATH#project-src/}
             jq --arg rel "$RELPATH" --arg hash "$HASH" '
               .components |= map(
-                if (.properties // [] | map(.value) | contains([$rel])) then
-                  .properties += [
+                if (.name | contains($rel)) then
+                  .properties = (.properties // []) + [
                     {"name": "source_code_uri", "value": $rel},
                     {"name": "source_code_hash", "value": $hash}
                   ]
-                else
-                  .
+                else .
                 end
               )
-            ' "$TMP" > "$TMP.2" && mv "$TMP.2" "$TMP"
+            ' "$SBOM" > "$SBOM.tmp" && mv "$SBOM.tmp" "$SBOM"
           done || true
 
           # 3. Add SBOM metadata
@@ -156,122 +145,78 @@ jobs:
               {"name":"spec_with_version_compliant","value":"true"}
             ] |
             .metadata.externalReferences += [
-              {"type":"signature", "url":"https://sigstore.dev"}
+              {"type":"signature","url":"https://sigstore.dev"}
             ]
-          ' "$TMP" > "$SBOM"
+          ' "$SBOM" > "$SBOM.tmp" && mv "$SBOM.tmp" "$SBOM"
 
-          echo "🟢 SBOM enrichment complete."
-
-      - name: Validate enriched SBOM fields
-        run: |
-          echo "📋 Checking enriched SBOM fields..."
-          jq '.metadata | {properties, externalReferences}' project-src/trivy-report.json | head -20
-          jq '.components[] | {name, supplier, licenses, properties, externalReferences}' project-src/trivy-report.json | head -10
-
-      # ---------------------------------------------------------
-      # COMPLIANCE & SCORE
-      # ---------------------------------------------------------
-      - name: Compliance SBOM NTIA
-        run: |
-          docker run --rm \
-            -v $PWD/project-src:/project-src \
-            ghcr.io/interlynk-io/sbomqs:latest compliance \
-            --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json || true
-
-      - name: Compliance SBOM BSI
-        run: |
-          docker run --rm \
-            -v $PWD/project-src:/project-src \
-            ghcr.io/interlynk-io/sbomqs:latest compliance \
-            --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json || true
+          cp "$SBOM" "$SBOM_ORIG"
 
       - name: Score SBOM
+        if: steps.checkout.outcome == 'success'
         run: |
-          docker run --rm \
-            -v $PWD/project-src:/project-src \
+          docker run --rm -v $PWD/project-src:/src \
             ghcr.io/interlynk-io/sbomqs:latest score \
-            /project-src/trivy-report.json --json > project-src/score_evaluation.json || true
+            /src/trivy-report.json --json > project-src/score_evaluation.json
 
-      # ---------------------------------------------------------
-      # DIAGNOSTIC CHECK
-      # ---------------------------------------------------------
-      - name: Diagnostic:print zero-score fields
+      - name: Compliance NTIA + BSI
+        if: steps.checkout.outcome == 'success'
         run: |
-          echo "🔎 Checking for zero-score NTIA/BSI fields..."
-          for FILE in project-src/compliance_NTIA.json project-src/compliance_BSI.json; do
-            if [ -f "$FILE" ]; then
-              jq -r 'to_entries[] | select(.value == 0) | "❌ " + .key' "$FILE"
-            else
-              echo "⚠️ Missing compliance file for $FILE"
-            fi
-          done
+          docker run --rm -v $PWD/project-src:/src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --ntia /src/trivy-report.json > project-src/compliance_NTIA.json
+          docker run --rm -v $PWD/project-src:/src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --bsi-v2 /src/trivy-report.json > project-src/compliance_BSI.json
 
-      - name: Sanitize artifact name
+      - name: Sanitize Artifact Name
         id: sanitize
         run: |
           SAFE_NAME="${{ matrix.repo }}"
           SAFE_NAME="${SAFE_NAME//\//_}"
           echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Upload SBOM reports
+      - name: Upload SBOM Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
           path: project-src/*.json
           if-no-files-found: warn
 
-  # ---------------------------------------------------------
-  # 3. AGGREGATE RESULTS
-  # ---------------------------------------------------------
   aggregate_results:
     name: Aggregate SBOMQS Results
     needs: sbom_scan
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
           path: results/
 
       - name: Install Python + Pandas
         run: |
-          sudo apt-get update && sudo apt-get install -y python3-pip
+          sudo apt-get install -y python3-pip
           pip install pandas
 
-      - name: Aggregate all JSON results
+      - name: Aggregate Results
         run: |
           python3 <<'EOF'
           import json, glob, pandas as pd, os
-
-          def load_json(path):
+          def load_json_safe(path):
               try:
-                  with open(path) as f: return json.load(f)
-              except: return None
-
+                  with open(path) as f:
+                      return json.loads(f.read())
+              except:
+                  return None
           records = []
           for path in glob.glob("results/**/score_evaluation.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
-              data = load_json(path)
-              if data: data["repository"] = repo; records.append(data)
-
-          for std in ["BSI", "NTIA"]:
-              for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
-                  repo = os.path.basename(os.path.dirname(path))
-                  data = load_json(path)
-                  if data:
-                      data["standard"] = std
-                      data["repository"] = repo
-                      records.append(data)
-
-          if records:
-              df = pd.json_normalize(records)
-              df.to_csv("sbomqs_summary.csv", index=False)
-              print("📊 Aggregated transparency records.")
-          else:
-              print("❌ No valid SBOMQS results found.")
+              data = load_json_safe(path)
+              if data: records.append({"repository": repo, **data})
+          df = pd.DataFrame(records)
+          df.to_csv("sbomqs_summary.csv", index=False)
           EOF
 
-      - name: Upload aggregated summary
+      - name: Upload Summary
         uses: actions/upload-artifact@v4
         with:
           name: sbomqs-summary
