@@ -15,13 +15,14 @@ permissions:
 
 jobs:
   # ------------------------------------------------------------------
-  # 1. Fetch top IoT repositories
+  # 1. Fetch top IoT repositories (topic:IoT)
   # ------------------------------------------------------------------
   fetch_top_repos:
     name: Fetch top 50 IoT repositories (${{ github.event.inputs.language }})
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
+
     steps:
       - name: Install jq & gh
         run: |
@@ -38,7 +39,6 @@ jobs:
           echo "🔎 Searching top IoT repos via topic:IoT"
           RAW_Q="topic:IoT language:\"$LANG\" fork:false archived:false"
           echo "🔍 Query: $RAW_Q"
-
           REPOS=$(gh api -X GET /search/repositories \
             --raw-field q="$RAW_Q" \
             --raw-field sort=stars \
@@ -46,18 +46,20 @@ jobs:
             --raw-field per_page=50 \
             --jq '.items[].full_name'
           )
-
+          echo "Found repositories:"
+          echo "$REPOS"
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   # ------------------------------------------------------------------
-  # 2. SBOM SCAN + ENRICHMENT (matrix)
+  # 2. SBOM SCAN + ENRICHMENT + NTIA/BSI V2 Compliance (matrix over repos)
   # ------------------------------------------------------------------
   sbom_scan:
     name: SBOM Scan + Enrichment + NTIA/BSI V2 Compliance
     needs: fetch_top_repos
     runs-on: ubuntu-latest
     continue-on-error: true
+
     strategy:
       fail-fast: false
       matrix:
@@ -70,9 +72,9 @@ jobs:
           sudo apt-get install -y jq uuid-runtime python3-pip coreutils
           pip install conan
 
-      # -------------------------------------------------------
-      # SAFE CHECKOUT WITH RETRIES
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
+      # FIXED — Checkout with retry (3 attempts)
+      # ------------------------------------------------------------------
       - name: Checkout repository (retry-safe)
         id: checkout
         shell: bash
@@ -80,8 +82,7 @@ jobs:
           REPO: ${{ matrix.repo }}
           TOKEN: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
         run: |
-          set -e
-
+          set -euo pipefail
           ATTEMPTS=0
           MAX_ATTEMPTS=3
           SUCCESS=0
@@ -101,22 +102,23 @@ jobs:
             fi
           done
 
-          if [[ $SUCCESS -eq 0 ]]; then
+          if [[ $SUCCESS -eq 1 ]]; then
+            echo "skip_repo=false" >> $GITHUB_ENV
+          else
             echo "❌ Failed to checkout $REPO after $MAX_ATTEMPTS attempts"
             echo "skip_repo=true" >> $GITHUB_ENV
-          else
-            echo "skip_repo=false" >> $GITHUB_ENV
+          fi
 
-      # -------------------------------------------------------
-      # Conan detect
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
+      # Conan (only if repository cloned)
+      # ------------------------------------------------------------------
       - name: Conan detect (optional)
         if: env.skip_repo != 'true'
         run: conan profile detect --force || true
 
-      # -------------------------------------------------------
-      # Run Trivy CycloneDX SBOM scan
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
+      # Trivy SBOM Scan (CycloneDX JSON)
+      # ------------------------------------------------------------------
       - name: Run Trivy CycloneDX SBOM scan
         if: env.skip_repo != 'true'
         continue-on-error: true
@@ -132,42 +134,41 @@ jobs:
           severity: CRITICAL,HIGH,MEDIUM
           timeout: 15m
 
-      # -------------------------------------------------------
-      # Normalize components bulletproof
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
+      # Bulletproof component normalization
+      # ------------------------------------------------------------------
       - name: Normalize components (bulletproof)
         if: env.skip_repo != 'true'
         run: |
           FILE="project-src/trivy-report.json"
           [ -f "$FILE" ] || exit 0
-
+          echo "🔧 Normalizing .components…"
           jq '
             .components = (
-              .components // [] |
-              (if type=="object" and has("components") then .components else . end) |
-              (if type=="array" then . else [.] end) |
-              map(if type=="array" then .[] else . end) |
-              map(
-                if type=="object" then .
-                else { "name": (tostring), "type": "library" }
-                end
-              )
+              .components
+              // [] 
+              | (if type=="object" and has("components") then .components else . end)
+              | (if type=="array" then . else [.] end)
+              | map(if type=="array" then .[] else . end)
+              | map(
+                  if type=="object" then .
+                  else { "name": (tostring), "type": "library" }
+                  end
+                )
             )
           ' "$FILE" > tmp && mv tmp "$FILE"
 
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
       # Sanitize CycloneDX metadata
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
       - name: Sanitize CycloneDX structure & metadata
         if: env.skip_repo != 'true'
         run: |
           FILE="project-src/trivy-report.json"
           [ -f "$FILE" ] || exit 0
-
           REPO_URL="https://github.com/${{ matrix.repo }}"
-          TS=$(date -Iseconds)
-
-          jq --arg repo "$REPO_URL" --arg ts "$TS" '
+          TIMESTAMP=$(date -Iseconds)
+          jq --arg repo "$REPO_URL" --arg ts "$TIMESTAMP" '
             .bomFormat = (.bomFormat // "CycloneDX") |
             .specVersion = (.specVersion // "1.5") |
             .metadata = (.metadata // {}) |
@@ -176,41 +177,22 @@ jobs:
               if (. == null or .name == null)
               then {"name": ($repo|split("/")[-1]), "type": "application", "version": "UNKNOWN"}
               else . end
-            ) |
-            .metadata.tools |= (
-              if (.metadata.tools|type)=="array" then .metadata.tools
-              elif (.metadata.tools|type)=="object" then [.metadata.tools]
-              else [] end
-            ) |
-            .metadata.properties |= (
-              if (.metadata.properties|type)=="array" then .metadata.properties
-              elif (.metadata.properties|type)=="object" then [.metadata.properties]
-              else [] end
-            ) |
-            .metadata.properties += [
-              {"name":"sbom_generator","value":"Trivy"},
-              {"name":"sbom_repo","value":$repo},
-              {"name":"sbom_enriched_timestamp","value":$ts},
-              {"name":"spec_version","value":(.specVersion // "1.5")}
-            ]
-          ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+            )
+          ' "$FILE" > tmp && mv tmp "$FILE"
 
-      # -------------------------------------------------------
-      # Enrich components
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
+      # Enrich components (licenses, supplier, externalRefs)
+      # ------------------------------------------------------------------
       - name: Enrich components (licenses, supplier, externalRefs, bom-ref)
         if: env.skip_repo != 'true'
         run: |
           FILE="project-src/trivy-report.json"
           [ -f "$FILE" ] || exit 0
-
           REPO_URL="https://github.com/${{ matrix.repo }}"
           RELEASE_URL="$REPO_URL/releases/latest"
-          NOW_STR=$(date -u +"%Y%m%dT%H%M%SZ")
-
-          jq --arg repo "$REPO_URL" --arg release "$RELEASE_URL" --arg now "$NOW_STR" '
-            .components = (.components // []) |
-            map(
+          NOW=$(date -u +"%Y%m%dT%H%M%SZ")
+          jq --arg repo "$REPO_URL" --arg release "$RELEASE_URL" --arg now "$NOW" '
+            .components |= map(
               .["bom-ref"] //= ("urn:uuid:" + (.name // "unknown") + ":" + (.version // "UNKNOWN") + ":" + $now) |
               .version //= "UNKNOWN" |
               .supplier //= {"name": ($repo | split("/")[-2])} |
@@ -219,66 +201,53 @@ jobs:
                 elif .licenses==null then []
                 else [ .licenses ] end
               ) |
-              .licenses = (
-                if (.licenses|length)==0
-                then [{"license":{"id":"NOASSERTION"}}]
-                else .licenses end
-              ) |
+              .licenses = (if (.licenses|length)==0 then [{"license":{"id":"NOASSERTION"}}] else .licenses end) |
               .externalReferences = (.externalReferences // []) +
-                 [{"type":"vcs","url":$repo},{"type":"distribution","url":$release}]
+                [{"type":"vcs","url":$repo},{"type":"distribution","url":$release}]
             )
-          ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+          ' "$FILE" > tmp && mv tmp "$FILE"
 
-      # -------------------------------------------------------
-      # Inject real SHA-256 hashes
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
+      # Inject SHA-256 hashes
+      # ------------------------------------------------------------------
       - name: Inject real SHA-256 hashes for up to 50 files
         if: env.skip_repo != 'true'
         run: |
           FILE="project-src/trivy-report.json"
           [ -f "$FILE" ] || exit 0
-
           mapfile -d $'\0' -t FILES < <(find project-src -type f -print0)
           COUNT=0
           for SRC in "${FILES[@]}"; do
             [ $COUNT -ge 50 ] && break
             COUNT=$((COUNT+1))
-
             HASH=$(sha256sum "$SRC" | awk '{print $1}')
             REL=$(realpath --relative-to="project-src" "$SRC")
-
             jq --arg h "$HASH" --arg rel "$REL" '
               .components |= map(
                 .hashes = (.hashes // []) +
                   [{"alg":"SHA-256","content":$h,"path":$rel}]
               )
-            ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+            ' "$FILE" > tmp && mv tmp "$FILE"
           done
 
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
       # Finalize metadata
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
       - name: Finalize SBOM metadata & external refs
         if: env.skip_repo != 'true'
         run: |
           FILE="project-src/trivy-report.json"
           [ -f "$FILE" ] || exit 0
-
           REPO_URL="https://github.com/${{ matrix.repo }}"
           BURL="$REPO_URL/raw/main/project-src/trivy-report.json"
-
           jq --arg b "$BURL" '
             .metadata.externalReferences = (.metadata.externalReferences // []) +
-              [{"type":"bom","url":$b},{"type":"signature","url":"https://sigstore.dev"}] |
-            .metadata.properties += [
-              {"name":"sbom_with_bomlinks","value":"true"},
-              {"name":"sbom_with_signature","value":"false"}
-            ]
-          ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+              [{"type":"bom","url":$b},{"type":"signature","url":"https://sigstore.dev"}]
+          ' "$FILE" > tmp && mv tmp "$FILE"
 
-      # -------------------------------------------------------
-      # Compliance checks
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
+      # SBOMQS compliance checks
+      # ------------------------------------------------------------------
       - name: Compliance (NTIA)
         if: env.skip_repo != 'true'
         run: |
@@ -300,25 +269,24 @@ jobs:
             score /project-src/trivy-report.json --json \
             > project-src/score_evaluation.json || true
 
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
       # Upload artifacts
-      # -------------------------------------------------------
+      # ------------------------------------------------------------------
       - name: Sanitize artifact name
         run: |
-          SAFE_NAME="${{ matrix.repo }}"
-          SAFE_NAME="${SAFE_NAME//\//_}"
-          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+          SAFE="${{ matrix.repo }}"
+          SAFE="${SAFE//\//_}"
+          echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
 
       - name: Upload SBOM artifacts
-        if: env.skip_repo != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: sbom-reports-${{ env.SAFE_NAME }}
           path: project-src/*.json
-          if-no-files-found: warn
+          if-no-files-found: ignore
 
   # ------------------------------------------------------------------
-  # 3. AGGREGATE RESULTS
+  # 3. Aggregate results
   # ------------------------------------------------------------------
   aggregate_results:
     name: Aggregate SBOMQS Results
@@ -340,46 +308,46 @@ jobs:
       - name: Aggregate SBOMQS results to CSV
         run: |
           python3 <<'PY'
-          import json, glob, pandas as pd, os
+import json, glob, pandas as pd, os
 
-          def load_json_safe(p):
-              try:
-                  with open(p) as f:
-                      s=f.read().strip()
-                      return json.loads(s) if s else None
-              except:
-                  return None
+def load_json_safe(p):
+    try:
+        txt=open(p).read().strip()
+        return json.loads(txt) if txt else None
+    except:
+        return None
 
-          rows=[]
-          for path in glob.glob("results/**/score_evaluation.json", recursive=True):
-              repo=os.path.basename(os.path.dirname(path))
-              d=load_json_safe(path)
-              if d:
-                  d["repository"]=repo
-                  rows.append(d)
+rows=[]
 
-          for std in ["NTIA","BSI"]:
-              for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
-                  repo=os.path.basename(os.path.dirname(path))
-                  d=load_json_safe(path)
-                  if d:
-                      d["repository"]=repo
-                      d["standard"]=std
-                      rows.append(d)
+# score outputs
+for path in glob.glob("results/**/score_evaluation.json", recursive=True):
+    repo=os.path.basename(os.path.dirname(path))
+    d=load_json_safe(path)
+    if d:
+        d["repository"]=repo
+        rows.append(d)
 
-          # ALWAYS write CSV
-          if not rows:
-              print("⚠️ No SBOMQS data found — writing empty CSV.")
-              pd.DataFrame([]).to_csv("sbomqs_summary.csv", index=False)
-          else:
-              df=pd.json_normalize(rows)
-              df.to_csv("sbomqs_summary.csv", index=False)
-              print("📊 Wrote sbomqs_summary.csv with", len(rows), "rows")
-          PY
+# compliance
+for std in ["NTIA","BSI"]:
+    for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
+        repo=os.path.basename(os.path.dirname(path))
+        d=load_json_safe(path)
+        if d:
+            d["repository"]=repo
+            d["standard"]=std
+            rows.append(d)
+
+if rows:
+    df=pd.json_normalize(rows)
+    df.to_csv("sbomqs_summary.csv", index=False)
+    print("✔ wrote sbomqs_summary.csv")
+else:
+    print("⚠ no results found")
+
+PY
 
       - name: Upload aggregated summary
         uses: actions/upload-artifact@v4
         with:
           name: sbomqs-summary
           path: sbomqs_summary.csv
-          if-no-files-found: ignore
