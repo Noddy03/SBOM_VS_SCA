@@ -270,43 +270,45 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y python3-pip
           pip install pandas
-
       - name: Aggregate SBOMQS results to CSV
         run: |
-          python3 << 'PY'
-          import json, glob, pandas as pd, os
+          # create aggregation.py safely (no heredoc)
+          printf '%s\n' 'import json, glob, pandas as pd, os' \
+          '' \
+          'def load_json_safe(p):' \
+          '    try:' \
+          '        txt = open(p).read().strip()' \
+          '        return json.loads(txt) if txt else None' \
+          '    except Exception:' \
+          '        return None' \
+          '' \
+          'rows = []' \
+          '' \
+          '# score outputs' \
+          'for path in glob.glob("results/**/score_evaluation.json", recursive=True):' \
+          '    repo = os.path.basename(os.path.dirname(path))' \
+          '    d = load_json_safe(path)' \
+          '    if d:' \
+          '        d["repository"] = repo' \
+          '        rows.append(d)' \
+          '' \
+          '# compliance outputs' \
+          'for std in ["NTIA", "BSI"]:' \
+          '    for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):' \
+          '        repo = os.path.basename(os.path.dirname(path))' \
+          '        d = load_json_safe(path)' \
+          '        if d:' \
+          '            d["repository"] = repo' \
+          '            d["standard"] = std' \
+          '            rows.append(d)' \
+          '' \
+          'if rows:' \
+          '    df = pd.json_normalize(rows)' \
+          '    df.to_csv("sbomqs_summary.csv", index=False)' \
+          '    print("✔ wrote sbomqs_summary.csv")' \
+          'else:' \
+          '    print("⚠ no results found")' \
+          > aggregation.py
 
-          def load_json_safe(p):
-            try:
-            txt = open(p).read().strip()
-            return json.loads(txt) if txt else None
-            except:
-              return None
-
-          rows = []
-
-          # score outputs
-          for path in glob.glob("results/**/score_evaluation.json", recursive=True):
-            repo = os.path.basename(os.path.dirname(path))
-            d = load_json_safe(path)
-            if d:
-                d["repository"] = repo
-                rows.append(d)
-
-          # compliance outputs
-          for std in ["NTIA", "BSI"]:
-              for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
-                  repo = os.path.basename(os.path.dirname(path))
-                  d = load_json_safe(path)
-                 if d:
-                    d["repository"] = repo
-                    d["standard"] = std
-                    rows.append(d)
-
-          if rows:
-              df = pd.json_normalize(rows)
-              df.to_csv("sbomqs_summary.csv", index=False)
-              print("✔ wrote sbomqs_summary.csv")
-          else:
-              print("⚠ no results found")
-PY
+          # run it
+          python3 aggregation.py
