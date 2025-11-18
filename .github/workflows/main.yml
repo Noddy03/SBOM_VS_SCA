@@ -38,12 +38,12 @@ jobs:
             -F q="IoT language:$LANG fork:true archived:false" \
             -F sort=stars -F order=desc -F per_page=50 \
             --jq '.items[].full_name')
-          
+
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------
-  # 2. SBOM SCAN + ENRICHMENT + COMPLIANCE
+  # 2. SBOM SCAN + ENRICHMENT + COMPLIANCE CHECKS
   # ---------------------------------------------------------
   sbom_scan:
     name: SBOM Scan + Enrichment + NTIA/BSI V2 Compliance
@@ -55,17 +55,15 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
     continue-on-error: true
 
+    env:
+      SBOM_OUT: project-src/trivy-report.json
+
     steps:
       - name: Setup environments
         run: |
           sudo apt-get update && sudo apt-get install -y jq uuid-runtime python3-pip coreutils
           pip install conan cyclonedx-bom
           docker --version || echo "⚠️ Docker not found! It should be pre-installed."
-
-      - name: Ensure Docker is running
-        run: |
-          sudo systemctl start docker || true
-          docker ps || echo "Docker is running."
 
       - name: Checkout repository
         id: checkout
@@ -80,10 +78,8 @@ jobs:
         if: steps.checkout.outcome == 'success'
         run: |
           conan profile detect --force
-          echo "Conan profile initialized."
 
       - name: Run Trivy SBOM scan
-        if: steps.checkout.outcome == 'success'
         continue-on-error: true
         uses: aquasecurity/trivy-action@0.25.0
         with:
@@ -91,90 +87,76 @@ jobs:
           scan-ref: ./project-src
           format: cyclonedx
           scanners: vuln
-          output: project-src/trivy-report.json
-          ignore-unfixed: true
+          output: ${{ env.SBOM_OUT }}
           vuln-type: os,library
           severity: CRITICAL,HIGH,MEDIUM
-          timeout: 10m
+          timeout: 15m
 
-      # ---------------------------------------------------------
-      # SBOM ENRICHMENT (initial)
-      # ---------------------------------------------------------
-      - name: Enrich SBOM with metadata
+      - name: Validate SBOM presence
         run: |
-          FILE="$GITHUB_WORKSPACE/project-src/trivy-report.json"
-          [ -f "$FILE" ] || { echo "⚠️ No SBOM found after scan"; exit 0; }
-          REPO_URL="https://github.com/${{ matrix.repo }}"
-          jq --arg repo "$REPO_URL" '
-            .metadata.timestamp = (now | todate) |
-            .metadata.tools = (if .metadata.tools | type == "array" then .metadata.tools else [] end) + [{"vendor": "GitHub", "name": "Actions"}] |
-            .metadata.properties = (if .metadata.properties | type == "array" then .metadata.properties else [] end) + [
-              {"name": "sbom_build_process", "value": "Trivy GitHub Workflow"},
-              {"name": "sbom_with_bomlinks", "value": "true"}
-            ] |
-            .metadata.bomLinks = (if .metadata.bomLinks | type == "array" then .metadata.bomLinks else [] end) + [{"rel": "vcs", "href": $repo}]
-          ' "$FILE" > tmp && mv tmp "$FILE"
-
-      # ---------------------------------------------------------
-      # SBOM ENRICHMENT: Component-Level Enhancements
-      # ---------------------------------------------------------
-      - name: Add Component Metadata (licenses, hashes)
-        run: |
-          FILE="$GITHUB_WORKSPACE/project-src/trivy-report.json"
-          [ -f "$FILE" ] || { echo "⚠️ No SBOM found after initial enrichment"; exit 0; }
-          jq '
-            .components |= map(
-              .licenses = (.licenses // [{"license": {"id": "Apache-2.0"}}]) |
-              .properties = (if .properties | type == "array" then .properties else [] end) + [{"name": "component_hash", "value": (.hashes[0].content // "unknown")}]
-            )
-          ' "$FILE" > tmp && mv tmp "$FILE"
-
-      # ---------------------------------------------------------
-      # ADVANCED SBOM ENRICHMENT (full NTIA + BSI compliance)
-      # ---------------------------------------------------------
-      - name: Advanced SBOM Metadata Enrichment
-        run: |
-          FILE="$GITHUB_WORKSPACE/project-src/trivy-report.json"
-          if [ ! -f "$FILE" ]; then
-            echo "⚠️ SBOM file $FILE not found. Listing directory:"
-            ls -R "$GITHUB_WORKSPACE/project-src" || true
-            exit 0
+          if [ ! -f "${{ env.SBOM_OUT }}" ]; then
+            echo "❌ No SBOM found at ${{ env.SBOM_OUT }}" && exit 0
           fi
-          
+
+      # ---------------------------------------------------------
+      # Generate Dependency Graph SBOM (CycloneDX)
+      # ---------------------------------------------------------
+      - name: Generate CycloneDX component dependency graph
+        run: |
+          cyclonedx-bom -o project-src/deps.bom.json -e -i ./project-src || echo "⚠️ Dependency scan failed"
+
+      - name: Merge Trivy and Dependency SBOM
+        run: |
+          if [ -f project-src/deps.bom.json ]; then
+            cat project-src/deps.bom.json | jq -s '.[0] * .[1]' > project-src/merged-sbom.json
+            mv project-src/merged-sbom.json ${{ env.SBOM_OUT }}
+          fi
+
+      # ---------------------------------------------------------
+      # Enrich SBOM with Full Metadata (BSI + NTIA)
+      # ---------------------------------------------------------
+      - name: Enrich SBOM with required fields
+        run: |
+          FILE="${{ env.SBOM_OUT }}"
           cd project-src
+
+          # Extract basic info
           SUPPLIER=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)/.*|\1|')
           VERSION=$(git describe --tags --always || echo "unknown")
           SOURCE_URI=$(git config --get remote.origin.url)
-          SOURCE_HASH=$(git rev-parse HEAD)
+          SOURCE_HASH=$(git rev-parse HEAD || echo "unknown")
 
+          # Enrich components and metadata
           jq --arg supplier "$SUPPLIER" \
              --arg version "$VERSION" \
              --arg uri "$SOURCE_URI" \
              --arg hash "$SOURCE_HASH" \
              '
              .components |= map(
-               .supplier = {"name": $supplier}
-               | .version = $version
-               | .properties += [
-                   {"name": "source_code_uri", "value": $uri},
-                   {"name": "source_code_hash", "value": $hash},
-                   {"name": "executable_uri", "value": (.externalReferences[]?.url // "")},
-                   {"name": "executable_hash", "value": (.hashes[]?.value // "")}
-                 ]
+               .supplier = { "name": $supplier } |
+               .version = $version |
+               .licenses = (.licenses // [{"license": {"id": "NOASSERTION"}}]) |
+               .properties += [
+                 {"name": "source_code_uri", "value": $uri},
+                 {"name": "source_code_hash", "value": $hash}
+               ]
              ) |
              .metadata.properties += [
                {"name": "sbom_build_process", "value": "GitHub Actions CI"},
                {"name": "sbom_with_signature", "value": "false"},
-               {"name": "sbom_with_vuln", "value": (if .vulnerabilities then "true" else "false" end)},
+               {"name": "sbom_with_bomlinks", "value": "true"},
+               {"name": "sbom_dependencies", "value": (if .dependencies then "true" else "false" end)},
                {"name": "spec_with_version_compliant", "value": "true"}
+             ] |
+             .metadata.bomLinks = [
+               { "rel": "vcs", "href": $uri }
              ]
              ' "$FILE" > ../tmp_sbom && mv ../tmp_sbom "$FILE"
 
       # ---------------------------------------------------------
-      # NTIA / BSI COMPLIANCE CHECKS
+      # COMPLIANCE CHECKS
       # ---------------------------------------------------------
       - name: NTIA Compliance Check
-        if: steps.checkout.outcome == 'success'
         run: |
           docker run --rm \
             -v $PWD/project-src:/project-src \
@@ -183,7 +165,6 @@ jobs:
             > project-src/compliance_NTIA.json
 
       - name: BSI V2 Compliance Check
-        if: steps.checkout.outcome == 'success'
         run: |
           docker run --rm \
             -v $PWD/project-src:/project-src \
@@ -192,7 +173,6 @@ jobs:
             > project-src/compliance_BSI.json
 
       - name: Score SBOM
-        if: steps.checkout.outcome == 'success'
         run: |
           docker run --rm \
             -v $PWD/project-src:/project-src \
@@ -200,17 +180,18 @@ jobs:
             /project-src/trivy-report.json --json \
             > project-src/score_evaluation.json
 
-      - name: Sanitize Artifact Name
-        id: sanitize
+      - name: Check for score threshold
         run: |
-          CLEAN_NAME="${{ matrix.repo }}"
-          CLEAN_NAME="${CLEAN_NAME//\//_}"
-          echo "name=$CLEAN_NAME" >> $GITHUB_OUTPUT
+          SCORE=$(jq '.score' project-src/score_evaluation.json)
+          echo "SBOM Score: $SCORE for ${{ matrix.repo }}"
+          if (( $(echo "$SCORE < 7.0" | bc -l) )); then
+            echo "⚠️ SBOM score for ${{ matrix.repo }} below 7.0"
+          fi
 
       - name: Upload SBOM Reports
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-reports-${{ steps.sanitize.outputs.name }}
+          name: sbom-reports-${{ matrix.repo }}
           path: project-src/*.json
           if-no-files-found: warn
 
@@ -236,7 +217,7 @@ jobs:
       - name: Aggregate SBOMQS Data
         run: |
           python3 <<EOF
-          import json, pandas as pd, glob, os
+          import json, pandas as pd, glob
           records = []
           for path in glob.glob('results/**/score_evaluation.json', recursive=True):
               with open(path) as f:
@@ -244,12 +225,9 @@ jobs:
                   repo = path.split('/')[-2]
                   data['repository'] = repo
                   records.append(data)
-          if not records:
-              print('❌ No SBOM score data found.')
-              exit(0)
-          df = pd.DataFrame(records)
+          df = pd.DataFrame(records) if records else pd.DataFrame()
           df.to_csv('sbomqs_summary.csv', index=False)
-          print('📄 SBOM summary created: sbomqs_summary.csv')
+          print(df.head())
           EOF
 
       - name: Upload Summary Report
