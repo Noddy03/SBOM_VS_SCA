@@ -230,7 +230,7 @@ jobs:
             docker run --rm -v "$PWD/project-src":/project-src ghcr.io/interlynk-io/sbomqs:latest score /project-src/trivy-report.json --json > project-src/score_evaluation.json
           fi
 
-      - name: Diagnostic: print zero-score fields
+      - name: Diagnostic:print zero-score fields
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
         run: |
           for FILE in project-src/compliance_NTIA.json project-src/compliance_BSI.json; do
