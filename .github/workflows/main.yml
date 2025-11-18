@@ -277,7 +277,7 @@ jobs:
           import json, glob, pandas as pd, os
 
 
-        def load_json_safe(p):
+          def load_json_safe(p):
             try:
               txt=open(p).read().strip()
               return json.loads(txt) if txt else None
