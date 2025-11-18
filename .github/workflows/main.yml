@@ -32,7 +32,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           LANG: ${{ github.event.inputs.language }}
         run: |
-          echo "Fetching top 50 IoT-related repositories written in $LANG..."
+          echo "Fetching top 50 IoT repositories for language: $LANG"
           REPOS=$(gh api /search/repositories \
             --method GET \
             -F q="IoT language:$LANG fork:false archived:false" \
@@ -52,7 +52,6 @@ jobs:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
-    continue-on-error: true
 
     steps:
       - name: Setup environments
@@ -61,7 +60,7 @@ jobs:
           curl -sSfL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 > /usr/local/bin/cosign
           chmod +x /usr/local/bin/cosign
           pip install conan
-          echo "🔧 Environments ready (Cosign, Conan, jq, Python)."
+          echo "🔧 Environment configured with jq, Cosign, Conan."
 
       - name: Checkout repository
         id: checkout
@@ -71,7 +70,6 @@ jobs:
           repository: ${{ matrix.repo }}
           path: project-src
           fetch-depth: 0
-          token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
 
       - name: Conan setup
         if: steps.checkout.outcome == 'success'
@@ -90,18 +88,22 @@ jobs:
           ignore-unfixed: true
           vuln-type: os,library
           severity: CRITICAL,HIGH,MEDIUM
-          timeout: 10m
+          timeout: 12m
 
       - name: Check SBOM exists
         id: sbom_exists
         run: |
           SBOM="project-src/trivy-report.json"
-          echo "sbom_exists=$(if [ -f "$SBOM" ]; then echo true; else echo false; fi)" >> $GITHUB_OUTPUT
+          if [ -f "$SBOM" ]; then
+            echo "sbom_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sbom_exists=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # ---------------------------------------------------------
       # SBOM ENRICHMENT
       # ---------------------------------------------------------
-      - name: Enrich SBOM metadata and components (licenses, hashes, source data)
+      - name: Enrich SBOM metadata and components
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
         run: |
           SBOM="project-src/trivy-report.json"
@@ -121,13 +123,7 @@ jobs:
             .components |= map(
               .supplier = {"name": $supplier} |
               .version = $version |
-              .licenses = (
-                if (.licenses | type == "array") then
-                  .licenses
-                else
-                  [{"license": {"id": "NOASSERTION"}}]
-                end
-              ) |
+              .licenses = (.licenses // [{"license": {"id": "NOASSERTION"}}]) |
               .properties += [
                 {"name": "source_code_uri", "value": $vcs},
                 {"name": "source_hash", "value": $hash},
@@ -143,26 +139,26 @@ jobs:
             .metadata.bomLinks += [{"rel": "vcs", "href": $vcs}]
             ' "$SBOM" > "$TMP" && mv "$TMP" "$SBOM"
 
-      - name: Add SHA256 hash to components (match source paths where possible)
+      - name: Add SHA256 hash to components (max 50 files, safe handling)
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
         run: |
           SBOM="project-src/trivy-report.json"
           TMP="project-src/tmp_sbom.json"
           cp "$SBOM" "$TMP"
 
-          find project-src -type f | head -n 50 | while read -r SRC; do
+          find project-src -type f -print0 | head -zn 50 | while IFS= read -r -d '' SRC; do
             HASH=$(sha256sum "$SRC" | awk '{print $1}')
             RELPATH=$(realpath --relative-to=project-src "$SRC")
             jq --arg rel "$RELPATH" --arg hash "$HASH" '
               .components |= map(
-                if (.properties // [] | map(.value) | .[] | contains($rel)) then
+                if (.properties // [] | map(.value) | contains($rel)) then
                   .properties += [{"name": "source_code_hash", "value": $hash}]
                 else
                   .
                 end
               )
             ' "$TMP" > project-src/tmp2.json && mv project-src/tmp2.json "$TMP"
-          done
+          done || true
 
           mv "$TMP" "$SBOM"
           echo "🟢 Hash injection complete."
@@ -181,10 +177,10 @@ jobs:
             exit 0
           fi
 
-          SBOM="project-src/trivy-report.json"
-          SIGNATURE="project-src/trivy-report.sig"
           echo "${COSIGN_PRIVATE_KEY}" | base64 --decode > cosign.key
 
+          SBOM="project-src/trivy-report.json"
+          SIGNATURE="project-src/trivy-report.sig"
           cosign sign-blob \
             --key cosign.key \
             "$SBOM" \
@@ -194,7 +190,7 @@ jobs:
           jq '.metadata.properties += [{"name": "sbom_with_signature", "value": "true"}]' \
             "$SBOM" > project-src/signed-sbom.json && mv project-src/signed-sbom.json "$SBOM"
 
-          echo "🔐 SBOM signed successfully."
+          echo "🔏 SBOM signed: $SIGNATURE"
 
       # ---------------------------------------------------------
       # COMPLIANCE CHECKS
