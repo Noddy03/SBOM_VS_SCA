@@ -33,7 +33,6 @@ jobs:
         run: |
           set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
-          echo "Query: $RAW_Q"
           REPOS=$(gh api -X GET /search/repositories \
              --raw-field q="$RAW_Q" \
              --raw-field sort=stars \
@@ -41,7 +40,6 @@ jobs:
              --raw-field per_page=50 \
              --jq '.items[].full_name'
           )
-          echo "$REPOS"
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
@@ -92,19 +90,15 @@ jobs:
         run: |
           FILE=$(find project-src -maxdepth=4 -type f \
             -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
-          if [ -n "$FILE" ]; then
-            cp "$FILE" project-src/local-license.txt
-          else
-            echo "" > project-src/local-license.txt
-          fi
+          if [ -n "$FILE" ]; then cp "$FILE" project-src/local-license.txt
+          else echo "" > project-src/local-license.txt; fi
 
       - name: Conan SBOM
         if: env.skip_repo != 'true'
         run: |
           cd project-src
           conan profile detect --force || true
-          conan graph info . --format=json > conan-sbom.json \
-            || echo '{"components":[]}' > conan-sbom.json
+          conan graph info . --format=json > conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
 
       - name: Trivy SBOM
         if: env.skip_repo != 'true'
@@ -113,9 +107,9 @@ jobs:
             -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      # ----------------------------------------------------------------------
-      #                       SBOM ENRICHMENT FIXED
-      # ----------------------------------------------------------------------
+      # -------------------------------------------------------------------
+      # FIXED — ALL JQ OPERATIONS NOW TYPE-SAFE
+      # -------------------------------------------------------------------
 
       - name: Add missing SBOM metadata (supplier, URLs, hashes)
         if: env.skip_repo != 'true'
@@ -133,20 +127,19 @@ jobs:
              --arg vcs "$VCS" \
              --arg dist "$DIST" \
              --arg hash "$REPO_HASH" '
-            .components |= (map(
+            .components |= map(
               .supplier = { "name": $supplier } |
               .externalReferences = ((.externalReferences // []) + [
                 { "type": "vcs", "url": $vcs },
                 { "type": "distribution", "url": $dist }
               ]) |
-              .hashes = [{
-                "alg": "SHA-256",
-                "content": $hash
-              }]
-            ))
+              .hashes = ((.hashes // []) + [
+                { "alg": "SHA-256", "content": $hash }
+              ])
+            )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      - name: Add source code hash (deterministic field)
+      - name: Add source code hash
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
@@ -158,23 +151,25 @@ jobs:
             ])
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      - name: Add build metadata for SBOMQS (FIXED)
+      - name: Add build metadata
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
 
           jq '
             .metadata.lifecycle = { "phase": "build" } |
-            .metadata.tools = ((.metadata.tools // []) + [
-              { "vendor": "github", "name": "actions", "version": "1.0" }
-            ]) |
+            .metadata.tools =
+              (if (.metadata.tools // empty) == empty then []
+               elif (.metadata.tools | type) == "object" then [ .metadata.tools ]
+               else .metadata.tools end) +
+              [{ "vendor": "github", "name": "actions", "version": "1.0" }] |
             .metadata.properties = ((.metadata.properties // []) + [
               { "name": "build:host", "value": "github-actions" },
               { "name": "build:timestamp", "value": (now | todate) }
             ])
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      - name: Add BOM link reference (FIXED)
+      - name: Add BOM link reference
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
@@ -183,10 +178,7 @@ jobs:
             .metadata.component = (.metadata.component // { "bom-ref": "root" }) |
             .metadata.component."bom-ref" = (.metadata.component."bom-ref" // "root") |
             .bomLinks = [
-              {
-                "ref": .metadata.component."bom-ref",
-                "rel": "variant"
-              }
+              { "ref": .metadata.component."bom-ref", "rel": "variant" }
             ]
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
@@ -197,13 +189,10 @@ jobs:
           SIG=$(sha256sum "$SBOM" | cut -d' ' -f1)
 
           jq --arg sig "$SIG" '
-            .signature = {
-              "algorithm": "SHA-256",
-              "value": $sig
-            }
+            .signature = { "algorithm": "SHA-256", "value": $sig }
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      # ----------------------------------------------------------------------
+      # -------------------------------------------------------------------
 
       - name: Merge GitHub + Trivy + Local license
         if: env.skip_repo != 'true'
@@ -224,14 +213,13 @@ jobs:
           jq --arg lic "$FINAL" '
             .metadata.licenses = [{ "license": { "id": $lic }}] |
             .components |= map(
-              if (.licenses | length == 0)
+              if (.licenses // [] | length) == 0
               then .licenses = [{ "license": { "id": $lic }}]
               else .
               end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      # Compliance, scoring, upload
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
         run: |
@@ -265,7 +253,6 @@ jobs:
         with:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
           path: project-src/*.json
-          if-no-files-found: warn
 
   aggregate_results:
     name: Aggregate SBOMQS Results
@@ -288,6 +275,7 @@ jobs:
         run: |
           python3 <<'PY'
           import json, glob, pandas as pd, os
+
           def load_json_safe(p):
               try:
                   with open(p) as f:
@@ -295,13 +283,16 @@ jobs:
                       return json.loads(content) if content else None
               except:
                   return None
+
           rows = []
+
           for path in glob.glob("results/**/score.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
               data = load_json_safe(path)
               if data:
                   data["repository"] = repo
                   rows.append(data)
+
           for std in ["NTIA", "BSI"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
                   repo = os.path.basename(os.path.dirname(path))
@@ -310,13 +301,12 @@ jobs:
                       data["repository"] = repo
                       data["standard"] = std
                       rows.append(data)
+
           if not rows:
-              print("⚠️ No SBOMQS data found — writing empty CSV.")
               pd.DataFrame([]).to_csv("sbomqs_summary.csv", index=False)
           else:
               df = pd.json_normalize(rows)
               df.to_csv("sbomqs_summary.csv", index=False)
-              print(f"📊 Wrote sbomqs_summary.csv with {len(rows)} rows")
           PY
 
       - name: Upload aggregated summary
@@ -324,4 +314,3 @@ jobs:
         with:
           name: sbomqs-summary
           path: sbomqs_summary.csv
-          if-no-files-found: ignore
