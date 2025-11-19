@@ -14,6 +14,9 @@ permissions:
   security-events: write
 
 jobs:
+  # -------------------------------------------------------------
+  # 1. Fetch IoT Repositories using GitHub API
+  # -------------------------------------------------------------
   fetch_top_repos:
     name: Fetch IoT repositories
     runs-on: ubuntu-latest
@@ -30,18 +33,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           LANG: ${{ github.event.inputs.language }}
         run: |
-          RAW_Q="topic:IoT language:\"$LANG\" fork:false archived:false"
+          echo "Searching IoT repos for language: $LANG"
+
+          # IMPORTANT: language cannot be quoted (GitHub API 404s)
+          RAW_Q="topic:IoT language:$LANG fork:false archived:false"
+
+          echo "Query: $RAW_Q"
 
           REPOS=$(gh api /search/repositories \
             --raw-field q="$RAW_Q" \
             --raw-field sort=stars \
             --raw-field order=desc \
             --raw-field per_page=20 \
-            --jq '.items[].full_name')
+            --jq '.items[].full_name'
+          )
+
+          echo "$REPOS"
 
           JSON=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON" >> "$GITHUB_OUTPUT"
 
+  # -------------------------------------------------------------
+  # 2. SBOM Generation Job Matrix
+  # -------------------------------------------------------------
   sbom_scan:
     name: SBOM Scan
     needs: fetch_top_repos
@@ -65,6 +79,7 @@ jobs:
 
           pip install conan
 
+          # Safe Trivy install (always works)
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
