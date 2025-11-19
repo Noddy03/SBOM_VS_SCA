@@ -159,25 +159,25 @@ jobs:
       - name: Aggregate results
         run: |
           python3 <<'EOF'
-import json, glob, pandas as pd, os
+          import json, glob, pandas as pd, os
 
-records = []
+          records = []
 
-for path in glob.glob("results/**/score.json", recursive=True):
-    repo = os.path.basename(os.path.dirname(path))
-    try:
-        data = json.load(open(path))
-        if isinstance(data, list):
+          for path in glob.glob("results/**/score.json", recursive=True):
+          repo = os.path.basename(os.path.dirname(path))
+          try:
+            data = json.load(open(path))
+          if isinstance(data, list):
             for entry in data:
                 entry["repository"] = repo
                 records.append(entry)
-    except:
-        pass
+          except:
+            pass
 
-df = pd.json_normalize(records)
-df.to_csv("sbomqs_summary.csv", index=False)
-print("Generated sbomqs_summary.csv with", len(df), "rows")
-EOF
+          df = pd.json_normalize(records)
+          df.to_csv("sbomqs_summary.csv", index=False)
+          print("Generated sbomqs_summary.csv with", len(df), "rows")
+                    EOF
 
       - uses: actions/upload-artifact@v4
         with:
