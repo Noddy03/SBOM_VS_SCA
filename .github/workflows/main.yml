@@ -28,6 +28,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq
+
       - name: Fetch top IoT repositories (topic:IoT)
         id: fetch
         env:
@@ -69,6 +70,9 @@ jobs:
           sudo apt-get install -y jq uuid-runtime python3-pip coreutils
           pip install conan
 
+      # ------------------------------------------------------------------
+      # Retry-safe checkout
+      # ------------------------------------------------------------------
       - name: Checkout repository (retry-safe)
         id: checkout
         shell: bash
@@ -97,10 +101,16 @@ jobs:
             echo "skip_repo=true" >> $GITHUB_ENV
           fi
 
+      # ------------------------------------------------------------------
+      # Conan
+      # ------------------------------------------------------------------
       - name: Conan detect
         if: env.skip_repo != 'true'
         run: conan profile detect --force || true
 
+      # ------------------------------------------------------------------
+      # FIXED: Trivy SBOM scan INCLUDING LICENSE DETECTION
+      # ------------------------------------------------------------------
       - name: Run Trivy CycloneDX SBOM scan
         if: env.skip_repo != 'true'
         continue-on-error: true
@@ -109,13 +119,15 @@ jobs:
           scan-type: fs
           scan-ref: ./project-src
           format: cyclonedx
-          scanners: vuln,license
+          scanners: vuln,license     # <-- LICENSE SCANNING ENABLED
           output: project-src/trivy-report.json
           ignore-unfixed: true
-          vuln-type: os,library
           severity: CRITICAL,HIGH,MEDIUM
           timeout: 15m
 
+      # ------------------------------------------------------------------
+      # Normalize components
+      # ------------------------------------------------------------------
       - name: Normalize components
         if: env.skip_repo != 'true'
         run: |
@@ -129,6 +141,9 @@ jobs:
             )
           ' "$FILE" > tmp && mv tmp "$FILE"
 
+      # ------------------------------------------------------------------
+      # Metadata sanitize
+      # ------------------------------------------------------------------
       - name: Sanitize metadata
         if: env.skip_repo != 'true'
         run: |
@@ -141,6 +156,9 @@ jobs:
             .metadata.timestamp = (.metadata.timestamp // $ts)
           ' "$FILE" > tmp && mv tmp "$FILE"
 
+      # ------------------------------------------------------------------
+      # Component enrichment
+      # ------------------------------------------------------------------
       - name: Enrich components
         if: env.skip_repo != 'true'
         run: |
@@ -162,6 +180,9 @@ jobs:
             )
           ' "$FILE" > tmp && mv tmp "$FILE"
 
+      # ------------------------------------------------------------------
+      # SHA-256 file injection
+      # ------------------------------------------------------------------
       - name: Inject SHA-256 hashes
         if: env.skip_repo != 'true'
         run: |
@@ -181,6 +202,9 @@ jobs:
             ' "$FILE" > tmp && mv tmp "$FILE"
           done
 
+      # ------------------------------------------------------------------
+      # SBOMQS
+      # ------------------------------------------------------------------
       - name: Compliance NTIA
         if: env.skip_repo != 'true'
         run: |
@@ -205,6 +229,9 @@ jobs:
             score /project-src/trivy-report.json --json \
             > project-src/score_evaluation.json || true
 
+      # ------------------------------------------------------------------
+      # Artifact upload
+      # ------------------------------------------------------------------
       - name: Sanitize artifact name
         run: |
           SAFE="${{ matrix.repo }}"
@@ -284,9 +311,9 @@ jobs:
           > aggregation.py
           python3 aggregation.py
 
-      # --------------------------------------------------------------
+      # ------------------------------------------------------------------
       # FIX 1 — Upload CSV Artifact
-      # --------------------------------------------------------------
+      # ------------------------------------------------------------------
       - name: Upload SBOM summary CSV
         uses: actions/upload-artifact@v4
         with:
