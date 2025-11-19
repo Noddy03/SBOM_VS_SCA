@@ -1,4 +1,4 @@
-name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan 
+name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (NTIA + BSI V2)
 
 on:
   workflow_dispatch:
@@ -14,9 +14,6 @@ permissions:
   security-events: write
 
 jobs:
-  # -------------------------------------------------------------
-  # 1. Fetch IoT Repositories using GitHub API
-  # -------------------------------------------------------------
   fetch_top_repos:
     name: Fetch IoT repositories
     runs-on: ubuntu-latest
@@ -33,8 +30,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           LANG: ${{ github.event.inputs.language }}
         run: |
-          echo "Searching top IoT repos for language: $LANG"
-
           RAW_Q="topic:IoT language:\"$LANG\" fork:false archived:false"
 
           REPOS=$(gh api /search/repositories \
@@ -44,14 +39,9 @@ jobs:
             --raw-field per_page=20 \
             --jq '.items[].full_name')
 
-          echo "$REPOS"
-
           JSON=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON" >> "$GITHUB_OUTPUT"
 
-  # -------------------------------------------------------------
-  # 2. SBOM Scan (Trivy + Conan)
-  # -------------------------------------------------------------
   sbom_scan:
     name: SBOM Scan
     needs: fetch_top_repos
@@ -73,10 +63,8 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq curl wget python3-pip python3-venv
 
-          # Conan
           pip install conan
 
-          # Trivy (safe installer, no 404)
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
@@ -84,18 +72,20 @@ jobs:
         run: |
           mkdir -p sbom
 
-          echo "Running Trivy CycloneDX SBOM..."
           trivy fs . --format cyclonedx --output sbom/cyclonedx.json || true
 
           if [ -f "conanfile.txt" ] || [ -f "conanfile.py" ]; then
-            echo "Conanfile detected — generating Conan SBOM..."
             conan graph info . --format=json > sbom/conan-sbom.json || true
-          else
-            echo "No Conan file found — skipping Conan SBOM."
           fi
+
+      - name: Sanitize repo name
+        run: |
+          SAFE_REPO="${{ matrix.repo }}"
+          SAFE_REPO="${SAFE_REPO//\//_}"
+          echo "SAFE_REPO=$SAFE_REPO" >> $GITHUB_ENV
 
       - name: Upload SBOM artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-${{ matrix.repo.replace('/', '_') }}
+          name: sbom-${{ env.SAFE_REPO }}
           path: sbom/
