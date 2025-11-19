@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   # ================================================================
-  # 1. FETCH TOP REPOS  (UNCHANGED)
+  # 1. FETCH TOP REPOS  (UNCHANGED — DO NOT TOUCH)
   # ================================================================
   fetch_top_repos:
     runs-on: ubuntu-latest
@@ -65,6 +65,7 @@ jobs:
     steps:
       - name: Install Conan + jq + Trivy
         run: |
+          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq wget curl python3-pip
           pip install --upgrade pip
@@ -85,7 +86,7 @@ jobs:
           fi
 
       # --------------------------------------------------------------------
-      # 2A — GITHUB LICENSE API
+      # 2A — GITHUB LICENSE API (best-effort)
       # --------------------------------------------------------------------
       - name: Fetch GitHub license metadata
         if: env.skip_repo != 'true'
@@ -94,7 +95,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # use proper accept header and fallback to NOASSERTION if 404/unavailable
+          # Preferred Accept header; fall back to NOASSERTION on error/404
           gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/license" > project-src/gh-license.json 2>/dev/null \
             || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
 
@@ -118,7 +119,7 @@ jobs:
           fi
 
       # --------------------------------------------------------------------
-      # 2C — BUILD SBOMS
+      # 2C — BUILD SBOMs (Conan + Trivy)
       # --------------------------------------------------------------------
       - name: Conan SBOM
         if: env.skip_repo != 'true'
@@ -128,7 +129,7 @@ jobs:
           conan profile detect --force || true
           conan graph info . --format=json > conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
 
-      - name: Trivy SBOM
+      - name: Trivy SBOM (CycloneDX)
         if: env.skip_repo != 'true'
         run: |
           set -euo pipefail
@@ -166,6 +167,11 @@ jobs:
             FINAL="NOASSERTION"
           fi
 
+          # Ensure SBOM exists (safe)
+          if [ ! -f "$SBOM" ] || [ ! -s "$SBOM" ]; then
+            echo '{"bomFormat":"CycloneDX","components":[],"metadata":{}}' > "$SBOM"
+          fi
+
           jq --arg lic "$FINAL" '
             .metadata.licenses = [{ "license": { "id": $lic }}] |
             .components |= map(
@@ -174,9 +180,9 @@ jobs:
           ' "$SBOM" > tmp.json && mv tmp.json "$SBOM"
 
       # --------------------------------------------------------------------
-      # 2E — ENRICH SBOM WITH REQUIRED NTIA / BSI FIELDS (component-level)
+      # 2E — ENRICH SBOM FOR NTIA + BSI V2 (component-level, safe jq)
       # --------------------------------------------------------------------
-      - name: Enrich SBOM for NTIA + BSI v2 (fixed jq handling)
+      - name: Enrich SBOM for NTIA + BSI v2 (component-level)
         if: env.skip_repo != 'true'
         env:
           REPO: ${{ matrix.repo }}
@@ -186,41 +192,39 @@ jobs:
           REPO_URL="https://github.com/$REPO"
           OWNER=$(echo "$REPO" | cut -d'/' -f1)
 
-          # create minimal sbom if missing
+          # Ensure SBOM JSON exists
           if [ ! -f "$SBOM" ] || [ ! -s "$SBOM" ]; then
             echo '{"bomFormat":"CycloneDX","components":[],"metadata":{}}' > "$SBOM"
           fi
 
-          # compute SBOM-level sha256
+          # Compute SBOM-level SHA256 signature (Option 1)
           FULL_SHA=$(sha256sum "$SBOM" | awk '{print $1}')
           echo "SBOM SHA256: $FULL_SHA"
 
-          # safe jq transformation: normalize arrays/objects before adding
+          # Normalize arrays/objects and safely add fields
           jq --arg owner "$OWNER" --arg repo "$REPO" --arg repourl "$REPO_URL" --arg sha "$FULL_SHA" '
-            # normalize metadata.tools, metadata.properties, metadata.bomLinks, metadata.externalReferences
+            # Normalize metadata arrays (handle object vs array vs missing)
             .metadata.tools |= (if type=="object" then [.] elif type=="array" then . else [] end) |
             .metadata.properties |= (if type=="object" then [.] elif type=="array" then . else [] end) |
             .metadata.bomLinks |= (if type=="object" then [.] elif type=="array" then . else [] end) |
             .metadata.externalReferences |= (if type=="object" then [.] elif type=="array" then . else [] end) |
 
-            # add tool info (Trivy) safely
+            # Add/merge tool + build metadata
             .metadata.tools += [{
               "vendor": "Aqua Security",
               "name": "Trivy",
               "version": "CycloneDX"
             }] |
-
-            # supplier metadata (repo owner)
-            .metadata.supplier = {
-              "name": $owner,
-              "url": ("https://github.com/" + $owner)
-            } |
-
-            # add build metadata
             .metadata.properties += [
               {"name":"build.environment","value":"GitHub Actions (ubuntu-latest)"},
               {"name":"build.timestamp","value":(now|todate)}
             ] |
+
+            # Supplier info at metadata level (use owner)
+            .metadata.supplier = {
+              "name": $owner,
+              "url": ("https://github.com/" + $owner)
+            } |
 
             # bomLinks
             .metadata.bomLinks += [
@@ -229,13 +233,13 @@ jobs:
               {"rel":"distribution","href": ($repourl + "/releases")}
             ] |
 
-            # signature (simple SBOM-level signature)
+            # signature block (simple)
             .signature = {"algorithm":"SHA-256","value":$sha} |
 
-            # Ensure components exists as array
+            # Ensure components is an array
             .components |= (if . == null then [] else . end) |
 
-            # map over components: set supplier, hashes, externalReferences, ensure licenses exist
+            # For each component: supplier, hashes (SBOM-level), externalReferences, ensure license exists
             .components |= map(
               (. // {}) |
               .supplier = (.supplier // {"name": $owner, "url": ("https://github.com/" + $owner)}) |
@@ -248,10 +252,10 @@ jobs:
             )
           ' "$SBOM" > tmp.json && mv tmp.json "$SBOM"
 
-          echo "✔ Enrichment inserted: component.supplier, component.hashes, externalReferences, metadata, bomLinks, signature."
+          echo "✔ Enrichment complete: component.supplier, component.hashes, externalReferences, metadata, bomLinks, signature inserted."
 
       # --------------------------------------------------------------------
-      # 2F — SBOMQS COMPLIANCE (NTIA / BSI) and Score (with safe fallbacks)
+      # 2F — SBOMQS COMPLIANCE (NTIA, BSI) + SCORE (safe fallback to empty JSON)
       # --------------------------------------------------------------------
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
@@ -278,7 +282,7 @@ jobs:
             > project-src/score.json || echo '{}' > project-src/score.json
 
       # --------------------------------------------------------------------
-      # 2G — PACKAGING / UPLOAD
+      # 2G — Packaging / Upload artifacts
       # --------------------------------------------------------------------
       - name: Sanitize artifact name
         id: sanitize
@@ -296,7 +300,7 @@ jobs:
           if-no-files-found: warn
 
   # ================================================================
-  # 3. AGGREGATION SUMMARY — FIX MODE A (recursively find all JSONs)
+  # 3. AGGREGATION SUMMARY — FIX MODE A (produce compact summary CSV)
   # ================================================================
   aggregate_results:
     name: Aggregate SBOMQS Results
@@ -314,45 +318,65 @@ jobs:
           sudo apt-get update && sudo apt-get install -y python3-pip
           pip install pandas
 
-      - name: Aggregate all JSON results
+      - name: Aggregate into sbomqs_summary.csv (minimal layout)
         run: |
           python3 <<'EOF'
-          import json, glob, pandas as pd, os
+          import json, glob, os, pandas as pd, time
 
-          def load_json_safe(path):
+          def load_json_safe(p):
               try:
-                  with open(path) as f:
+                  with open(p) as f:
                       return json.load(f)
-              except:
+              except Exception:
                   return None
 
-          json_files = glob.glob("results/**/*.json", recursive=True)
+          rows = []
+          run_id = os.getenv("GITHUB_RUN_ID", "")
+          timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-          records = []
-          for path in json_files:
-              # repository is guessed from the artifact directory name if possible
-              parts = path.split(os.sep)
-              repo = parts[1] if len(parts) > 1 else ""
-              data = load_json_safe(path)
-              if not data:
-                  continue
-              row = {"repository_artifact_dir": repo, "file": os.path.basename(path)}
-              if isinstance(data, dict):
-                  # flatten top-level keys (careful: may be nested)
-                  for k,v in data.items():
-                      # only include primitive top-level items to avoid heavy nesting
-                      if isinstance(v, (str, int, float, bool)) or v is None:
-                          row[k] = v
-                  # include the whole object under a json column
-                  row["json"] = json.dumps(data)
-              records.append(row)
+          # Search artifact folders under results/
+          # Each artifact typically extracted into results/<artifact-name>/...
+          artifact_dirs = sorted({ os.path.dirname(p) for p in glob.glob("results/**/score.json", recursive=True) })
 
-          if not records:
-              print("❌ No JSON files found for aggregation.")
-          else:
-              df = pd.json_normalize(records)
+          for ad in artifact_dirs:
+              repo = os.path.basename(ad)  # artifact folder - often "sbom-reports-<repo>"
+              # Try to locate score.json in that directory tree
+              score_paths = glob.glob(os.path.join(ad, "**", "score.json"), recursive=True)
+              score = None
+              if score_paths:
+                  score = load_json_safe(score_paths[0])
+
+              # Count files we consider (score + NTIA + BSI)
+              files_count = 0
+              if glob.glob(os.path.join(ad, "**", "score.json"), recursive=True):
+                  files_count += 1
+              if glob.glob(os.path.join(ad, "**", "compliance_NTIA.json"), recursive=True):
+                  files_count += 1
+              if glob.glob(os.path.join(ad, "**", "compliance_BSI.json"), recursive=True):
+                  files_count += 1
+
+              ci = {}
+              if isinstance(score, dict):
+                  ci = score.get("creation_info", {}) or {}
+
+              row = {
+                  "run_id": run_id,
+                  "timestamp": timestamp,
+                  "files": files_count,
+                  "repository": repo,
+                  "creation_info.name": ci.get("name", ""),
+                  "creation_info.version": ci.get("version", ""),
+                  "creation_info.scoring_engine_version": ci.get("scoring_engine_version", ""),
+                  "creation_info.vendor": ci.get("vendor", "")
+              }
+              rows.append(row)
+
+          if rows:
+              df = pd.DataFrame(rows)
               df.to_csv("sbomqs_summary.csv", index=False)
-              print("✅ Aggregated", len(records), "records.")
+              print("Generated sbomqs_summary.csv with", len(rows), "rows")
+          else:
+              print("No score.json files found; sbomqs_summary.csv not created")
           EOF
 
       - name: Upload aggregated summary
