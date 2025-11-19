@@ -35,7 +35,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
           echo "Query: $RAW_Q"
 
@@ -137,6 +136,7 @@ jobs:
           SAFE_NAME="${{ matrix.repo }}"
           SAFE_NAME="${SAFE_NAME//\//_}"
           echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
+
       - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
         with:
@@ -145,47 +145,62 @@ jobs:
           if-no-files-found: warn
 
   # ================================================================
-  # 3. AGGREGATION – TSV SUMMARY (SAFE JSON HANDLING)
+  # 3. AGGREGATION – CSV SUMMARY (FIXED)
   # ================================================================
   aggregate_results:
     name: Aggregate SBOMQS Results
     needs: sbom_scan
     runs-on: ubuntu-latest
+
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: results/
+
       - name: Install Python + Pandas
         run: |
           sudo apt-get update && sudo apt-get install -y python3-pip
           pip install pandas
+
       - name: Aggregate all JSON results
         run: |
           python3 <<'EOF'
           import json, glob, pandas as pd, os
+
           def load_json_safe(path):
               try:
                   with open(path) as f:
                       content = f.read().strip()
-                      if not content: return None
+                      if not content: 
+                          return None
                       return json.loads(content)
               except Exception as e:
                   print(f"⚠️ Skipping invalid JSON in {path}: {e}")
                   return None
+
           records = []
-          for path in glob.glob("results/**/score_evaluation.json", recursive=True):
+
+          # SCORE FILES (fixed)
+          for path in glob.glob("results/**/score.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
               data = load_json_safe(path)
-              if data: data["repository"] = repo; records.append(data)
-          for std in ["BSI","NTIA"]:
+              if data:
+                  data["repository"] = repo
+                  data["type"] = "score"
+                  records.append(data)
+
+          # COMPLIANCE FILES
+          for std in ["BSI", "NTIA"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
                   repo = os.path.basename(os.path.dirname(path))
                   data = load_json_safe(path)
                   if data:
                       data["repository"] = repo
                       data["standard"] = std
+                      data["type"] = "compliance"
                       records.append(data)
+
           if not records:
               print("❌ No valid SBOMQS data found.")
           else:
@@ -193,6 +208,7 @@ jobs:
               df.to_csv("sbomqs_summary.csv", index=False)
               print(f"✅ Aggregated {len(records)} SBOMQS results successfully.")
           EOF
+
       - name: Upload aggregated summary
         uses: actions/upload-artifact@v4
         with:
