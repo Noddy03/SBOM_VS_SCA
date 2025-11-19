@@ -135,44 +135,44 @@ jobs:
       - name: Merge SBOMs (Conan + Trivy FS + GitHub License)
         if: env.skip_repo != 'true'
         run: |
-          python3 << 'EOF'
-            import json, os, uuid
+            python3 << 'EOF'
+                  import json, os, uuid
 
-            def load(path):
-            try:
-              return json.load(open(path))
-            except:
-              return {"components": []}
+                  def load(path):
+                  try:
+                      return json.load(open(path))
+                  except:
+                      return {"components": []}
 
-            trivy = load("project-src/trivy-fs.json")
-            conan = load("project-src/conan-sbom.json")
-            gh_license = load("project-src/license-github.json")
+                  trivy = load("project-src/trivy-fs.json")
+                  conan = load("project-src/conan-sbom.json")
+                  gh_license = load("project-src/license-github.json")
 
-            merged = {
-              "bomFormat": "CycloneDX",
-              "specVersion": "1.5",
-              "version": 1,
-              "metadata": trivy.get("metadata", {}),
-              "components": []
-              }
+                  merged = {
+                      "bomFormat": "CycloneDX",
+                      "specVersion": "1.5",
+                      "version": 1,
+                      "metadata": trivy.get("metadata", {}),
+                      "components": []
+                    }
 
-            def normalize(comps):
-            out = []
-            if not isinstance(comps, list):
-                return out
-            for c in comps:
-              if not isinstance(c, dict):
-                  continue
-              if "licenses" not in c:
-                  c["licenses"] = [gh_license.get("license", {"id": "NOASSERTION"})]
-              if "bom-ref" not in c:
-                  c["bom-ref"] = str(uuid.uuid4())
-              out.append(c)
-            return out
+                 def normalize(comps):
+                 out = []
+                 if not isinstance(comps, list):
+                     return out
+                 for c in comps:
+                    if not isinstance(c, dict):
+                        continue
+                    if "licenses" not in c:
+                        c["licenses"] = [gh_license.get("license", {"id": "NOASSERTION"})]
+                    if "bom-ref" not in c:
+                        c["bom-ref"] = str(uuid.uuid4())
+                    out.append(c)
+                  return out
 
-            merged["components"] += normalize(trivy.get("components", []))
-            merged["components"] += normalize(conan.get("components", []))
+                merged["components"] += normalize(trivy.get("components", []))
+                merged["components"] += normalize(conan.get("components", []))
 
-            with open("project-src/merged-sbom.json", "w") as f:
-            json.dump(merged, f, indent=2)
-          EOF
+                with open("project-src/merged-sbom.json", "w") as f:
+                json.dump(merged, f, indent=2)
+            EOF
