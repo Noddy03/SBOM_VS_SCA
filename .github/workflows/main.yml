@@ -15,13 +15,14 @@ permissions:
 
 jobs:
   # ------------------------------------------------------------------
-  # 1. Fetch top IoT repositories using GitHub API (stable version)
+  # 1. Fetch top IoT repositories
   # ------------------------------------------------------------------
   fetch_top_repos:
     name: Fetch top IoT repositories (${{ github.event.inputs.language }})
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
+
     steps:
       - name: Install jq
         run: sudo apt-get update -y && sudo apt-get install -y jq
@@ -49,12 +50,12 @@ jobs:
 
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
 
-          # Important: wrap JSON in quotes so GitHub accepts it
-          echo "repo_list=\"$JSON_ARRAY\"" >> $GITHUB_OUTPUT
+          # MUST NOT QUOTE THIS (critical!)
+          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
 
   # ------------------------------------------------------------------
-  # 2. SBOM Scan (matrix)
+  # 2. SBOM scan
   # ------------------------------------------------------------------
   sbom_scan:
     name: SBOM Scan for ${{ matrix.repo }}
@@ -67,23 +68,24 @@ jobs:
         repo: ${{ fromJson(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-      - name: Checkout repo
+
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
           path: project-src
 
-      - name: Install Conan & Trivy & jq
+      - name: Install Conan, Trivy, jq
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y pipx jq
+          sudo apt-get install -y jq
           pipx install conan
           sudo apt-get install -y trivy
 
       # --------------------------------------------------------------
-      # GitHub API License Fetch
+      # GitHub license API
       # --------------------------------------------------------------
-      - name: Fetch license via GitHub API
+      - name: Fetch license
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -97,30 +99,27 @@ jobs:
       # --------------------------------------------------------------
       # Conan SBOM
       # --------------------------------------------------------------
-      - name: Generate Conan SBOM (CycloneDX)
+      - name: Generate Conan SBOM
         working-directory: project-src
         run: |
           conan profile detect || true
-
           conan install . --build=missing || true
-
           conan sbom . --format cyclonedx-json --output conan-sbom.json || \
             echo '{"components":[]}' > conan-sbom.json
 
       # --------------------------------------------------------------
       # Trivy SBOM
       # --------------------------------------------------------------
-      - name: Generate Trivy SBOM (CycloneDX)
+      - name: Generate Trivy SBOM
         run: |
           trivy fs project-src --format cyclonedx --output project-src/trivy.json || \
             echo '{"components":[]}' > project-src/trivy.json
 
       # --------------------------------------------------------------
-      # SAFE SBOM MERGE (no Python, no huge variables, no jq errors)
+      # MERGE SBOMS IN jq (no Python)
       # --------------------------------------------------------------
-      - name: Merge Conan + Trivy + License into merged.json
+      - name: Merge SBOM files
         run: |
-          # Normalize missing license
           jq '.license // {"id":"NOASSERTION"}' project-src/license.json \
             > project-src/license_norm.json
 
@@ -143,11 +142,8 @@ jobs:
             }
             ' > project-src/merged.json
 
-      # --------------------------------------------------------------
-      # Upload artifacts
-      # --------------------------------------------------------------
       - name: Upload merged SBOM
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-${{ matrix.repo }}.json
+          name: sbom-${{ matrix.repo }}
           path: project-src/merged.json
