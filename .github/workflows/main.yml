@@ -24,6 +24,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq
+
       - name: Fetch repositories
         id: fetch
         env:
@@ -55,6 +56,7 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
+
       - name: Install Conan + jq + Trivy
         run: |
           sudo apt-get update -y
@@ -111,9 +113,9 @@ jobs:
             -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      # ------------------------------------------------------------------------
-      # SBOM ENRICHMENT (SUPPLIER, HASHES, BUILD METADATA, ETC.)
-      # ------------------------------------------------------------------------
+      # ----------------------------------------------------------------------
+      #                       SBOM ENRICHMENT FIXED
+      # ----------------------------------------------------------------------
 
       - name: Add missing SBOM metadata (supplier, URLs, hashes)
         if: env.skip_repo != 'true'
@@ -124,23 +126,24 @@ jobs:
           OWNER=$(echo "$REPO" | cut -d'/' -f1)
           VCS="https://github.com/$REPO"
           DIST="https://github.com/$REPO/releases"
+
           REPO_HASH=$(find project-src -type f -exec sha256sum {} + | sha256sum | cut -d' ' -f1)
 
           jq --arg supplier "$OWNER" \
              --arg vcs "$VCS" \
              --arg dist "$DIST" \
              --arg hash "$REPO_HASH" '
-            .components |= map(
+            .components |= (map(
               .supplier = { "name": $supplier } |
-              .externalReferences += [
+              .externalReferences = ((.externalReferences // []) + [
                 { "type": "vcs", "url": $vcs },
                 { "type": "distribution", "url": $dist }
-              ] |
+              ]) |
               .hashes = [{
                 "alg": "SHA-256",
                 "content": $hash
               }]
-            )
+            ))
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
       - name: Add source code hash (deterministic field)
@@ -150,10 +153,9 @@ jobs:
           SRC_HASH=$(find project-src -type f -exec sha256sum {} + | sha256sum | cut -d' ' -f1)
 
           jq --arg hash "$SRC_HASH" '
-            .metadata.properties = (.metadata.properties // []) |
-            .metadata.properties += [
+            .metadata.properties = ((.metadata.properties // []) + [
               { "name": "cdx:digest:source", "value": $hash }
-            ]
+            ])
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
       - name: Add build metadata for SBOMQS (FIXED)
@@ -163,39 +165,26 @@ jobs:
 
           jq '
             .metadata.lifecycle = { "phase": "build" } |
-
-            # Normalize tools to array
-            .metadata.tools = (
-              if (.metadata.tools // empty | type) == "object" then
-                [ .metadata.tools ]
-              elif (.metadata.tools // empty | type) == "array" then
-                .metadata.tools
-              else
-                []
-              end
-            ) |
-
-            .metadata.tools += [
+            .metadata.tools = ((.metadata.tools // []) + [
               { "vendor": "github", "name": "actions", "version": "1.0" }
-            ] |
-
-            # Normalize metadata.properties
-            .metadata.properties = (.metadata.properties // []) |
-
-            .metadata.properties += [
+            ]) |
+            .metadata.properties = ((.metadata.properties // []) + [
               { "name": "build:host", "value": "github-actions" },
               { "name": "build:timestamp", "value": (now | todate) }
-            ]
+            ])
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      - name: Add BOM link reference
+      - name: Add BOM link reference (FIXED)
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
+
           jq '
+            .metadata.component = (.metadata.component // { "bom-ref": "root" }) |
+            .metadata.component."bom-ref" = (.metadata.component."bom-ref" // "root") |
             .bomLinks = [
               {
-                "ref": (.metadata.component.bom-ref // "root"),
+                "ref": .metadata.component."bom-ref",
                 "rel": "variant"
               }
             ]
@@ -214,7 +203,7 @@ jobs:
             }
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      # ------------------------------------------------------------------------
+      # ----------------------------------------------------------------------
 
       - name: Merge GitHub + Trivy + Local license
         if: env.skip_repo != 'true'
@@ -242,6 +231,7 @@ jobs:
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
+      # Compliance, scoring, upload
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
         run: |
@@ -298,7 +288,6 @@ jobs:
         run: |
           python3 <<'PY'
           import json, glob, pandas as pd, os
-
           def load_json_safe(p):
               try:
                   with open(p) as f:
@@ -306,16 +295,13 @@ jobs:
                       return json.loads(content) if content else None
               except:
                   return None
-
           rows = []
-
           for path in glob.glob("results/**/score.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
               data = load_json_safe(path)
               if data:
                   data["repository"] = repo
                   rows.append(data)
-
           for std in ["NTIA", "BSI"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
                   repo = os.path.basename(os.path.dirname(path))
@@ -324,7 +310,6 @@ jobs:
                       data["repository"] = repo
                       data["standard"] = std
                       rows.append(data)
-
           if not rows:
               print("⚠️ No SBOMQS data found — writing empty CSV.")
               pd.DataFrame([]).to_csv("sbomqs_summary.csv", index=False)
