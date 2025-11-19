@@ -136,134 +136,43 @@ jobs:
         if: env.skip_repo != 'true'
         run: |
           python3 << 'EOF'
-import json, os, uuid
+          import json, os, uuid
 
-def load(path):
-    try:
-        return json.load(open(path))
-    except:
-        return {"components":[]}
+          def load(path):
+          try:
+            return json.load(open(path))
+          except:
+            return {"components": []}
 
-trivy = load("project-src/trivy-fs.json")
-conan = load("project-src/conan-sbom.json")
-gh_license = load("project-src/license-github.json")
+          trivy = load("project-src/trivy-fs.json")
+          conan = load("project-src/conan-sbom.json")
+          gh_license = load("project-src/license-github.json")
 
-merged = {
-    "bomFormat": "CycloneDX",
-    "specVersion": "1.5",
-    "version": 1,
-    "metadata": trivy.get("metadata", {}),
-    "components": []
-}
+          merged = {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "metadata": trivy.get("metadata", {}),
+            "components": []
+            }
 
-def normalize(comps):
-    out=[]
-    if not isinstance(comps, list):
-        return out
-    for c in comps:
-        if not isinstance(c, dict):
-            continue
-        if "licenses" not in c:
-            c["licenses"] = [gh_license.get("license", {"id":"NOASSERTION"})]
-        if "bom-ref" not in c:
-            c["bom-ref"] = str(uuid.uuid4())
-        out.append(c)
-    return out
+          def normalize(comps):
+          out = []
+          if not isinstance(comps, list):
+              return out
+          for c in comps:
+            if not isinstance(c, dict):
+                continue
+            if "licenses" not in c:
+                c["licenses"] = [gh_license.get("license", {"id": "NOASSERTION"})]
+            if "bom-ref" not in c:
+                c["bom-ref"] = str(uuid.uuid4())
+            out.append(c)
+          return out
 
-merged["components"] += normalize(trivy.get("components", []))
-merged["components"] += normalize(conan.get("components", []))
+          merged["components"] += normalize(trivy.get("components", []))
+          merged["components"] += normalize(conan.get("components", []))
 
-with open("project-src/merged-sbom.json","w") as f:
-    json.dump(merged, f, indent=2)
-EOF
-
-      # ----------------------------------------------
-      # 2.5 SBOMQS
-      # ----------------------------------------------
-      - name: SBOMQS – NTIA Compliance
-        run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            compliance --ntia /sbom/merged-sbom.json \
-            > project-src/compliance_NTIA.json || true
-
-      - name: SBOMQS – BSI V2 Compliance
-        run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            compliance --bsi-v2 /sbom/merged-sbom.json \
-            > project-src/compliance_BSI.json || true
-
-      - name: SBOMQS – Score
-        run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            score /sbom/merged-sbom.json --json \
-            > project-src/score.json || true
-
-      # ----------------------------------------------
-      # Upload artifacts
-      # ----------------------------------------------
-      - name: Sanitize name
-        run: |
-          SAFE="${{ matrix.repo }}"
-          SAFE="${SAFE//\//_}"
-          echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
-
-      - name: Upload merged SBOM
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom-${{ env.SAFE_NAME }}
-          path: project-src/*.json
-
-
-  # ------------------------------------------------------------------
-  # 3. Aggregation
-  # ------------------------------------------------------------------
-  aggregate_results:
-    name: Aggregate SBOMQS Results
-    needs: sbom_scan
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: results/
-
-      - name: Install Python + pandas
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y python3-pip
-          pip install pandas
-
-      - name: Aggregate SBOM evaluation results
-        run: |
-          python3 << 'EOF'
-import json, glob, pandas as pd, os
-
-def load(p):
-    try:
-        txt=open(p).read()
-        return json.loads(txt) if txt.strip() else None
-    except:
-        return None
-
-rows=[]
-
-for path in glob.glob("results/**/*.json", recursive=True):
-    if "score" in path or "compliance" in path:
-        repo=os.path.basename(os.path.dirname(path))
-        data=load(path)
-        if data:
-            data["repository"]=repo
-            rows.append(data)
-
-if rows:
-    pd.json_normalize(rows).to_csv("sbomqs_summary.csv", index=False)
-else:
-    open("sbomqs_summary.csv","w").write("repository,standard,message\nnone,none,no_results\n")
-EOF
-
-      - name: Upload final SBOMQS summary
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbomqs_summary
-          path: sbomqs_summary.csv
+          with open("project-src/merged-sbom.json", "w") as f:
+          json.dump(merged, f, indent=2)
+          EOF
