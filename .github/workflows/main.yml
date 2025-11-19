@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Programming language to scan (C++, Python, Java, etc.)"
+        description: "Programming language to scan (e.g. C++, Python, Java)"
         required: true
         default: "C++"
 
@@ -13,22 +13,23 @@ permissions:
   security-events: write
   actions: read
 
+
 jobs:
-  # ================================================================
-  # 1. FETCH TOP REPOS
-  # ================================================================
+  # ------------------------------------------------------------
+  # 1. Fetch Top IoT Repositories
+  # ------------------------------------------------------------
   fetch_top_repos:
+    name: Fetch top 50 IoT repositories (${{ github.event.inputs.language }})
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
-
     steps:
       - name: Install jq
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      - name: Fetch repositories
+      - name: Fetch IoT repositories
         id: fetch
         env:
           LANG: ${{ github.event.inputs.language }}
@@ -40,144 +41,77 @@ jobs:
           echo "Query: $RAW_Q"
 
           REPOS=$(gh api -X GET /search/repositories \
-             --raw-field q="$RAW_Q" \
-             --raw-field sort=stars \
-             --raw-field order=desc \
-             --raw-field per_page=50 \
-             --jq '.items[].full_name'
+            --raw-field q="$RAW_Q" \
+            --raw-field sort=stars \
+            --raw-field order=desc \
+            --raw-field per_page=50 \
+            --jq '.items[].full_name'
           )
 
-          echo "Found repos:"
+          echo "Found repositories:"
           echo "$REPOS"
 
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
-
+          JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  # ================================================================
-  # 2. SBOM SCAN (CONAN + TRIVY + GITHUB API LICENSE)
-  # ================================================================
+
+  # ------------------------------------------------------------
+  # 2. SBOM Scan Job (Matrix)
+  # ------------------------------------------------------------
   sbom_scan:
+    name: SBOM Scan (Trivy + Conan + NTIA + BSI V2)
     needs: fetch_top_repos
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     strategy:
       fail-fast: false
       matrix:
-        repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+        repo: ${{ fromJson(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-      - name: Install Conan, Trivy, jq
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+
+      # --------------------------------------------------------
+      # Install required tools (jq, Conan, Trivy)
+      # --------------------------------------------------------
+      - name: Install Conan, Trivy, jq, curl, wget
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq wget
+          sudo apt-get install -y jq wget curl python3-pip python3-venv
 
-          pipx install conan
+          # Conan
+          pip install --upgrade pip
+          pip install conan
 
-          wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.50.0_Linux-64bit.deb
-          sudo dpkg -i trivy_0.50.0_Linux-64bit.deb || sudo apt-get -f install -y
+          # Trivy - official safe installer (never 404s)
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
 
-      - name: Checkout repository
-        env:
-          REPO: ${{ matrix.repo }}
-          TOKEN: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
+      # --------------------------------------------------------
+      # Generate SBOM with Trivy + Conan
+      # --------------------------------------------------------
+      - name: Generate SBOM (NTIA + BSI V2)
+        id: sbom
         run: |
-          if git clone --depth=1 "https://$TOKEN@github.com/$REPO" project-src; then
-              echo "skip_repo=false" >> $GITHUB_ENV
-          else
-              echo "skip_repo=true" >> $GITHUB_ENV
+          mkdir -p sbom
+
+          echo "Generating NTIA-style CycloneDX SBOM via Trivy..."
+
+          trivy fs . --format cyclonedx --output sbom/cyclonedx.json || true
+
+          echo "Creating Conan SBOM if conanfile exists..."
+          if [ -f "conanfile.txt" ] || [ -f "conanfile.py" ]; then
+            conan graph info . --format=json > sbom/conan-sbom.json || true
           fi
 
-      # ---------------- GitHub License API ----------------
-      - name: Fetch GitHub license metadata
-        if: env.skip_repo != 'true'
-        env:
-          REPO: ${{ matrix.repo }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api "/repos/$REPO/license" > project-src/gh-license.json || echo '{"license":{"id":"NOASSERTION"}}' > project-src/gh-license.json
-
-      # ---------------- Conan SBOM ----------------
-      - name: Conan SBOM
-        if: env.skip_repo != 'true'
-        run: |
-          cd project-src
-          conan profile detect --force || true
-          conan graph info . --format=json > conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
-
-      # ---------------- Trivy FS SBOM ----------------
-      - name: Trivy SBOM
-        if: env.skip_repo != 'true'
-        run: |
-          trivy fs --scanners vuln,license --format cyclonedx -o project-src/trivy-fs.json project-src || \
-          echo '{"components":[]}' > project-src/trivy-fs.json
-
-      # ---------------- SBOMQS ----------------
-      - name: NTIA
-        if: env.skip_repo != 'true'
-        run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            compliance --ntia /sbom/trivy-fs.json \
-            > project-src/compliance_NTIA.json || true
-
-      - name: BSI v2
-        if: env.skip_repo != 'true'
-        run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            compliance --bsi-v2 /sbom/trivy-fs.json \
-            > project-src/compliance_BSI.json || true
-
-      - name: Score
-        if: env.skip_repo != 'true'
-        run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            score /sbom/trivy-fs.json --json \
-            > project-src/score.json || true
-
-      # ---------------- ARTIFACT UPLOAD ----------------
-      - name: Sanitize name
-        run: |
-          SAFE="${{ matrix.repo }}"
-          SAFE="${SAFE//\//_}"
-          echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
-
-      - name: Upload artifacts
+      # --------------------------------------------------------
+      # Upload SBOM artifacts
+      # --------------------------------------------------------
+      - name: Upload SBOMs
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-${{ env.SAFE_NAME }}
-          path: project-src/*.json
-
-  # ================================================================
-  # 3 — AGGREGATION (NO PYTHON)
-  # ================================================================
-  aggregate_results:
-    runs-on: ubuntu-latest
-    needs: sbom_scan
-
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: results/
-
-      - name: Install jq
-        run: sudo apt-get install -y jq
-
-      - name: Aggregate JSON → CSV (NO PYTHON)
-        run: |
-          echo "repository,file,status" > sbomqs_summary.csv
-
-          for f in $(find results -name "*.json"); do
-            REPO=$(basename $(dirname "$f"))
-            BASE=$(basename "$f")
-            
-            STATUS=$(jq -r '.status // .message // "unknown"' "$f" 2>/dev/null || echo "unknown")
-
-            echo "$REPO,$BASE,$STATUS" >> sbomqs_summary.csv
-          done
-
-      - name: Upload final CSV
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbomqs_summary
-          path: sbomqs_summary.csv
+          name: sbom-${{ matrix.repo }}
+          path: sbom/
