@@ -53,14 +53,22 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-      - name: Install Conan + jq + Trivy
+      # -------------------------------------------------------------------------
+      # FIX: remove docker.io (conflicts with builtin containerd)
+      # -------------------------------------------------------------------------
+      - name: Install Conan + jq + Trivy (safe, non-conflicting)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq wget curl python3-pip docker.io
+          sudo apt-get install -y jq wget curl python3-pip
           pip install --upgrade pip
           pip install conan
+
+          # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
+
+          # Ensure Docker exists (GitHub runners already have it)
+          docker --version || sudo systemctl start docker || true
 
       - name: Checkout repository
         env:
@@ -111,7 +119,7 @@ jobs:
             || echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > project-src/trivy-fs.json
 
       # -------------------------------------------------------------------------
-      # NORMALIZE SBOM
+      # Normalize SBOM
       # -------------------------------------------------------------------------
       - name: Normalize SBOM structure (permanent fix)
         if: env.skip_repo != 'true'
@@ -142,7 +150,6 @@ jobs:
           VCS="https://github.com/$REPO"
           DIST="https://github.com/$REPO/releases"
           REPO_HASH=$(find project-src -type f -exec sha256sum {} + | sha256sum | cut -d' ' -f1)
-
           jq --arg supplier "$OWNER" \
              --arg vcs "$VCS" \
              --arg dist "$DIST" \
@@ -165,7 +172,6 @@ jobs:
         run: |
           SBOM="project-src/trivy-fs.json"
           SRC_HASH=$(find project-src -type f -exec sha256sum {} + | sha256sum | cut -d' ' -f1)
-
           jq --arg hash "$SRC_HASH" '
             .metadata.properties += [
               { "name": "cdx:digest:source", "value": $hash }
@@ -221,16 +227,13 @@ jobs:
           SBOM="project-src/trivy-fs.json"
           GH="project-src/gh-license.json"
           LOC="project-src/local-license.txt"
-
           GH_SPDX=$(jq -r '.license.spdx_id // empty' "$GH")
           TRIVY_SPDX=$(jq -r '[.components[]?.licenses[]?.license?.id // empty] | unique | join(",")' "$SBOM")
           LOCAL_SPDX=$( [ -s "$LOC" ] && echo CUSTOM || echo "" )
-
           if [ -n "$GH_SPDX" ] && [ "$GH_SPDX" != "NOASSERTION" ]; then FINAL="$GH_SPDX"
           elif [ -n "$TRIVY_SPDX" ]; then FINAL="$TRIVY_SPDX"
           elif [ -n "$LOCAL_SPDX" ]; then FINAL="$LOCAL_SPDX"
           else FINAL="NOASSERTION"; fi
-
           jq --arg lic "$FINAL" '
             .metadata.licenses = [{ "license": { "id": $lic }}] |
             .components |= map(
@@ -242,7 +245,7 @@ jobs:
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
       # -------------------------------------------------------------------------
-      # SBOMQS (now valid!)
+      # SBOMQS
       # -------------------------------------------------------------------------
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
@@ -300,7 +303,6 @@ jobs:
         run: |
           python3 <<'PY'
           import json, glob, pandas as pd, os
-
           def load_json_safe(path):
               try:
                   with open(path, "r") as f:
@@ -308,9 +310,7 @@ jobs:
                       return json.loads(txt) if txt else None
               except:
                   return None
-
           rows = []
-
           for path in glob.glob("results/**/*.json", recursive=True):
               name = os.path.basename(path)
               if name == "score.json":
@@ -321,18 +321,14 @@ jobs:
                   category = "compliance_BSI"
               else:
                   continue
-
               data = load_json_safe(path)
               if not data:
                   continue
-
               folder = os.path.basename(os.path.dirname(path))
               repo = folder.replace("sbom-reports-", "")
-
               data["repository"] = repo
               data["category"] = category
               rows.append(data)
-
           df = pd.DataFrame(rows)
           df.to_csv("sbomqs_summary.csv", index=False)
           PY
