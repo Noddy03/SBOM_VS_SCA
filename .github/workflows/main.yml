@@ -1,5 +1,6 @@
 name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (NTIA + BSI V2)
 
+# Trigger
 on:
   workflow_dispatch:
     inputs:
@@ -8,6 +9,7 @@ on:
         required: true
         default: "C++"
 
+# Minimal permissions required
 permissions:
   contents: read
   security-events: write
@@ -50,7 +52,7 @@ jobs:
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   # ================================================================
-  # 2. SBOM SCAN + ENRICHMENT
+  # 2. SBOM SCAN + ENRICHMENT (YAML A - full)
   # ================================================================
   sbom_scan:
     needs: fetch_top_repos
@@ -63,6 +65,9 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
+      # ------------------------------------------------------------
+      # Install required tools: conan, jq, trivy
+      # ------------------------------------------------------------
       - name: Install Conan + jq + Trivy
         run: |
           set -euo pipefail
@@ -70,9 +75,13 @@ jobs:
           sudo apt-get install -y jq wget curl python3-pip
           pip install --upgrade pip
           pip install conan
+          # Install trivy (adds trivy executable to /usr/local/bin)
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
+      # ------------------------------------------------------------
+      # Checkout repository (shallow clone) - skip if cannot clone
+      # ------------------------------------------------------------
       - name: Checkout repository
         env:
           REPO: ${{ matrix.repo }}
@@ -87,6 +96,7 @@ jobs:
 
       # --------------------------------------------------------------------
       # 2A — GITHUB LICENSE API (best-effort)
+      # Use Accept header and fallback to NOASSERTION
       # --------------------------------------------------------------------
       - name: Fetch GitHub license metadata
         if: env.skip_repo != 'true'
@@ -101,6 +111,7 @@ jobs:
 
       # --------------------------------------------------------------------
       # 2B — LOCAL LICENSE DETECTION (fallback)
+      # Detect common license filenames (LICENSE, COPYING, etc.)
       # --------------------------------------------------------------------
       - name: Local license file detection (fallback)
         if: env.skip_repo != 'true'
@@ -120,6 +131,7 @@ jobs:
 
       # --------------------------------------------------------------------
       # 2C — BUILD SBOMs (Conan + Trivy)
+      # Conan for dependency info (if present), Trivy for CycloneDX SBOM
       # --------------------------------------------------------------------
       - name: Conan SBOM
         if: env.skip_repo != 'true'
@@ -133,12 +145,14 @@ jobs:
         if: env.skip_repo != 'true'
         run: |
           set -euo pipefail
+          # Generate CycloneDX SBOM from filesystem
           trivy fs --scanners vuln,license --format cyclonedx \
             -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
       # --------------------------------------------------------------------
       # 2D — MERGE LICENSE SIGNALS (GitHub -> Trivy -> Local -> NOASSERTION)
+      # Guarantees metadata.licenses and per-component licenses
       # --------------------------------------------------------------------
       - name: Merge GitHub + Trivy + Local license into SBOM
         if: env.skip_repo != 'true'
@@ -148,10 +162,11 @@ jobs:
           GHLIC="project-src/gh-license.json"
           LOCALLIC="project-src/local-license.txt"
 
+          # Extract SPDX from GitHub / Trivy
           GH_SPDX=$(jq -r '.license.spdx_id // empty' "$GHLIC" 2>/dev/null || echo "")
           TRIVY_SPDX=$(jq -r '
-            [.components[]?.licenses[]?.license?.id // empty]
-            | map(select(. != "")) | unique | join(",")
+            [.components[]?.licenses[]?.license?.id // empty] |
+            map(select(. != "")) | unique | join(",")
           ' "$SBOM" 2>/dev/null || echo "")
 
           LOCAL_SPDX=""
@@ -167,11 +182,12 @@ jobs:
             FINAL="NOASSERTION"
           fi
 
-          # Ensure SBOM exists (safe)
+          # Ensure SBOM exists
           if [ ! -f "$SBOM" ] || [ ! -s "$SBOM" ]; then
             echo '{"bomFormat":"CycloneDX","components":[],"metadata":{}}' > "$SBOM"
           fi
 
+          # Inject merged license into metadata and components where missing
           jq --arg lic "$FINAL" '
             .metadata.licenses = [{ "license": { "id": $lic }}] |
             .components |= map(
@@ -180,7 +196,9 @@ jobs:
           ' "$SBOM" > tmp.json && mv tmp.json "$SBOM"
 
       # --------------------------------------------------------------------
-      # 2E — ENRICH SBOM FOR NTIA + BSI V2 (component-level, safe jq)
+      # 2E — ENRICH SBOM FOR NTIA + BSI V2 (component-level, robust jq)
+      # Adds: component.supplier, component.hashes (SBOM-level), externalReferences, metadata.bomLinks,
+      # metadata.tools/properties, signature, timestamp.
       # --------------------------------------------------------------------
       - name: Enrich SBOM for NTIA + BSI v2 (component-level)
         if: env.skip_repo != 'true'
@@ -192,24 +210,25 @@ jobs:
           REPO_URL="https://github.com/$REPO"
           OWNER=$(echo "$REPO" | cut -d'/' -f1)
 
-          # Ensure SBOM JSON exists
+          # Ensure SBOM file exists and is valid JSON
           if [ ! -f "$SBOM" ] || [ ! -s "$SBOM" ]; then
             echo '{"bomFormat":"CycloneDX","components":[],"metadata":{}}' > "$SBOM"
           fi
 
-          # Compute SBOM-level SHA256 signature (Option 1)
+          # Compute SBOM-level SHA256 signature (fast Option 1)
           FULL_SHA=$(sha256sum "$SBOM" | awk '{print $1}')
           echo "SBOM SHA256: $FULL_SHA"
 
-          # Normalize arrays/objects and safely add fields
+          # Robust jq transformation ensuring no object+array add errors:
+          # normalize metadata arrays then add the required fields and per-component entries
           jq --arg owner "$OWNER" --arg repo "$REPO" --arg repourl "$REPO_URL" --arg sha "$FULL_SHA" '
-            # Normalize metadata arrays (handle object vs array vs missing)
+            # Normalize metadata arrays (if objects -> wrap in array; if missing -> empty array)
             .metadata.tools |= (if type=="object" then [.] elif type=="array" then . else [] end) |
             .metadata.properties |= (if type=="object" then [.] elif type=="array" then . else [] end) |
             .metadata.bomLinks |= (if type=="object" then [.] elif type=="array" then . else [] end) |
             .metadata.externalReferences |= (if type=="object" then [.] elif type=="array" then . else [] end) |
 
-            # Add/merge tool + build metadata
+            # Add/merge tool info and build metadata
             .metadata.tools += [{
               "vendor": "Aqua Security",
               "name": "Trivy",
@@ -220,26 +239,26 @@ jobs:
               {"name":"build.timestamp","value":(now|todate)}
             ] |
 
-            # Supplier info at metadata level (use owner)
+            # Supplier metadata at SBOM level (still add per-component below)
             .metadata.supplier = {
               "name": $owner,
               "url": ("https://github.com/" + $owner)
             } |
 
-            # bomLinks
+            # Add or append bomLinks
             .metadata.bomLinks += [
               {"rel":"self","href":("https://github.com/" + $repo + "/sbom")},
               {"rel":"repository","href": $repourl},
               {"rel":"distribution","href": ($repourl + "/releases")}
             ] |
 
-            # signature block (simple)
+            # Signature block (simple SBOM-level signature using computed sha)
             .signature = {"algorithm":"SHA-256","value":$sha} |
 
-            # Ensure components is an array
+            # Ensure components exists as array
             .components |= (if . == null then [] else . end) |
 
-            # For each component: supplier, hashes (SBOM-level), externalReferences, ensure license exists
+            # Per-component enrichment: supplier, hashes, externalReferences, ensure license presence
             .components |= map(
               (. // {}) |
               .supplier = (.supplier // {"name": $owner, "url": ("https://github.com/" + $owner)}) |
@@ -255,12 +274,14 @@ jobs:
           echo "✔ Enrichment complete: component.supplier, component.hashes, externalReferences, metadata, bomLinks, signature inserted."
 
       # --------------------------------------------------------------------
-      # 2F — SBOMQS COMPLIANCE (NTIA, BSI) + SCORE (safe fallback to empty JSON)
+      # 2F — SBOMQS COMPLIANCE ANALYSIS (NTIA + BSI) and Score with creation_info injection
+      # We make sure these steps always produce JSON (fallback to {}), then inject creation_info into score.json
       # --------------------------------------------------------------------
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
         run: |
           set -euo pipefail
+          # Run compliance NTIA; if it fails, write empty JSON so aggregator can still run
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --ntia /sbom/trivy-fs.json \
             > project-src/compliance_NTIA.json || echo '{}' > project-src/compliance_NTIA.json
@@ -273,16 +294,31 @@ jobs:
             compliance --bsi-v2 /sbom/trivy-fs.json \
             > project-src/compliance_BSI.json || echo '{}' > project-src/compliance_BSI.json
 
-      - name: Score SBOM
+      - name: Score SBOM (with creation_info injection)
         if: env.skip_repo != 'true'
+        env:
+          REPO: ${{ matrix.repo }}
         run: |
           set -euo pipefail
+          # Run score; fallback to empty JSON if the container errors
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             score /sbom/trivy-fs.json --json \
             > project-src/score.json || echo '{}' > project-src/score.json
 
+          # Inject creation_info block so aggregator can extract the expected columns.
+          # creation_info fields: name, version, scoring_engine_version, vendor
+          # We preserve any existing scoring_engine_version if present in the output.
+          jq --arg repo "$REPO" '
+            .creation_info = {
+              "name": "SBOMQS Score",
+              "version": "1.0",
+              "scoring_engine_version": (.scoring_engine_version // "unknown"),
+              "vendor": $repo
+            }
+          ' project-src/score.json > project-src/score.tmp.json && mv project-src/score.tmp.json project-src/score.json
+
       # --------------------------------------------------------------------
-      # 2G — Packaging / Upload artifacts
+      # 2G — Packaging / Upload artifacts (unchanged behaviour)
       # --------------------------------------------------------------------
       - name: Sanitize artifact name
         id: sanitize
@@ -334,19 +370,21 @@ jobs:
           run_id = os.getenv("GITHUB_RUN_ID", "")
           timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-          # Search artifact folders under results/
-          # Each artifact typically extracted into results/<artifact-name>/...
-          artifact_dirs = sorted({ os.path.dirname(p) for p in glob.glob("results/**/score.json", recursive=True) })
+          # Find artifact directories that contain score.json
+          score_paths = glob.glob("results/**/score.json", recursive=True)
+          # Normalize list of artifact dirs (dir that contains each score.json)
+          artifact_dirs = sorted({ os.path.dirname(p) for p in score_paths })
 
           for ad in artifact_dirs:
-              repo = os.path.basename(ad)  # artifact folder - often "sbom-reports-<repo>"
-              # Try to locate score.json in that directory tree
-              score_paths = glob.glob(os.path.join(ad, "**", "score.json"), recursive=True)
-              score = None
-              if score_paths:
-                  score = load_json_safe(score_paths[0])
+              # repository: try to get the artifact folder name (often 'sbom-reports_<repo>')
+              repo = os.path.basename(ad)
+              # find first score.json under this artifact dir (may be nested)
+              score_list = glob.glob(os.path.join(ad, "**", "score.json"), recursive=True)
+              score_data = None
+              if score_list:
+                  score_data = load_json_safe(score_list[0])
 
-              # Count files we consider (score + NTIA + BSI)
+              # count presence of relevant files (score + compliance_NTIA + compliance_BSI)
               files_count = 0
               if glob.glob(os.path.join(ad, "**", "score.json"), recursive=True):
                   files_count += 1
@@ -355,9 +393,10 @@ jobs:
               if glob.glob(os.path.join(ad, "**", "compliance_BSI.json"), recursive=True):
                   files_count += 1
 
+              # Extract creation_info fields from score.json (injected earlier)
               ci = {}
-              if isinstance(score, dict):
-                  ci = score.get("creation_info", {}) or {}
+              if isinstance(score_data, dict):
+                  ci = score_data.get("creation_info", {}) or {}
 
               row = {
                   "run_id": run_id,
