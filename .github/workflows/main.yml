@@ -24,7 +24,6 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq
-
       - name: Fetch repositories
         id: fetch
         env:
@@ -34,14 +33,12 @@ jobs:
           set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
           echo "Query: $RAW_Q"
-
           REPOS=$(gh api -X GET /search/repositories \
              --raw-field q="$RAW_Q" \
              --raw-field sort=stars \
              --raw-field order=desc \
              --raw-field per_page=50 \
              --jq '.items[].full_name')
-
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
@@ -110,8 +107,7 @@ jobs:
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
       # ---------------------------------------------------------
-      # 🔧 UNIVERSAL SBOM NORMALIZATION (PERMANENT FIX)
-      # Ensures metadata exists, components are arrays, properties exist, etc.
+      # UNIVERSAL SBOM NORMALIZATION
       # ---------------------------------------------------------
       - name: Normalize SBOM structure (permanent fix)
         if: env.skip_repo != 'true'
@@ -129,8 +125,7 @@ jobs:
                end)
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      # --- SBOM METADATA PATCHES (unchanged, fully working) -------------------
-
+      # --- SBOM METADATA PATCHES -----------------------------
       - name: Add missing SBOM metadata
         if: env.skip_repo != 'true'
         env:
@@ -209,8 +204,7 @@ jobs:
             }
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      # --- LICENSE MERGE ------------------------------------------------------
-
+      # --- LICENSE MERGE ----------------------------------------
       - name: Merge GitHub + Trivy + Local license
         if: env.skip_repo != 'true'
         run: |
@@ -220,12 +214,10 @@ jobs:
           GH_SPDX=$(jq -r '.license.spdx_id // empty' "$GH")
           TRIVY_SPDX=$(jq -r '[.components[]?.licenses[]?.license?.id // empty] | unique | join(",")' "$SBOM")
           LOCAL_SPDX=$( [ -s "$LOC" ] && echo CUSTOM || echo "" )
-
           if [ -n "$GH_SPDX" ] && [ "$GH_SPDX" != "NOASSERTION" ]; then FINAL="$GH_SPDX"
           elif [ -n "$TRIVY_SPDX" ]; then FINAL="$TRIVY_SPDX"
           elif [ -n "$LOCAL_SPDX" ]; then FINAL="$LOCAL_SPDX"
           else FINAL="NOASSERTION"; fi
-
           jq --arg lic "$FINAL" '
             .metadata.licenses = [{ "license": { "id": $lic }}] |
             .components |= map(
@@ -236,8 +228,7 @@ jobs:
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      # --- SBOMQS -------------------------------------------------------------
-
+      # --- SBOMQS ------------------------------------------------
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
         run: |
@@ -298,18 +289,22 @@ jobs:
           def load_json_safe(path):
               try:
                   with open(path, "r") as f:
-                      txt = f.read().strip()
-                      return json.loads(txt) if txt else None
+                      text = f.read().strip()
+                      return json.loads(text) if text else None
               except:
                   return None
 
           rows = []
+
+          # Each repo artifact unpacks to: results/sbom-reports-REPO/*.json
           for path in glob.glob("results/**/*.json", recursive=True):
-              if path.endswith("score.json"):
+              name = os.path.basename(path)
+
+              if name == "score.json":
                   category = "score"
-              elif "compliance_NTIA" in path:
+              elif name == "compliance_NTIA.json":
                   category = "compliance_NTIA"
-              elif "compliance_BSI" in path:
+              elif name == "compliance_BSI.json":
                   category = "compliance_BSI"
               else:
                   continue
@@ -318,7 +313,10 @@ jobs:
               if not data:
                   continue
 
-              repo = os.path.basename(os.path.dirname(os.path.dirname(path)))
+              # artifact folder is: results/sbom-reports-OWNER_REPO
+              folder = os.path.basename(os.path.dirname(path))
+              repo = folder.replace("sbom-reports-", "")
+
               data["repository"] = repo
               data["category"] = category
               rows.append(data)
