@@ -131,17 +131,18 @@ jobs:
             score /sbom/trivy-fs.json --json \
             > project-src/score.json || true
 
-      - name: Sanitize name
+      - name: Sanitize artifact name
+        id: sanitize
         run: |
-          SAFE="${{ matrix.repo }}"
-          SAFE="${SAFE//\//_}"
-          echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
-
-      - name: Upload SBOM artifacts
+          SAFE_NAME="${{ matrix.repo }}"
+          SAFE_NAME="${SAFE_NAME//\//_}"
+          echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
+      - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-${{ env.SAFE_NAME }}
+          name: sbom-reports-${{ steps.sanitize.outputs.name }}
           path: project-src/*.json
+          if-no-files-found: warn
 
   # ================================================================
   # 3. AGGREGATION – TSV SUMMARY (SAFE JSON HANDLING)
