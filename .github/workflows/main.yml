@@ -91,9 +91,14 @@ jobs:
       - name: Local license fallback
         if: env.skip_repo != 'true'
         run: |
-          FILE=$(find project-src -maxdepth 4 -type f \
+          FILE=$(find project-src -maxdepth=4 -type f \
             -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
-          if [ -n "$FILE" ]; then cp "$FILE" project-src/local-license.txt; else echo "" > project-src/local-license.txt; fi
+
+          if [ -n "$FILE" ]; then
+            cp "$FILE" project-src/local-license.txt
+          else
+            echo "" > project-src/local-license.txt
+          fi
 
       - name: Conan SBOM
         if: env.skip_repo != 'true'
@@ -129,7 +134,10 @@ jobs:
           jq --arg lic "$FINAL" '
             .metadata.licenses = [{ "license": { "id": $lic }}] |
             .components |= map(
-              if (.licenses | length == 0) then .licenses = [{ "license": { "id": $lic }}] else . end
+              if (.licenses | length == 0)
+              then .licenses = [{ "license": { "id": $lic }}]
+              else .
+              end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
@@ -189,6 +197,7 @@ jobs:
         run: |
           python3 <<'PY'
           import json, glob, pandas as pd, os
+
           def load_json_safe(p):
               try:
                   with open(p) as f:
@@ -196,14 +205,17 @@ jobs:
                       return json.loads(content) if content else None
               except:
                   return None
+
           rows = []
-          # SBOM Score
-          for path in glob.glob("results/**/score_evaluation.json", recursive=True):
+
+          # FIXED — load correct score filename
+          for path in glob.glob("results/**/score.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
               data = load_json_safe(path)
               if data:
                   data["repository"] = repo
                   rows.append(data)
+
           # NTIA / BSI
           for std in ["NTIA", "BSI"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
@@ -213,7 +225,8 @@ jobs:
                       data["repository"] = repo
                       data["standard"] = std
                       rows.append(data)
-          # ALWAYS write CSV
+
+          # ALWAYS create summary.csv
           if not rows:
               print("⚠️ No SBOMQS data found — writing empty CSV.")
               pd.DataFrame([]).to_csv("sbomqs_summary.csv", index=False)
@@ -221,7 +234,9 @@ jobs:
               df = pd.json_normalize(rows)
               df.to_csv("sbomqs_summary.csv", index=False)
               print(f"📊 Wrote sbomqs_summary.csv with {len(rows)} rows")
+
           PY
+
       - name: Upload aggregated summary
         uses: actions/upload-artifact@v4
         with:
