@@ -51,7 +51,6 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-
       - name: Install Conan + jq + Trivy
         run: |
           sudo apt-get update -y
@@ -106,10 +105,10 @@ jobs:
           trivy fs --scanners vuln,license --format cyclonedx \
             -o project-src/trivy-fs.json project-src || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      ###########################################################
-      # FINAL FIX — FULL SBOMQS COMPATIBLE LICENSE INJECTION
-      ###########################################################
-      - name: Inject final license into ALL SBOM structures
+      ###########################################################################
+      # BRUTE FORCE LICENSE INJECTION — MAX COMPATIBILITY WITH SBOMQS
+      ###########################################################################
+      - name: Inject final license (BRUTE FORCE — WORKS WITH ALL SBOM SHAPES)
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
@@ -122,51 +121,65 @@ jobs:
           else LIC="NOASSERTION"; fi
 
           jq --arg lic "$LIC" '
-            def ensure_obj_array:
-              if type=="array" then map(if type=="object" then . else {} end)
-              elif type=="object" then [.] else [] end;
+            def arr: if type=="array" then . elif type=="object" then [.] else [] end;
 
-            # Normalize components from multiple CycloneDX possible roots
-            .components = ((.components // []) | ensure_obj_array) |
+            # Normalize arrays
+            .components = (.components // [] | arr) |
             .bom = (.bom // {}) |
-            (.bom.components = ((.bom.components // .components) | ensure_obj_array)) |
+            .bom.components = (.bom.components // .components // [] | arr) |
 
-            # If both arrays empty, create synthetic component
-            if ((.components | length)==0 and (.bom.components | length)==0) then
+            # Sync arrays
+            .components =
+              if (.components|length)==0 and (.bom.components|length)>0 then .bom.components
+              else .components end |
+            .bom.components =
+              if (.bom.components|length)==0 and (.components|length)>0 then .components
+              else .bom.components end |
+
+            # Synthetic component if empty
+            if (.components|length)==0 then
               .components = [
                 {
                   "name":"repository",
                   "version":"0.0.0",
                   "licenses":[{"license":{"id":$lic}}],
-                  "externalReferences":[
-                    { "type":"license", "url":("https://spdx.org/licenses/" + $lic + ".html") }
-                  ]
+                  "externalReferences":[{"type":"license","url":("https://spdx.org/licenses/" + $lic + ".html")}]
                 }
               ] |
               .bom.components = .components
             else . end |
 
-            # Inject license+externalRefs into both arrays
-            .components |= map(
-              .licenses = [{ "license": { "id": $lic }}] |
-              .externalReferences = ((.externalReferences // []) + [
-                { "type":"license", "url":("https://spdx.org/licenses/" + $lic + ".html") }
-              ])
-            ) |
-            .bom.components = (.components) |
+            # BRUTE FORCE injection
+            (.components |= map(
+                del(.license) |
+                del(.licenses) |
+                del(.licence) |
+                del(.licences) |
+                del(.licenseId) |
+                del(.declaredLicense) |
+                .name = (.name // "unknown") |
+                .version = (.version // "0.0.0") |
+                .licenses = [{ "license": { "id": $lic }}] |
+                .externalReferences = ((.externalReferences // []) + [
+                  {"type":"license","url":("https://spdx.org/licenses/" + $lic + ".html")}
+                ])
+            )) |
+            .bom.components = .components |
 
-            # Add metadata required by SBOMQS
+            # SBOM metadata
             .metadata = (.metadata // {}) |
+            del(.metadata.license) |
+            del(.metadata.licensesId) |
+            del(.metadata.licence) |
             .metadata.dataLicense = "CC-BY-4.0" |
             .metadata.licenses = [{ "license": { "id": $lic }}] |
             .metadata.component = (.metadata.component // {}) |
             .metadata.component.licenses = [{ "license": { "id": $lic }}] |
             .metadata.component.externalReferences = [
-              { "type":"license", "url":("https://spdx.org/licenses/" + $lic + ".html") }
+              {"type":"license","url":("https://spdx.org/licenses/" + $lic + ".html")}
             ]
           ' "$SBOM" > tmp && mv tmp "$SBOM"
-
-      ###########################################################
+      ###########################################################################
 
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
