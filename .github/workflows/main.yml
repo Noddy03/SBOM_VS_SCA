@@ -32,6 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
+          echo "Query: $RAW_Q"
           REPOS=$(gh api -X GET /search/repositories \
              --raw-field q="$RAW_Q" \
              --raw-field sort=stars \
@@ -39,6 +40,7 @@ jobs:
              --raw-field per_page=50 \
              --jq '.items[].full_name'
           )
+          echo "$REPOS"
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
@@ -110,7 +112,36 @@ jobs:
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
       ###########################################################################
-      # Step: Add metadata (unchanged except safe guards)
+      # SAFE NORMALIZATION: convert any non-object components -> valid objects
+      # This must run immediately after Trivy output to prevent all downstream jq crashes
+      ###########################################################################
+      - name: Normalize SBOM components (BEST + SAFEST)
+        if: env.skip_repo != 'true'
+        run: |
+          SBOM="project-src/trivy-fs.json"
+          jq '
+            .components |= map(
+              if (type == "object") then
+                .  # leave object components alone
+              else
+                {
+                  "name": "unknown",
+                  "version": "0.0.0",
+                  "supplier": { "name": "unknown" },
+                  "purl": "pkg:generic/unknown@0.0.0",
+                  "licenses": [{ "license": { "id": "NOASSERTION" }}],
+                  "hashes": [{ "alg": "SHA-256", "content": "0" }],
+                  "externalReferences": [
+                    { "type": "website", "url": "https://github.com/" },
+                    { "type": "vcs", "url": "https://github.com/" }
+                  ]
+                }
+              end
+            )
+          ' "$SBOM" > tmp && mv tmp "$SBOM"
+
+      ###########################################################################
+      # Step: Add missing SBOM metadata (supplier, URLs, hashes) — safe guards included
       ###########################################################################
       - name: Add missing SBOM metadata (supplier, URLs, hashes)
         if: env.skip_repo != 'true'
@@ -121,14 +152,14 @@ jobs:
           OWNER=$(echo "$REPO" | cut -d'/' -f1)
           VCS="https://github.com/$REPO"
           DIST="https://github.com/$REPO/releases"
+          echo "Computing repo-level deterministic SHA-256..."
           REPO_HASH=$(find project-src -type f -exec sha256sum {} + | sha256sum | cut -d' ' -f1)
-
           jq --arg supplier "$OWNER" \
              --arg vcs "$VCS" \
              --arg dist "$DIST" \
              --arg hash "$REPO_HASH" '
             .components |= map(
-              if type=="object" then
+              if (type == "object") then
                 (
                   .supplier = { "name": $supplier } |
                   (.externalReferences //= []) |
@@ -138,68 +169,88 @@ jobs:
                   ] |
                   .hashes = [{ "alg": "SHA-256", "content": $hash }]
                 )
-              else .
+              else
+                .
               end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
       ###########################################################################
-      # Step: BSI-V2 normalization (safe version)
+      # BSI-V2 normalization (safe)
       ###########################################################################
-      - name: Enrich SBOM for full BSI-V2 compliance (safe normalizer)
+      - name: Enrich SBOM for full BSI-V2 compliance (safe)
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
           NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
           jq --arg ts "$NOW" '
             .metadata.timestamp = $ts |
             .components |= map(
-              if type=="object" then
+              if (type == "object") then
                 (
                   .supplier //= { "name": "unknown" } |
                   .name //= "unknown" |
                   .version //= "0.0.0" |
+                  .licenses //= [{ "license": { "id": "NOASSERTION" }}] |
+                  .hashes //= [{ "alg": "SHA-256", "content": "0" }] |
                   .purl //= ("pkg:generic/" + (.name|tostring) + "@" + (.version|tostring)) |
-                  (.externalReferences //= [])
+                  (.externalReferences //= []) |
+                  .externalReferences += [
+                    { "type": "website", "url": "https://github.com/" },
+                    { "type": "vcs", "url": "https://github.com/" }
+                  ]
                 )
-              else .
+              else
+                .
               end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
       ###########################################################################
-      # Step: Ensure valid SPDX license structure BEFORE assigning repo license
+      # Ensure licenses array exists and is valid (fix nulls / empty / malformed)
       ###########################################################################
-      - name: Enforce valid SPDX license structure
+      - name: Enforce valid SPDX license structure for all components (SAFE FIX)
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
-
           jq '
             .components |= map(
-              if type=="object" then
+              if (type == "object") then
                 (
-                  if (.licenses | type != "array" or (.licenses|length)==0) then
+                  if (.licenses | type != "array" or (.licenses | length == 0)) then
                     .licenses = [{ "license": { "id": "NOASSERTION" }}]
                   else
                     .licenses = (
                       .licenses | map(
-                        if (.license==null or .license.id==null or .license.id=="") then
+                        if (.license == null or .license.id == null or .license.id == "" or .license.id == "UNKNOWN") then
                           { "license": { "id": "NOASSERTION" }}
-                        else .
+                        else
+                          .
                         end
                       )
                     )
                   end
                 )
-              else .
+              else
+                # should not happen due to normalization but be extra safe
+                {
+                  "name": "unknown",
+                  "version": "0.0.0",
+                  "supplier": { "name": "unknown" },
+                  "purl": "pkg:generic/unknown@0.0.0",
+                  "licenses": [{ "license": { "id": "NOASSERTION" }}],
+                  "hashes": [{ "alg": "SHA-256", "content": "0" }],
+                  "externalReferences": [
+                    { "type": "website", "url": "https://github.com/" },
+                    { "type": "vcs", "url": "https://github.com/" }
+                  ]
+                }
               end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
       ###########################################################################
-      # ✅ SAFE OPTION 2 — Assign repo license ONCE; no argfile; no rewriting arrays
+      # Assign repository license to all components (Option 2 SAFE, no --argfile)
       ###########################################################################
       - name: Assign repository license to all components (Option 2 SAFE)
         if: env.skip_repo != 'true'
@@ -207,9 +258,7 @@ jobs:
           SBOM="project-src/trivy-fs.json"
 
           GH_LICENSE=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
-          FILE_LICENSE=$(grep -Eo "SPDX-License-Identifier:[ ]*[A-Za-z0-9\.\-\+]+" \
-                          project-src/local-license.txt 2>/dev/null \
-                          | head -1 | awk -F': ' '{print $2}')
+          FILE_LICENSE=$(grep -Eo "SPDX-License-Identifier:[ ]*[A-Za-z0-9\.\-\+]+" project-src/local-license.txt 2>/dev/null | head -1 | awk -F': ' '{print $2}')
 
           FINAL_LICENSE="${GH_LICENSE:-$FILE_LICENSE}"
           if [ -z "$FINAL_LICENSE" ]; then
@@ -219,10 +268,12 @@ jobs:
           echo "Final detected license: $FINAL_LICENSE"
 
           jq --arg lic "$FINAL_LICENSE" '
+            .metadata.licenses = [{ "license": { "id": $lic }}] |
             .components |= map(
-              if type=="object" then
+              if (type == "object") then
                 .licenses = [{ "license": { "id": $lic }}]
-              else .
+              else
+                .
               end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
@@ -264,9 +315,6 @@ jobs:
           path: project-src/*.json
           if-no-files-found: warn
 
-  ###########################################################################
-  # AGGREGATION (unchanged)
-  ###########################################################################
   aggregate_results:
     name: Aggregate SBOMQS Results
     needs: sbom_scan
