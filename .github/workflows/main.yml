@@ -41,7 +41,6 @@ jobs:
              --jq '.items[].full_name')
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
   sbom_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
@@ -61,7 +60,6 @@ jobs:
           pip install conan
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
-
       - name: Checkout repository
         env:
           REPO: ${{ matrix.repo }}
@@ -72,28 +70,48 @@ jobs:
           else
               echo "skip_repo=true" >> $GITHUB_ENV
           fi
-
-      - name: Fetch GitHub license metadata
+      - name: Fetch GitHub license metadata (robust)
         if: env.skip_repo != 'true'
         env:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/license" \
-             > project-src/gh-license.json 2>/dev/null \
-             || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
-
-      - name: Local license fallback
+          # Use the repository metadata endpoint which more reliably contains license.spdx_id
+          mkdir -p project-src
+          GH_SPdx=$(gh api -H "Accept: application/vnd.github+json" "/repos/$REPO" --jq '.license.spdx_id' 2>/dev/null || echo "")
+          # Normalize empty / null to NOASSERTION
+          if [ -z "$GH_SPdx" ] || [ "$GH_SPdx" = "null" ]; then
+            echo "NOASSERTION" > project-src/gh-license.txt
+          else
+            echo "$GH_SPdx" | tr -d '\n' > project-src/gh-license.txt
+          fi
+      - name: Detect SPDX license locally (strong fallback)
         if: env.skip_repo != 'true'
         run: |
+          mkdir -p project-src
+          # Find likely license files
           FILE=$(find project-src -maxdepth=4 -type f \
-            -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
+            -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|UNLICENSE\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
           if [ -n "$FILE" ]; then
-            cp "$FILE" project-src/local-license.txt
-          else
-            echo "" > project-src/local-license.txt
-          fi
+            # Try to extract a SPDX identifier from the file contents with a conservative regex.
+            SPDX=$(grep -Eio "SPDX-License-Identifier:[[:space:]]*([A-Za-z0-9\.\-+]+)" "$FILE" \
+                   | head -1 \
+                   | sed -E 's/.*SPDX-License-Identifier:[[:space:]]*//I' || true)
 
+            # If SPDX header not found, try to match common license names
+            if [ -z "$SPDX" ]; then
+              SPDX=$(grep -Eio "(Apache-2\.0|MIT|BSD-[23]-Clause|GPL-3\.0-only|GPL-3\.0-or-later|GPL-2\.0-only|LGPL-3\.0-only|LGPL-2\.1-only|MPL-2\.0|CDDL-1\.0|EPL-2\.0|Unlicense|ISC|BSD-2-Clause|BSD-3-Clause)" "$FILE" \
+                     | head -1 || true)
+            fi
+
+            if [ -z "$SPDX" ]; then
+              echo "NOASSERTION" > project-src/local-license.txt
+            else
+              echo "$SPDX" | tr -d '\n' > project-src/local-license.txt
+            fi
+          else
+            echo "NOASSERTION" > project-src/local-license.txt
+          fi
       - name: Conan SBOM
         if: env.skip_repo != 'true'
         run: |
@@ -101,14 +119,12 @@ jobs:
           conan profile detect --force || true
           conan graph info . --format=json > conan-sbom.json \
             || echo '{"components":[]}' > conan-sbom.json
-
       - name: Trivy SBOM
         if: env.skip_repo != 'true'
         run: |
           trivy fs --scanners vuln,license --format cyclonedx \
             -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
-
       ###########################################################################
       #  SAFE NORMALISATION — UNBREAKABLE FIX (100% prevents jq failures)
       ###########################################################################
@@ -166,25 +182,43 @@ jobs:
               end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
-
       ###########################################################################
-      #  LICENSE INJECTION (MINIMAL, SAFE, GITHUB + LOCAL + FALLBACK)
+      #  LICENSE INJECTION (MINIMAL, SAFE, GITHUB + LOCAL + fallback)
       ###########################################################################
-      - name: Assign repository license to all components (GitHub + Local + fallback)
+      - name: Force license injection into SBOM (robust)
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
+          GH_LICENSE=$(cat project-src/gh-license.txt 2>/dev/null || echo "")
+          FILE_LICENSE=$(cat project-src/local-license.txt 2>/dev/null || echo "")
+          FINAL_LICENSE=""
 
-          GH_LICENSE=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
-          FILE_LICENSE=$(grep -Eo "SPDX-License-Identifier:[ ]*[A-Za-z0-9.\-+]+" \
-                         project-src/local-license.txt 2>/dev/null | head -1 | awk -F': ' '{print $2}')
-
-          FINAL_LICENSE="${GH_LICENSE:-$FILE_LICENSE}"
-          [ -z "$FINAL_LICENSE" ] && FINAL_LICENSE="NOASSERTION"
+          if [ -n "$GH_LICENSE" ] && [ "$GH_LICENSE" != "NOASSERTION" ]; then
+            FINAL_LICENSE="$GH_LICENSE"
+          elif [ -n "$FILE_LICENSE" ] && [ "$FILE_LICENSE" != "NOASSERTION" ]; then
+            FINAL_LICENSE="$FILE_LICENSE"
+          else
+            FINAL_LICENSE="NOASSERTION"
+          fi
 
           echo "Final detected license: $FINAL_LICENSE"
 
+          # Ensure components exists, create one if empty, and set licenses on every component.
           jq --arg lic "$FINAL_LICENSE" '
+            .components |= (if type=="array" then . else [] end) |
+            .components |= (if length==0 then
+              [
+                {
+                  "name": ( (.metadata?.component?.name // "repository") ),
+                  "version": ( (.metadata?.component?.version // "0.0.0") ),
+                  "supplier": (.metadata?.component?.supplier // { "name": "unknown" }),
+                  "licenses": [{ "license": { "id": $lic }}],
+                  "purl": (.metadata?.component?.purl // ("pkg:generic/" + (.metadata?.component?.name // "repository") + "@0.0.0")),
+                  "externalReferences": []
+                }
+              ]
+            else .
+            end) |
             .components |= map(
               if type == "object" then
                 .licenses = [{ "license": { "id": $lic }}]
@@ -193,7 +227,6 @@ jobs:
               end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
-
       ###########################################################################
 
       - name: NTIA Compliance
@@ -202,28 +235,24 @@ jobs:
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --ntia /sbom/trivy-fs.json \
             > project-src/compliance_NTIA.json || true
-
       - name: BSI v2 Compliance
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --bsi-v2 /sbom/trivy-fs.json \
             > project-src/compliance_BSI.json || true
-
       - name: Score SBOM
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             score /sbom/trivy-fs.json --json \
             > project-src/score.json || true
-
       - name: Sanitize artifact name
         id: sanitize
         run: |
           SAFE="${{ matrix.repo }}"
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
-
       - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
         with:
@@ -248,7 +277,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-pip
           pip install pandas
-
       - name: Aggregate SBOMQS results to CSV
         run: |
           python3 <<'PY'
@@ -283,7 +311,6 @@ jobs:
               df.to_csv("sbomqs_summary.csv", index=False)
               print(f"📊 Wrote sbomqs_summary.csv with {len(rows)} rows")
           PY
-
       - name: Upload aggregated summary
         uses: actions/upload-artifact@v4
         with:
