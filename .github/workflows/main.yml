@@ -31,7 +31,6 @@ jobs:
           LANG: ${{ github.event.inputs.language }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
              --raw-field q="$RAW_Q" \
@@ -46,7 +45,6 @@ jobs:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
     continue-on-error: true
-
     strategy:
       fail-fast: false
       matrix:
@@ -76,11 +74,8 @@ jobs:
 
       - name: Fetch GitHub license metadata
         if: env.skip_repo != 'true'
-        env:
-          REPO: ${{ matrix.repo }}
         run: |
-          mkdir -p project-src
-          LICENSE=$(gh api "/repos/$REPO" --jq '.license.spdx_id' 2>/dev/null || echo "")
+          LICENSE=$(gh api "/repos/${{ matrix.repo }}" --jq '.license.spdx_id' 2>/dev/null || echo "")
           if [ -z "$LICENSE" ] || [ "$LICENSE" = "null" ]; then
             echo "NOASSERTION" > project-src/gh-license.txt
           else
@@ -90,13 +85,9 @@ jobs:
       - name: Local license fallback
         if: env.skip_repo != 'true'
         run: |
-          FILE=$(find project-src -maxdepth=4 -type f \
-            -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|UNLICENSE\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
+          FILE=$(find project-src -maxdepth=4 -iname "*license*" | head -1)
           if [ -n "$FILE" ]; then
-            SPDX=$(grep -Eio "SPDX-License-Identifier:[ ]*[A-Za-z0-9.\-+]+" "$FILE" | head -1 | awk -F': ' '{print $2}')
-            if [ -z "$SPDX" ]; then
-              SPDX=$(grep -Eio "(Apache-2\.0|MIT|BSD-[23]-Clause|GPL-3\.0|LGPL-3\.0|MPL-2\.0|Unlicense)" "$FILE" | head -1)
-            fi
+            SPDX=$(grep -Eio "SPDX-License-Identifier: *[A-Za-z0-9.\-+]+" "$FILE" | head -1 | awk -F': ' '{print $2}')
             echo "${SPDX:-NOASSERTION}" > project-src/local-license.txt
           else
             echo "NOASSERTION" > project-src/local-license.txt
@@ -107,95 +98,72 @@ jobs:
         run: |
           cd project-src
           conan profile detect --force || true
-          conan graph info . --format=json > conan-sbom.json \
-            || echo '{"components":[]}' > conan-sbom.json
+          conan graph info . --format=json > conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
 
       - name: Trivy SBOM
         if: env.skip_repo != 'true'
         run: |
           trivy fs --scanners vuln,license --format cyclonedx \
-            -o project-src/trivy-fs.json project-src \
-            || echo '{"components":[]}' > project-src/trivy-fs.json
+            -o project-src/trivy-fs.json project-src || echo '{"components":[]}' > project-src/trivy-fs.json
 
       ###########################################################
-      #   FINAL WORKING FIX: robust component + license injection
+      # FINAL FIX — FULL SBOMQS COMPATIBLE LICENSE INJECTION
       ###########################################################
-      - name: Inject final license into SBOM (robust multi-shape)
+      - name: Inject final license into ALL SBOM structures
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
+
           GH=$(cat project-src/gh-license.txt)
           LC=$(cat project-src/local-license.txt)
 
-          if [ "$GH" != "NOASSERTION" ]; then FINAL="$GH"
-          elif [ "$LC" != "NOASSERTION" ]; then FINAL="$LC"
-          else FINAL="NOASSERTION"; fi
+          if [ "$GH" != "NOASSERTION" ]; then LIC="$GH"
+          elif [ "$LC" != "NOASSERTION" ]; then LIC="$LC"
+          else LIC="NOASSERTION"; fi
 
-          jq --arg lic "$FINAL" '
-
+          jq --arg lic "$LIC" '
             def ensure_obj_array:
-              if type=="array" then
-                map(if type=="object" then . else {"name":"unknown"} end)
+              if type=="array" then map(if type=="object" then . else {} end)
               elif type=="object" then [.] else [] end;
 
-            # Normalize components from CycloneDX variants
-            .components = (
-              ( .components // .bom.components // [] )
-              | ensure_obj_array
-            )
+            # Normalize components from multiple CycloneDX possible roots
+            .components = ((.components // []) | ensure_obj_array) |
+            .bom = (.bom // {}) |
+            (.bom.components = ((.bom.components // .components) | ensure_obj_array)) |
 
-            # If empty, add synthetic repository component
-            | if (.components | length)==0 then
-                .components = [
-                  {
-                    "name":"repository",
-                    "version":"0.0.0",
-                    "supplier":{"name":"unknown"},
-                    "licenses":[{"license":{"id":$lic}}],
-                    "externalReferences":[
-                      {
-                        "type":"license",
-                        "url":("https://spdx.org/licenses/" + $lic + ".html")
-                      }
-                    ]
-                  }
-                ]
-              else .
-              end
-
-            # Inject license + externalReferences into each component
-            | .components = (.components | map(
-                .name = (.name // "unknown") |
-                .version = (.version // "0.0.0") |
-                .supplier = (.supplier // {"name":"unknown"}) |
-                .licenses = [{ "license": { "id": $lic } }] |
-                .externalReferences = (
-                  (.externalReferences // []) +
-                  [
-                    {
-                      "type":"license",
-                      "url":("https://spdx.org/licenses/" + $lic + ".html")
-                    }
-                  ]
-                )
-              ))
-
-            # Mirror components for SBOMs using bom.components
-            | .bom = (.bom // {}) | .bom.components = .components
-
-            # SBOM-level metadata (required by SBOMQS)
-            | .metadata = (.metadata // {}) |
-              .metadata.dataLicense = "CC-BY-4.0" |
-              .metadata.licenses = [{ "license":{ "id":$lic }}] |
-              .metadata.component = (.metadata.component // {}) |
-              .metadata.component.licenses = [{ "license":{ "id":$lic }}] |
-              .metadata.component.externalReferences = [
+            # If both arrays empty, create synthetic component
+            if ((.components | length)==0 and (.bom.components | length)==0) then
+              .components = [
                 {
-                  "type":"license",
-                  "url":("https://spdx.org/licenses/" + $lic + ".html")
+                  "name":"repository",
+                  "version":"0.0.0",
+                  "licenses":[{"license":{"id":$lic}}],
+                  "externalReferences":[
+                    { "type":"license", "url":("https://spdx.org/licenses/" + $lic + ".html") }
+                  ]
                 }
-              ]
+              ] |
+              .bom.components = .components
+            else . end |
 
+            # Inject license+externalRefs into both arrays
+            .components |= map(
+              .licenses = [{ "license": { "id": $lic }}] |
+              .externalReferences = ((.externalReferences // []) + [
+                { "type":"license", "url":("https://spdx.org/licenses/" + $lic + ".html") }
+              ])
+            ) |
+            .bom.components = (.components) |
+
+            # Add metadata required by SBOMQS
+            .metadata = (.metadata // {}) |
+            .metadata.dataLicense = "CC-BY-4.0" |
+            .metadata.licenses = [{ "license": { "id": $lic }}] |
+            .metadata.component = (.metadata.component // {}) |
+            .metadata.component.licenses = [{ "license": { "id": $lic }}] |
+            .metadata.component.externalReferences = [
+              { "type":"license", "url":("https://spdx.org/licenses/" + $lic + ".html") }
+            ]
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
       ###########################################################
@@ -204,25 +172,22 @@ jobs:
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
-            ghcr.io/interlynk-io/sbomqs:latest \
-            compliance --ntia /sbom/trivy-fs.json \
-            > project-src/compliance_NTIA.json || true
+          ghcr.io/interlynk-io/sbomqs:latest \
+          compliance --ntia /sbom/trivy-fs.json > project-src/compliance_NTIA.json || true
 
       - name: BSI v2 Compliance
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
-            ghcr.io/interlynk-io/sbomqs:latest \
-            compliance --bsi-v2 /sbom/trivy-fs.json \
-            > project-src/compliance_BSI.json || true
+          ghcr.io/interlynk-io/sbomqs:latest \
+          compliance --bsi-v2 /sbom/trivy-fs.json > project-src/compliance_BSI.json || true
 
       - name: Score SBOM
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
-            ghcr.io/interlynk-io/sbomqs:latest \
-            score /sbom/trivy-fs.json --json \
-            > project-src/score.json || true
+          ghcr.io/interlynk-io/sbomqs:latest \
+          score /sbom/trivy-fs.json --json > project-src/score.json || true
 
       - name: Sanitize artifact name
         id: sanitize
@@ -260,34 +225,31 @@ jobs:
           python3 <<'PY'
           import json, glob, pandas as pd, os
 
-          def load_json_safe(p):
+          def load(p):
               try:
                   with open(p) as f:
-                      data=f.read().strip()
-                      return json.loads(data) if data else None
+                      return json.loads(f.read().strip())
               except:
                   return None
 
-          rows = []
-
-          for path in glob.glob("results/**/score.json", recursive=True):
-              repo=os.path.basename(os.path.dirname(path))
-              data=load_json_safe(path)
+          rows=[]
+          for p in glob.glob("results/**/score.json",recursive=True):
+              repo=os.path.basename(os.path.dirname(p))
+              data=load(p)
               if data:
                   data["repository"]=repo
                   rows.append(data)
 
-          for std in ["NTIA","BSI"]:
-              for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
-                  repo=os.path.basename(os.path.dirname(path))
-                  data=load_json_safe(path)
+          for s in ["NTIA","BSI"]:
+              for p in glob.glob(f"results/**/compliance_{s}.json",recursive=True):
+                  repo=os.path.basename(os.path.dirname(p))
+                  data=load(p)
                   if data:
                       data["repository"]=repo
-                      data["standard"]=std
+                      data["standard"]=s
                       rows.append(data)
 
-          df=pd.json_normalize(rows)
-          df.to_csv("sbomqs_summary.csv", index=False)
+          pd.json_normalize(rows).to_csv("sbomqs_summary.csv",index=False)
           PY
 
       - name: Upload aggregated summary
