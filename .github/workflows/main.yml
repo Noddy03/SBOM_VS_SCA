@@ -1,4 +1,4 @@
-name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (NTIA + BSI V2)
+name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (NTIA + BSI V2 – Upgraded)
 
 on:
   workflow_dispatch:
@@ -14,6 +14,7 @@ permissions:
   actions: read
 
 jobs:
+
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -24,7 +25,6 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq
-
       - name: Fetch repositories
         id: fetch
         env:
@@ -33,12 +33,11 @@ jobs:
         run: |
           set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
-          echo "Query: $RAW_Q"
           REPOS=$(gh api -X GET /search/repositories \
              --raw-field q="$RAW_Q" \
              --raw-field sort=stars \
              --raw-field order=desc \
-             --raw-field per_page=100 \
+             --raw-field per_page=50 \
              --jq '.items[].full_name')
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
@@ -54,15 +53,13 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-      - name: Install Conan + CycloneDX + jq + Trivy (stable/bulletproof)
+
+      - name: Install Conan + CycloneDX + jq + Trivy
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq wget curl python3-pip rpm
-
           pip install --upgrade pip
           pip install conan cyclonedx-bom
-
-          echo "Installing Trivy via Aqua Security APT repo (never fails)..."
           sudo apt-get install -y gnupg lsb-release
           curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
@@ -77,10 +74,16 @@ jobs:
           TOKEN: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
         run: |
           if git clone --depth=1 "https://$TOKEN@github.com/$REPO" project-src; then
-              echo "skip_repo=false" >> $GITHUB_ENV
+            echo "skip_repo=false" >> $GITHUB_ENV
           else
-              echo "skip_repo=true" >> $GITHUB_ENV
+            echo "skip_repo=true" >> $GITHUB_ENV
           fi
+
+      - name: Save repo metadata
+        if: env.skip_repo != 'true'
+        run: |
+          echo "${{ matrix.repo }}" > project-src/repo_name.txt
+          date -Iseconds > project-src/scan_timestamp.txt
 
       - name: Fetch GitHub license metadata
         if: env.skip_repo != 'true'
@@ -89,14 +92,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/license" \
-             > project-src/gh-license.json 2>/dev/null \
-             || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
+            > project-src/gh-license.json 2>/dev/null \
+            || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
 
       - name: Local license fallback
         if: env.skip_repo != 'true'
         run: |
           FILE=$(find project-src -maxdepth=4 -type f \
-            -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
+            -iregex ".*\(LICENSE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
           if [ -n "$FILE" ]; then
             cp "$FILE" project-src/local-license.txt
           else
@@ -118,83 +121,25 @@ jobs:
             -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      ###########################################################################
-      #  SAFE NORMALISATION — UNBREAKABLE FIX (100% prevents jq failures)
-      ###########################################################################
-      - name: Normalize SBOM components (unbreakable safe mode)
+      - name: Normalize SBOM components
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
           jq '
-            .components |= (if type=="array" then . else [] end) |
-            .components |= map(
-              if (type != "object") then
-                {
-                  "name": "unknown",
-                  "version": "0.0.0",
-                  "supplier": { "name": "unknown" },
-                  "licenses": [{ "license": { "id": "NOASSERTION" }}],
-                  "hashes": [{ "alg": "SHA-256", "content": "0" }],
-                  "purl": "pkg:generic/unknown@0.0.0",
-                  "externalReferences": []
-                }
-              else
-                (
-                  .name = (.name // "unknown") |
-                  .version = (.version // "0.0.0") |
-                  .supplier = (.supplier // { "name": "unknown" }) |
-                  .licenses = (
-                    if (.licenses | type != "array") then
-                      [{ "license": { "id": "NOASSERTION" }}]
-                    else
-                      (.licenses | map(
-                        if (type=="object" and (.license.id // "") != "") then
-                          .
-                        else
-                          { "license": { "id": "NOASSERTION" }}
-                        end
-                      ))
-                    end
-                  ) |
-                  .hashes = (
-                    if (.hashes | type != "array" or (.hashes|length)==0) then
-                      [{ "alg": "SHA-256", "content": "0" }]
-                    else
-                      .hashes
-                    end
-                  ) |
-                  .purl = (.purl // ("pkg:generic/" + (.name|tostring) + "@" + (.version|tostring))) |
-                  .externalReferences = (
-                    if (.externalReferences | type != "array") then
-                      []
-                    else
-                      .externalReferences
-                    end
-                  )
-                )
-              end
-            )
+            .components |= (if type=="array" then . else [] end)
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      ###########################################################################
-      #  LICENSE INJECTION (GitHub + Local SPDX + fallback)
-      ###########################################################################
       - name: Assign repository license to all components
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
           GH_LICENSE=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
           FILE_LICENSE=$(grep -Eo "SPDX-License-Identifier:[ ]*[A-Za-z0-9.\-+]+" \
-                         project-src/local-license.txt 2>/dev/null | head -1 | awk -F': ' '{print $2}')
-          FINAL_LICENSE="${GH_LICENSE:-$FILE_LICENSE}"
-          [ -z "$FINAL_LICENSE" ] && FINAL_LICENSE="NOASSERTION"
-
-          jq --arg lic "$FINAL_LICENSE" '
-            .components |= map(
-              if type == "object" then
-                .licenses = [{ "license": { "id": $lic }}]
-              else . end
-            )
+            project-src/local-license.txt 2>/dev/null | head -1 | awk -F': ' '{print $2}')
+          FINAL="${GH_LICENSE:-$FILE_LICENSE}"
+          [ -z "$FINAL" ] && FINAL="NOASSERTION"
+          jq --arg lic "$FINAL" '
+            .components |= map( .licenses=[{"license":{"id":$lic}}] )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
       - name: NTIA Compliance
@@ -229,17 +174,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
-          path: project-src/*.json
+          path: project-src/*
           if-no-files-found: warn
 
   aggregate_results:
-    name: Aggregate SBOMQS Results
     needs: sbom_scan
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: results/
 
@@ -252,41 +195,56 @@ jobs:
       - name: Aggregate SBOMQS results to CSV
         run: |
           python3 <<'PY'
-          import json, glob, pandas as pd, os
-          def load_json_safe(p):
-              try:
-                  with open(p) as f:
-                      content = f.read().strip()
-                      return json.loads(content) if content else None
-              except:
-                  return None
-          rows = []
-          for path in glob.glob("results/**/score.json", recursive=True):
-              repo = os.path.basename(os.path.dirname(path))
-              data = load_json_safe(path)
-              if data:
-                  data["repository"] = repo
-                  rows.append(data)
-          for std in ["NTIA", "BSI"]:
-              for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
-                  repo = os.path.basename(os.path.dirname(path))
-                  data = load_json_safe(path)
-                  if data:
-                      data["repository"] = repo
-                      data["standard"] = std
-                      rows.append(data)
-          if not rows:
-              print("⚠️ No SBOMQS data found — writing empty CSV.")
-              pd.DataFrame([]).to_csv("sbomqs_summary.csv", index=False)
-          else:
-              df = pd.json_normalize(rows)
-              df.to_csv("sbomqs_summary.csv", index=False)
-              print(f"📊 Wrote sbomqs_summary.csv with {len(rows)} rows")
-          PY
+import json, glob, pandas as pd, os
 
-      - name: Upload aggregated summary
-        uses: actions/upload-artifact@v4
+def load(p):
+    try:
+        with open(p) as f:
+            t=f.read().strip()
+            return json.loads(t) if t else None
+    except:
+        return None
+
+rows=[]
+
+for folder in glob.glob("results/*/"):
+    repo = open(os.path.join(folder,"repo_name.txt")).read().strip() \
+           if os.path.exists(os.path.join(folder,"repo_name.txt")) else folder
+
+    timestamp = open(os.path.join(folder,"scan_timestamp.txt")).read().strip() \
+           if os.path.exists(os.path.join(folder,"scan_timestamp.txt")) else ""
+
+    trivy_sbom = load(os.path.join(folder,"trivy-fs.json"))
+    conan_sbom = load(os.path.join(folder,"conan-sbom.json"))
+    score = load(os.path.join(folder,"score.json"))
+    ntia = load(os.path.join(folder,"compliance_NTIA.json"))
+    bsi = load(os.path.join(folder,"compliance_BSI.json"))
+
+    base = {
+        "repository": repo,
+        "scan_timestamp": timestamp,
+        "num_trivy_components": len(trivy_sbom.get("components",[])) if trivy_sbom else 0,
+        "num_conan_components": len(conan_sbom.get("components",[])) if conan_sbom else 0,
+        "scan_failed": score is None,
+    }
+
+    if score:
+        score["type"]="score"
+        rows.append({**base, **score})
+
+    if ntia:
+        ntia["type"]="ntia"
+        rows.append({**base, **ntia})
+
+    if bsi:
+        bsi["type"]="bsi"
+        rows.append({**base, **bsi})
+
+df=pd.json_normalize(rows)
+df.to_csv("sbomqs_summary.csv",index=False)
+PY
+
+      - uses: actions/upload-artifact@v4
         with:
           name: sbomqs-summary
           path: sbomqs_summary.csv
-          if-no-files-found: ignore
