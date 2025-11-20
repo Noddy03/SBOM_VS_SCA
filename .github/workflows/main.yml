@@ -195,54 +195,54 @@ jobs:
       - name: Aggregate SBOMQS results to CSV
         run: |
           python3 <<'PY'
-import json, glob, pandas as pd, os
+          import json, glob, pandas as pd, os
 
-def load(p):
-    try:
-        with open(p) as f:
-            t=f.read().strip()
-            return json.loads(t) if t else None
-    except:
-        return None
+          def load(p):
+              try:
+                  with open(p) as f:
+                      t = f.read().strip()
+                      return json.loads(t) if t else None
+              except:
+                  return None
 
-rows=[]
+          rows = []
 
-for folder in glob.glob("results/*/"):
-    repo = open(os.path.join(folder,"repo_name.txt")).read().strip() \
-           if os.path.exists(os.path.join(folder,"repo_name.txt")) else folder
+          for folder in glob.glob("results/*/"):
+              repo = open(os.path.join(folder, "repo_name.txt")).read().strip() \
+                     if os.path.exists(os.path.join(folder, "repo_name.txt")) else folder
 
-    timestamp = open(os.path.join(folder,"scan_timestamp.txt")).read().strip() \
-           if os.path.exists(os.path.join(folder,"scan_timestamp.txt")) else ""
+              timestamp = open(os.path.join(folder, "scan_timestamp.txt")).read().strip() \
+                     if os.path.exists(os.path.join(folder, "scan_timestamp.txt")) else ""
 
-    trivy_sbom = load(os.path.join(folder,"trivy-fs.json"))
-    conan_sbom = load(os.path.join(folder,"conan-sbom.json"))
-    score = load(os.path.join(folder,"score.json"))
-    ntia = load(os.path.join(folder,"compliance_NTIA.json"))
-    bsi = load(os.path.join(folder,"compliance_BSI.json"))
+              trivy_sbom = load(os.path.join(folder, "trivy-fs.json"))
+              conan_sbom = load(os.path.join(folder, "conan-sbom.json"))
+              score = load(os.path.join(folder, "score.json"))
+              ntia = load(os.path.join(folder, "compliance_NTIA.json"))
+              bsi = load(os.path.join(folder, "compliance_BSI.json"))
 
-    base = {
-        "repository": repo,
-        "scan_timestamp": timestamp,
-        "num_trivy_components": len(trivy_sbom.get("components",[])) if trivy_sbom else 0,
-        "num_conan_components": len(conan_sbom.get("components",[])) if conan_sbom else 0,
-        "scan_failed": score is None,
-    }
+              base = {
+                  "repository": repo,
+                  "scan_timestamp": timestamp,
+                  "num_trivy_components": len(trivy_sbom.get("components", [])) if trivy_sbom else 0,
+                  "num_conan_components": len(conan_sbom.get("components", [])) if conan_sbom else 0,
+                  "scan_failed": score is None,
+              }
 
-    if score:
-        score["type"]="score"
-        rows.append({**base, **score})
+              if score:
+                  score["type"] = "score"
+                  rows.append({**base, **score})
 
-    if ntia:
-        ntia["type"]="ntia"
-        rows.append({**base, **ntia})
+              if ntia:
+                  ntia["type"] = "ntia"
+                  rows.append({**base, **ntia})
 
-    if bsi:
-        bsi["type"]="bsi"
-        rows.append({**base, **bsi})
+              if bsi:
+                  bsi["type"] = "bsi"
+                  rows.append({**base, **bsi})
 
-df=pd.json_normalize(rows)
-df.to_csv("sbomqs_summary.csv",index=False)
-PY
+          df = pd.json_normalize(rows)
+          df.to_csv("sbomqs_summary.csv", index=False)
+          PY
 
       - uses: actions/upload-artifact@v4
         with:
