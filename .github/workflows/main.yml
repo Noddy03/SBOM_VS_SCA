@@ -106,9 +106,9 @@ jobs:
             -o project-src/trivy-fs.json project-src || echo '{"components":[]}' > project-src/trivy-fs.json
 
       ###########################################################################
-      # BRUTE FORCE LICENSE INJECTION — MAX COMPATIBILITY WITH SBOMQS
+      # BRUTE FORCE LICENSE INJECTION INCLUDING TYPE FIX
       ###########################################################################
-      - name: Inject final license (BRUTE FORCE — WORKS WITH ALL SBOM SHAPES)
+      - name: Inject final license (BRUTE FORCE + TYPE FIX)
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
@@ -123,12 +123,12 @@ jobs:
           jq --arg lic "$LIC" '
             def arr: if type=="array" then . elif type=="object" then [.] else [] end;
 
-            # Normalize arrays
+            # Normalize
             .components = (.components // [] | arr) |
             .bom = (.bom // {}) |
             .bom.components = (.bom.components // .components // [] | arr) |
 
-            # Sync arrays
+            # Sync
             .components =
               if (.components|length)==0 and (.bom.components|length)>0 then .bom.components
               else .components end |
@@ -136,12 +136,13 @@ jobs:
               if (.bom.components|length)==0 and (.components|length)>0 then .components
               else .bom.components end |
 
-            # Synthetic component if empty
+            # Synthetic
             if (.components|length)==0 then
               .components = [
                 {
                   "name":"repository",
                   "version":"0.0.0",
+                  "type":"library",
                   "licenses":[{"license":{"id":$lic}}],
                   "externalReferences":[{"type":"license","url":("https://spdx.org/licenses/" + $lic + ".html")}]
                 }
@@ -149,7 +150,7 @@ jobs:
               .bom.components = .components
             else . end |
 
-            # BRUTE FORCE injection
+            # BRUTE FORCE INJECTION + TYPE FIX HERE
             (.components |= map(
                 del(.license) |
                 del(.licenses) |
@@ -157,20 +158,27 @@ jobs:
                 del(.licences) |
                 del(.licenseId) |
                 del(.declaredLicense) |
+
+                # TYPE FIX — THIS IS THE CRITICAL LINE
+                .type = (
+                  if .type == "file" or .type == null then "library"
+                  else .type end
+                ) |
+
                 .name = (.name // "unknown") |
                 .version = (.version // "0.0.0") |
+
                 .licenses = [{ "license": { "id": $lic }}] |
+
                 .externalReferences = ((.externalReferences // []) + [
                   {"type":"license","url":("https://spdx.org/licenses/" + $lic + ".html")}
                 ])
             )) |
+
             .bom.components = .components |
 
-            # SBOM metadata
+            # Metadata for SBOMQS
             .metadata = (.metadata // {}) |
-            del(.metadata.license) |
-            del(.metadata.licensesId) |
-            del(.metadata.licence) |
             .metadata.dataLicense = "CC-BY-4.0" |
             .metadata.licenses = [{ "license": { "id": $lic }}] |
             .metadata.component = (.metadata.component // {}) |
