@@ -24,7 +24,6 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq
-
       - name: Fetch repositories
         id: fetch
         env:
@@ -34,18 +33,14 @@ jobs:
           set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
           echo "Query: $RAW_Q"
-
           REPOS=$(gh api -X GET /search/repositories \
              --raw-field q="$RAW_Q" \
              --raw-field sort=stars \
              --raw-field order=desc \
              --raw-field per_page=50 \
              --jq '.items[].full_name')
-
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
-
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
 
   sbom_scan:
     needs: fetch_top_repos
@@ -64,7 +59,6 @@ jobs:
           sudo apt-get install -y jq wget curl python3-pip
           pip install --upgrade pip
           pip install conan
-
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
@@ -94,7 +88,6 @@ jobs:
         run: |
           FILE=$(find project-src -maxdepth=4 -type f \
             -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
-
           if [ -n "$FILE" ]; then
             cp "$FILE" project-src/local-license.txt
           else
@@ -123,14 +116,10 @@ jobs:
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
-
           jq '
-            # Ensure components is always an array
             .components |= (if type=="array" then . else [] end) |
-
             .components |= map(
               if (type != "object") then
-                # Replace non-object components with a valid minimal structure
                 {
                   "name": "unknown",
                   "version": "0.0.0",
@@ -142,16 +131,9 @@ jobs:
                 }
               else
                 (
-                  # COMPONENT NAME
                   .name = (.name // "unknown") |
-
-                  # VERSION
                   .version = (.version // "0.0.0") |
-
-                  # SUPPLIER
                   .supplier = (.supplier // { "name": "unknown" }) |
-
-                  # LICENSES — ALWAYS SAFE
                   .licenses = (
                     if (.licenses | type != "array") then
                       [{ "license": { "id": "NOASSERTION" }}]
@@ -165,8 +147,6 @@ jobs:
                       ))
                     end
                   ) |
-
-                  # HASHES
                   .hashes = (
                     if (.hashes | type != "array" or (.hashes|length)==0) then
                       [{ "alg": "SHA-256", "content": "0" }]
@@ -174,11 +154,7 @@ jobs:
                       .hashes
                     end
                   ) |
-
-                  # PURL
                   .purl = (.purl // ("pkg:generic/" + (.name|tostring) + "@" + (.version|tostring))) |
-
-                  # EXTERNAL REFERENCES
                   .externalReferences = (
                     if (.externalReferences | type != "array") then
                       []
@@ -187,6 +163,33 @@ jobs:
                     end
                   )
                 )
+              end
+            )
+          ' "$SBOM" > tmp && mv tmp "$SBOM"
+
+      ###########################################################################
+      #  LICENSE INJECTION (MINIMAL, SAFE, GITHUB + LOCAL + FALLBACK)
+      ###########################################################################
+      - name: Assign repository license to all components (GitHub + Local + fallback)
+        if: env.skip_repo != 'true'
+        run: |
+          SBOM="project-src/trivy-fs.json"
+
+          GH_LICENSE=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
+          FILE_LICENSE=$(grep -Eo "SPDX-License-Identifier:[ ]*[A-Za-z0-9.\-+]+" \
+                         project-src/local-license.txt 2>/dev/null | head -1 | awk -F': ' '{print $2}')
+
+          FINAL_LICENSE="${GH_LICENSE:-$FILE_LICENSE}"
+          [ -z "$FINAL_LICENSE" ] && FINAL_LICENSE="NOASSERTION"
+
+          echo "Final detected license: $FINAL_LICENSE"
+
+          jq --arg lic "$FINAL_LICENSE" '
+            .components |= map(
+              if type == "object" then
+                .licenses = [{ "license": { "id": $lic }}]
+              else
+                .
               end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
@@ -250,7 +253,6 @@ jobs:
         run: |
           python3 <<'PY'
           import json, glob, pandas as pd, os
-
           def load_json_safe(p):
               try:
                   with open(p) as f:
@@ -258,16 +260,13 @@ jobs:
                       return json.loads(content) if content else None
               except:
                   return None
-
           rows = []
-
           for path in glob.glob("results/**/score.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
               data = load_json_safe(path)
               if data:
                   data["repository"] = repo
                   rows.append(data)
-
           for std in ["NTIA", "BSI"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
                   repo = os.path.basename(os.path.dirname(path))
@@ -276,7 +275,6 @@ jobs:
                       data["repository"] = repo
                       data["standard"] = std
                       rows.append(data)
-
           if not rows:
               print("⚠️ No SBOMQS data found — writing empty CSV.")
               pd.DataFrame([]).to_csv("sbomqs_summary.csv", index=False)
