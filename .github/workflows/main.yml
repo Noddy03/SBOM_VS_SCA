@@ -126,6 +126,27 @@ jobs:
             .components = (if (.components | type) == "array" then .components else [] end)
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
+      - name: Ensure component has version + name (BSI helper)
+        if: env.skip_repo != 'true'
+        run: |
+          SBOM="project-src/trivy-fs.json"
+          jq '
+            .metadata.component.name = (.metadata.component.name // "root") |
+            .metadata.component.version = (.metadata.component.version // "0.0.0")
+          ' "$SBOM" > tmp && mv tmp "$SBOM"
+
+      - name: Add synthetic PURLs for BSI compliance (BSI helper)
+        if: env.skip_repo != 'true'
+        run: |
+          SBOM="project-src/trivy-fs.json"
+          jq '
+            .metadata.component.purl = (.metadata.component.purl // ("pkg:generic/" + (.metadata.component.name // "root") + "@" + (.metadata.component.version // "0.0.0"))) |
+            .components |= map(
+              .purl = (.purl // ("pkg:generic/" + ((.name // "unknown") | gsub(" "; "-")) + "@" + ((.version // "0.0.0") | tostring))) |
+              .
+            )
+          ' "$SBOM" > tmp && mv tmp "$SBOM"
+
       - name: Add missing SBOM metadata
         if: env.skip_repo != 'true'
         env:
@@ -143,7 +164,7 @@ jobs:
                 { "type": "vcs", "url": $vcs },
                 { "type": "distribution", "url": $dist }
               ]) |
-              .hashes = [{ "alg": "SHA-256", "content": $hash }]
+              .hashes = (.hashes // []) + [{ "alg": "SHA-256", "content": $hash }]
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
@@ -292,11 +313,11 @@ jobs:
           for path in glob.glob("results/**/*.json", recursive=True):
               name = os.path.basename(path).lower()
 
-              if name == "score.json":
+              if "score" in name:
                   category = "score"
-              elif name == "compliance_ntia.json":
+              elif "ntia" in name:
                   category = "compliance_NTIA"
-              elif name == "compliance_bsi.json":
+              elif "bsi" in name:
                   category = "compliance_BSI"
               else:
                   continue
@@ -317,7 +338,6 @@ jobs:
           EOF
 
           python3 agg.py
-
 
 
       - name: Upload aggregated summary
