@@ -38,7 +38,6 @@ jobs:
             --raw-field sort=stars \
             --raw-field order=desc \
             --jq '.items[].full_name')
-
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
@@ -56,14 +55,20 @@ jobs:
     steps:
 
       ##########################################################################
-      # Install Required Tools
+      # Install Tools (FIXED)
       ##########################################################################
       - name: Install Conan + Trivy + CycloneDX CLI
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq wget curl python3-pip
+
           pip install --upgrade pip
           pip install conan cyclonedx-bom
+
+          # ⭐ FIX — ensure cyclonedx-bom is in PATH
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.local/bin:$PATH"
+
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
@@ -79,9 +84,9 @@ jobs:
 
 
       ##########################################################################
-      # LICENSE DISCOVERY
+      # LICENSE DETECTION
       ##########################################################################
-      - name: Fetch GitHub license metadata
+      - name: GitHub license detection
         if: env.skip_repo != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -90,10 +95,10 @@ jobs:
           L=$(gh api "/repos/$REPO" --jq '.license.spdx_id' 2>/dev/null || echo "")
           echo "${L:-NOASSERTION}" > project-src/gh-license.txt
 
-      - name: Local license fallback
+      - name: Local license detection
         if: env.skip_repo != 'true'
         run: |
-          FILE=$(find project-src -maxdepth=4 -type f -iregex ".*license.*" | head -1)
+          FILE=$(find project-src -maxdepth=4 -type f -iname "*license*" | head -1)
           if [ -n "$FILE" ]; then
             SPDX=$(grep -Eio "SPDX-License-Identifier: *[A-Za-z0-9\.\-+]+" "$FILE" | head -1 | awk -F': ' '{print $2}')
             echo "${SPDX:-NOASSERTION}" > project-src/local-license.txt
@@ -103,7 +108,7 @@ jobs:
 
 
       ##########################################################################
-      # ⭐ STEP 1 — Conan SBOM (primary)
+      # STEP 1 — Conan SBOM
       ##########################################################################
       - name: Conan SBOM (CycloneDX)
         if: env.skip_repo != 'true'
@@ -115,9 +120,9 @@ jobs:
 
 
       ##########################################################################
-      # ⭐ STEP 1b — CycloneDX fallback if Conan is empty
+      # STEP 1b — CycloneDX fallback
       ##########################################################################
-      - name: CycloneDX fallback when Conan SBOM is empty
+      - name: CycloneDX fallback if Conan SBOM empty
         if: env.skip_repo != 'true'
         run: |
           cd project-src
@@ -127,13 +132,12 @@ jobs:
             cyclonedx-bom -o cdx-fallback.json -f json -s .
             cp cdx-fallback.json cdx-sbom.json
           else
-            echo "Using Conan SBOM"
             cp conan-sbom.json cdx-sbom.json
           fi
 
 
       ##########################################################################
-      # ⭐ STEP 2 — Trivy scans the SBOM (NOT filesystem)
+      # STEP 2 — Trivy scan
       ##########################################################################
       - name: Trivy scan of SBOM
         if: env.skip_repo != 'true'
@@ -146,9 +150,9 @@ jobs:
 
 
       ##########################################################################
-      # ⭐ STEP 3 — Inject SPDX license
+      # STEP 3 — License injection
       ##########################################################################
-      - name: Inject SPDX license into Trivy SBOM
+      - name: Inject SPDX license into SBOM
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-scan.json"
@@ -159,27 +163,27 @@ jobs:
           elif [ "$LC" != "NOASSERTION" ]; then LIC="$LC"
           else LIC="MIT"; fi
 
-          echo "License injected: $LIC"
+          echo "Final license used: $LIC"
 
           jq --arg lic "$LIC" '
             if (.components | type=="array") then
-              .components |= map(.licenses=[{"license": {"id": $lic}}])
+              .components |= map(.licenses=[{"license":{"id":$lic}}])
             else . end
             |
             if (.bom.components | type=="array") then
-              .bom.components |= map(.licenses=[{"license": {"id": $lic}}])
+              .bom.components |= map(.licenses=[{"license":{"id":$lic}}])
             else . end
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
 
       ##########################################################################
-      # ⭐ STEP 4 — SBOMQS COMPLIANCE + SCORING
+      # STEP 4 — SBOMQS Scoring
       ##########################################################################
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
-            ghcr.io/interlynk-io/sbomqs:latest \
+            ghcr.io/interlynk-io/sbomqs \
             compliance --ntia /sbom/trivy-scan.json \
             > project-src/compliance_NTIA.json || true
 
@@ -187,7 +191,7 @@ jobs:
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
-            ghcr.io/interlynk-io/sbomqs:latest \
+            ghcr.io/interlynk-io/sbomqs \
             compliance --bsi-v2 /sbom/trivy-scan.json \
             > project-src/compliance_BSI.json || true
 
@@ -195,13 +199,13 @@ jobs:
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
-            ghcr.io/interlynk-io/sbomqs:latest \
+            ghcr.io/interlynk-io/sbomqs \
             score /sbom/trivy-scan.json --json \
             > project-src/score.json || true
 
 
       ##########################################################################
-      # UPLOAD ARTIFACTS
+      # Upload artifacts
       ##########################################################################
       - name: Sanitize artifact name
         id: sanitize
@@ -210,13 +214,16 @@ jobs:
           NAME="${NAME//\//_}"
           echo "name=$NAME" >> $GITHUB_OUTPUT
 
-      - name: Upload SBOM reports
+      - name: Upload Reports
         uses: actions/upload-artifact@v4
         with:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
           path: project-src/*.json
 
 
+  ##########################################################################
+  # AGGREGATION
+  ##########################################################################
   aggregate_results:
     needs: sbom_scan
     runs-on: ubuntu-latest
@@ -233,15 +240,14 @@ jobs:
           sudo apt-get install -y python3-pip
           pip install pandas
 
-      - name: Aggregate SBOMQS results to CSV
+      - name: Aggregate SBOMQS results
         run: |
           python3 <<'PY'
-          import json, glob, pandas as pd, os
+          import json, glob, os, pandas as pd
 
           def load(p):
               try:
-                  with open(p) as f:
-                      return json.loads(f.read())
+                  with open(p) as f: return json.loads(f.read())
               except:
                   return None
 
@@ -256,7 +262,7 @@ jobs:
           pd.json_normalize(rows).to_csv("sbomqs_summary.csv", index=False)
           PY
 
-      - name: Upload aggregated summary
+      - name: Upload summary
         uses: actions/upload-artifact@v4
         with:
           name: sbomqs-summary
