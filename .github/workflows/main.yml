@@ -126,7 +126,6 @@ jobs:
           DIST="https://github.com/$REPO/releases"
           echo "Computing repo-level deterministic SHA-256..."
           REPO_HASH=$(find project-src -type f -exec sha256sum {} + | sha256sum | cut -d' ' -f1)
-
           jq --arg supplier "$OWNER" \
              --arg vcs "$VCS" \
              --arg dist "$DIST" \
@@ -145,19 +144,17 @@ jobs:
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
       ###########################################################################
-      #  🔥 **BSI-V2 FULL COMPLIANCE PATCH** — MOST BULLETPROOF FIX
+      #  🔥 **BSI-V2 FULL COMPLIANCE PATCH**
       ###########################################################################
       - name: Enrich SBOM for full BSI-V2 compliance
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
           NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
           jq --arg ts "$NOW" '
             .metadata.timestamp = $ts |
             .metadata.component.name //= "unknown" |
             .metadata.component.version //= "0.0.0" |
-
             .components |= map(
               .supplier //= { "name": "unknown" } |
               .name //= "unknown" |
@@ -170,6 +167,30 @@ jobs:
                 { "type": "website", "url": "https://github.com/" },
                 { "type": "vcs", "url": "https://github.com/" }
               ]
+            )
+          ' "$SBOM" > tmp && mv tmp "$SBOM"
+
+      ###########################################################################
+      #  ⭐ NEW — BULLETPROOF LICENSE FIX FOR BSI-V2
+      ###########################################################################
+      - name: Enforce valid SPDX license for all components
+        if: env.skip_repo != 'true'
+        run: |
+          SBOM="project-src/trivy-fs.json"
+          jq '
+            .components |= map(
+              if (.licenses | type != "array" or (.licenses | length == 0)) then
+                .licenses = [{ "license": { "id": "NOASSERTION" }}]
+              else
+                .licenses = (
+                  .licenses | map(
+                    if (.license.id == null or .license.id == "" or .license.id == "UNKNOWN")
+                    then { "license": { "id": "NOASSERTION" }}
+                    else .
+                    end
+                  )
+                )
+              end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
@@ -231,6 +252,7 @@ jobs:
         run: |
           python3 <<'PY'
           import json, glob, pandas as pd, os
+
           def load_json_safe(p):
               try:
                   with open(p) as f:
