@@ -37,7 +37,7 @@ jobs:
              --raw-field q="$RAW_Q" \
              --raw-field sort=stars \
              --raw-field order=desc \
-             --raw-field per_page=50 \
+             --raw-field per_page=100 \
              --jq '.items[].full_name')
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
