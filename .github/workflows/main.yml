@@ -72,9 +72,10 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y trivy
 
-      # ----------------------
-      #   FIXED SYFT INSTALL
-      # ----------------------
+
+      # -------------------------
+      #       SYFT FIX
+      # -------------------------
       - name: Install Syft safely
         run: |
           mkdir -p $HOME/bin
@@ -86,19 +87,20 @@ jobs:
         run: |
           syft version
 
+
+      # -------------------------
+      #   FIXED CHECKOUT (NO SKIP)
+      # -------------------------
       - name: Checkout repository
-        env:
-          REPO: ${{ matrix.repo }}
-          TOKEN: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
-        run: |
-          if git clone --depth=1 "https://$TOKEN@github.com/$REPO" project-src; then
-              echo "skip_repo=false" >> $GITHUB_ENV
-          else
-              echo "skip_repo=true" >> $GITHUB_ENV
-          fi
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
+          path: project-src
+          fetch-depth: 1
+
 
       - name: GitHub license metadata
-        if: env.skip_repo != 'true'
         env:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ github.token }}
@@ -107,8 +109,8 @@ jobs:
               > project-src/gh-license.json 2>/dev/null \
               || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
 
+
       - name: Local SPDX fallback
-        if: env.skip_repo != 'true'
         run: |
           FILE=$(find project-src -maxdepth=5 -type f \
              -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
@@ -116,29 +118,29 @@ jobs:
           else echo "" > project-src/local-license.txt
           fi
 
+
       - name: Conan SBOM
-        if: env.skip_repo != 'true'
         run: |
           cd project-src
           conan profile detect --force || true
           conan graph info . --format=json > conan-sbom.json \
               || echo '{"components":[]}' > conan-sbom.json
 
+
       - name: Trivy SBOM
-        if: env.skip_repo != 'true'
         run: |
           trivy fs --scanners vuln,license --format cyclonedx \
               -o project-src/trivy-fs.json project-src \
               || echo '{"components":[]}' > project-src/trivy-fs.json
 
+
       - name: Syft SBOM
-        if: env.skip_repo != 'true'
         run: |
           syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json \
             || echo '{"components":[]}' > project-src/syft-sbom.json
 
+
       - name: Normalize SBOMs
-        if: env.skip_repo != 'true'
         run: |
           for f in project-src/trivy-fs.json project-src/syft-sbom.json; do
             jq '
@@ -147,8 +149,8 @@ jobs:
             ' "$f" > tmp && mv tmp "$f"
           done
 
+
       - name: Merge Trivy + Syft into merged-sbom.json
-        if: env.skip_repo != 'true'
         run: |
           python3 <<'PY'
           import json, os
@@ -194,8 +196,8 @@ jobs:
           json.dump({"components":merged}, open("project-src/merged-sbom.json","w"), indent=2)
           PY
 
+
       - name: Final license selection
-        if: env.skip_repo != 'true'
         run: |
           GH_LIC=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
           FILE_LIC=$(grep -Eo "SPDX-License-Identifier:\s*[A-Za-z0-9.\-+]+" \
@@ -204,8 +206,8 @@ jobs:
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
 
+
       - name: Inject license into merged SBOM
-        if: env.skip_repo != 'true'
         run: |
           L=$(cat project-src/final_license.txt)
           jq --arg lic "$L" '
@@ -214,50 +216,33 @@ jobs:
             )
           ' project-src/merged-sbom.json > tmp && mv tmp project-src/merged-sbom.json
 
+
       - name: NTIA compliance
-        if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
              ghcr.io/interlynk-io/sbomqs compliance --ntia /sbom/merged-sbom.json \
              > project-src/compliance_NTIA.json || true
 
       - name: BSI v2 compliance
-        if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
              ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 /sbom/merged-sbom.json \
              > project-src/compliance_BSI.json || true
 
       - name: Score merged SBOM
-        if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
              ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json \
              > project-src/score.json || true
 
-      - name: Sanitize artifact name
-        id: sanitize
-        run: |
-          SAFE="${{ matrix.repo }}"
-          SAFE="${SAFE//\//_}"
-          echo "name=$SAFE" >> $GITHUB_OUTPUT
 
       - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-reports-${{ steps.sanitize.outputs.name }}
-          path: |
-            project-src/merged-sbom.json
-            project-src/trivy-fs.json
-            project-src/syft-sbom.json
-            project-src/conan-sbom.json
-            project-src/score.json
-            project-src/compliance_NTIA.json
-            project-src/compliance_BSI.json
-            project-src/gh-license.json
-            project-src/local-license.txt
-            project-src/final_license.txt
+          name: sbom-reports-${{ matrix.repo }}
+          path: project-src/*.json
           if-no-files-found: warn
+
 
 
 
@@ -294,7 +279,7 @@ jobs:
 
           for folder in glob.glob("results/*/"):
               raw = os.path.basename(folder.rstrip("/"))
-              repo = raw.replace("sbom-reports-","")   # FIXED
+              repo = raw.replace("sbom-reports-","")  # fix
 
               merged = load_json(os.path.join(folder,"merged-sbom.json")) or {}
               if not merged.get("components"):
@@ -355,4 +340,3 @@ jobs:
         with:
           name: sbomqs-summary
           path: sbomqs_summary.csv
-          if-no-files-found: ignore
