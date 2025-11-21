@@ -1,4 +1,4 @@
-name: Fetch Top IoT Repositories + Trivy/Conan/Syft SBOM Merge + Trivy Vulnerabilities (NTIA + BSI V2 Bulletproof)
+name: Fetch Top IoT Repositories + Trivy/Conan/Syft SBOM Merge (NTIA + BSI V2 Bulletproof)
 
 on:
   workflow_dispatch:
@@ -55,7 +55,7 @@ jobs:
 
     steps:
 
-      - name: Install Conan + CycloneDX + jq + Trivy + other tools
+      - name: Install Conan + CycloneDX + jq + Trivy
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq wget curl python3-pip rpm gnupg lsb-release
@@ -70,11 +70,13 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y trivy
 
-      - name: Install Syft (Anchore) to /usr/bin (chosen)
+      - name: Install Syft safely (no sudo)
         run: |
-          # install Syft into /usr/bin so the runner can execute it reliably
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/bin
-          /usr/bin/syft version || /usr/bin/syft -v
+          mkdir -p $HOME/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b $HOME/bin
+          echo "$HOME/bin" >> $GITHUB_PATH
+          syft version
 
       - name: Checkout repository
         env:
@@ -85,16 +87,6 @@ jobs:
               echo "skip_repo=false" >> $GITHUB_ENV
           else
               echo "skip_repo=true" >> $GITHUB_ENV
-          fi
-
-      - name: (optional) Copy uploaded reference file into workspace
-        if: env.skip_repo != 'true'
-        run: |
-          mkdir -p project-src/.scan_refs || true
-          # developer-uploaded file (will be converted to URL by external tooling)
-          if [ -f "/mnt/data/TOP 50 IOT REPOSITRIES.txt" ]; then
-            cp "/mnt/data/TOP 50 IOT REPOSITRIES.txt" project-src/.scan_refs/ || true
-            echo "copied_uploaded_refs=/mnt/data/TOP 50 IOT REPOSITRIES.txt" >> $GITHUB_OUTPUT
           fi
 
       - name: Fetch GitHub license metadata
@@ -126,7 +118,7 @@ jobs:
           conan graph info . --format=json > conan-sbom.json \
               || echo '{"components":[]}' > conan-sbom.json
 
-      - name: Trivy SBOM (primary vulnerability & license evidence)
+      - name: Trivy SBOM (primary)
         if: env.skip_repo != 'true'
         run: |
           trivy fs --scanners vuln,license --format cyclonedx \
@@ -136,106 +128,102 @@ jobs:
       - name: Syft SBOM (metadata enrichment)
         if: env.skip_repo != 'true'
         run: |
-          /usr/bin/syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json || \
+          syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json || \
             echo '{"components":[]}' > project-src/syft-sbom.json
 
-      - name: Normalize SBOM component arrays
+      - name: Normalize SBOM inputs
         if: env.skip_repo != 'true'
         run: |
           for f in project-src/trivy-fs.json project-src/syft-sbom.json; do
-            if [ -f "$f" ]; then
-              # ensure components array exists and is an array
-              jq 'if has("components") then . else (. + {components: []}) end | .components |= (if type=="array" then . else [] end)' "$f" > tmp && mv tmp "$f" || true
-            fi
+            jq 'if has("components") then . else (. + {components: []}) end |
+                .components |= (if type=="array" then . else [] end)' "$f" > tmp && mv tmp "$f"
           done
 
-      - name: Merge Syft metadata into Trivy SBOM (Python — Trivy primary, Syft enriches)
+      - name: Merge SBOMs (Python — Trivy primary, Syft enriches)
         if: env.skip_repo != 'true'
         run: |
-          # Python merge: reliable, robust merging (Trivy is authoritative; Syft enriches missing fields)
           python3 <<'PY'
           import json, os
-          TRIVY = "project-src/trivy-fs.json"
-          SYFT  = "project-src/syft-sbom.json"
-          OUT   = "project-src/merged-sbom.json"
+
+          TRIVY="project-src/trivy-fs.json"
+          SYFT="project-src/syft-sbom.json"
+          OUT="project-src/merged-sbom.json"
 
           def load(path):
               if not os.path.exists(path):
                   return {"components": []}
               try:
-                  with open(path) as f:
-                      return json.load(f)
-              except Exception:
+                  return json.load(open(path))
+              except:
                   return {"components": []}
 
           trivy = load(TRIVY)
-          syft  = load(SYFT)
+          syft = load(SYFT)
 
           tcom = trivy.get("components", []) or []
           scom = syft.get("components", []) or []
 
-          # build indices for syft by purl and name:version
           idx_purl = {}
-          idx_nv   = {}
+          idx_nv = {}
+
           for c in scom:
               purl = c.get("purl")
               name = c.get("name")
-              ver  = c.get("version")
+              ver = c.get("version")
               if purl:
                   idx_purl[purl] = c
               if name and ver:
                   idx_nv[f"{name}:{ver}"] = c
 
           def enrich(base, extra):
-              fields = ["supplier", "purl", "hashes", "externalReferences",
-                        "evidence", "copyright", "type", "properties"]
+              fields=["supplier","purl","hashes","externalReferences",
+                      "evidence","copyright","type","properties"]
               for k in fields:
                   if not base.get(k) and extra.get(k):
                       base[k] = extra[k]
               return base
 
           merged = []
-          # enrich Trivy components
+
+          existing_purls=set()
+          existing_nv=set()
+
           for c in tcom:
-              new = dict(c)
-              purl = c.get("purl")
-              name = c.get("name")
-              ver  = c.get("version")
-              matched = None
-              if purl and purl in idx_purl:
-                  matched = idx_purl[purl]
+              new=dict(c)
+              purl=c.get("purl")
+              name=c.get("name")
+              ver=c.get("version")
+
+              matched=None
+              if purl and purl in idx_purl: matched=idx_purl[purl]
               elif name and ver and f"{name}:{ver}" in idx_nv:
                   matched = idx_nv[f"{name}:{ver}"]
+
               if matched:
                   new = enrich(new, matched)
+
               merged.append(new)
 
-          # append syft components not already present (by purl or name:version)
-          existing_purls = {m.get("purl") for m in merged if m.get("purl")}
-          existing_nv = { (m.get("name"), m.get("version")) for m in merged }
+              if new.get("purl"):
+                  existing_purls.add(new["purl"])
+              existing_nv.add((new.get("name"), new.get("version")))
+
           for c in scom:
-              purl = c.get("purl")
-              name = c.get("name")
-              ver  = c.get("version")
-              if purl and purl in existing_purls:
-                  continue
-              if name and ver and (name, ver) in existing_nv:
-                  continue
+              purl=c.get("purl")
+              name=c.get("name")
+              ver=c.get("version")
+              if purl and purl in existing_purls: continue
+              if name and ver and (name,ver) in existing_nv: continue
               merged.append(c)
 
-          # If nothing in merged, fall back to trivy
-          if len(merged) == 0:
+          if not merged:
               merged = tcom
 
-          outobj = {"components": merged}
-          with open(OUT, "w") as f:
-              json.dump(outobj, f, indent=2)
+          json.dump({"components": merged}, open(OUT,"w"), indent=2)
           PY
 
-          # safety: ensure merged-sbom exists
           if [ ! -s project-src/merged-sbom.json ]; then
-            echo "merged missing — fallback to trivy"
-            cp project-src/trivy-fs.json project-src/merged-sbom.json || true
+            cp project-src/trivy-fs.json project-src/merged-sbom.json
           fi
 
       - name: Determine final assigned license
@@ -243,64 +231,45 @@ jobs:
         run: |
           GH_LICENSE=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
           FILE_LICENSE=$(grep -Eo "SPDX-License-Identifier:[ ]*[A-Za-z0-9.\-+]+" \
-                         project-src/local-license.txt 2>/dev/null | head -1 | awk -F': ' '{print $2}')
+                         project-src/local-license.txt | head -1 | awk -F': ' '{print $2}')
           FINAL="${GH_LICENSE:-$FILE_LICENSE}"
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
-          echo "final_license=$FINAL" >> $GITHUB_OUTPUT
 
-      - name: Apply final license to MERGED SBOM components (only fill missing licenses)
+      - name: Apply final license to merged SBOM
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/merged-sbom.json"
           FINAL=$(cat project-src/final_license.txt)
           jq --arg lic "$FINAL" '
             .components |= map(
-              if (.licenses? | length // 0) == 0 then
-                . + { licenses: [{ "license": { "id": $lic }}] }
+              if (.licenses?|length // 0)==0 then
+                . + {licenses:[{"license":{"id":$lic}}]}
               else
-                .licenses = ( .licenses | map(
-                  if (.license? and (.license.id? // "") == "") then
-                    .license.id = $lic | .
-                  else .
-                  end
-                )) | .
+                .
               end
-            )
-          ' "$SBOM" > tmp && mv tmp "$SBOM"
+            )' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      - name: (optional) Ensure SBOM-level dataLicense and metadata.author/supplier exist
+      - name: NTIA Compliance
         if: env.skip_repo != 'true'
         run: |
-          SBOM="project-src/merged-sbom.json"
-          FINAL=$(cat project-src/final_license.txt)
-          jq --arg lic "$FINAL" '
-            .dataLicense = (.dataLicense // $lic) |
-            .metadata = (.metadata // {}) |
-            .metadata.authors = (.metadata.authors // [{"name":"automated-scan"}]) |
-            .metadata.component = (.metadata.component // {"type":"application","name": ( .metadata.component.name // "unknown" )})
-          ' "$SBOM" > tmp && mv tmp "$SBOM"
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs \
+            compliance --ntia /sbom/merged-sbom.json \
+            > project-src/compliance_NTIA.json || true
 
-      - name: NTIA Compliance (use merged SBOM)
+      - name: BSI v2 Compliance
         if: env.skip_repo != 'true'
         run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-             compliance --ntia /sbom/merged-sbom.json \
-             > project-src/compliance_NTIA.json || true
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs \
+            compliance --bsi-v2 /sbom/merged-sbom.json \
+            > project-src/compliance_BSI.json || true
 
-      - name: BSI v2 Compliance (use merged SBOM)
+      - name: Score SBOM
         if: env.skip_repo != 'true'
         run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-             compliance --bsi-v2 /sbom/merged-sbom.json \
-             > project-src/compliance_BSI.json || true
-
-      - name: Score SBOM (use merged SBOM)
-        if: env.skip_repo != 'true'
-        run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-             score /sbom/merged-sbom.json --json \
-             > project-src/score.json || true
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs \
+            score /sbom/merged-sbom.json --json \
+            > project-src/score.json || true
 
       - name: Sanitize artifact name
         id: sanitize
@@ -317,7 +286,6 @@ jobs:
           if-no-files-found: warn
 
   aggregate_results:
-    name: Aggregate SBOMQS Results
     needs: sbom_scan
     runs-on: ubuntu-latest
 
@@ -329,7 +297,7 @@ jobs:
 
       - name: Install Python + Pandas
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y python3-pip
           pip install pandas
 
@@ -340,77 +308,69 @@ jobs:
 
           def load_json(path):
               try:
-                  with open(path) as f:
-                      txt = f.read().strip()
-                      return json.loads(txt) if txt else None
+                  return json.load(open(path))
               except:
                   return None
 
           def load_text(path):
               try:
-                  with open(path) as f:
-                      return f.read().strip()
+                  return open(path).read().strip()
               except:
                   return ""
 
-          rows = []
+          rows=[]
 
           for folder in glob.glob("results/*/"):
-              repo = os.path.basename(os.path.dirname(folder))
+              repo=os.path.basename(os.path.dirname(folder))
 
-              trivy = load_json(os.path.join(folder, "trivy-fs.json")) or {}
-              syft = load_json(os.path.join(folder, "syft-sbom.json")) or {}
-              merged = load_json(os.path.join(folder, "merged-sbom.json")) or {}
-              conan = load_json(os.path.join(folder, "conan-sbom.json")) or {}
-              score = load_json(os.path.join(folder, "score.json"))
-              ntia  = load_json(os.path.join(folder, "compliance_NTIA.json"))
-              bsi   = load_json(os.path.join(folder, "compliance_BSI.json"))
+              merged = load_json(os.path.join(folder,"merged-sbom.json")) or {}
 
-              gh_license = load_json(os.path.join(folder, "gh-license.json")) or {}
-              github_license_spdx = gh_license.get("license", {}).get("spdx_id", "")
-              github_license_name = gh_license.get("license", {}).get("name", "")
+              trivy = load_json(os.path.join(folder,"trivy-fs.json")) or {}
+              syft  = load_json(os.path.join(folder,"syft-sbom.json")) or {}
+              conan = load_json(os.path.join(folder,"conan-sbom.json")) or {}
 
-              local_license_txt = load_text(os.path.join(folder, "local-license.txt"))
-              m = re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+]+)", local_license_txt)
+              score = load_json(os.path.join(folder,"score.json"))
+              ntia  = load_json(os.path.join(folder,"compliance_NTIA.json"))
+              bsi   = load_json(os.path.join(folder,"compliance_BSI.json"))
+
+              gh_license = load_json(os.path.join(folder,"gh-license.json")) or {}
+              github_spdx = gh_license.get("license",{}).get("spdx_id","")
+              github_name = gh_license.get("license",{}).get("name","")
+
+              local = load_text(os.path.join(folder,"local-license.txt"))
+              m=re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+]+)", local)
               local_spdx = m.group(1) if m else ""
 
-              final_license = load_text(os.path.join(folder, "final_license.txt"))
+              final_license = load_text(os.path.join(folder,"final_license.txt"))
 
-              components = merged.get("components", []) or []
-              component_names = [c.get("name") for c in components]
-              component_versions = [c.get("version") for c in components]
-              component_purls = [c.get("purl") for c in components]
-              component_suppliers = [c.get("supplier", {}).get("name") if isinstance(c.get("supplier"), dict) else c.get("supplier") for c in components]
+              components = merged.get("components",[]) or []
+              names=[c.get("name") for c in components]
+              vers=[c.get("version") for c in components]
+              purls=[c.get("purl") for c in components]
+              suppliers=[ (c.get("supplier",{}) if isinstance(c.get("supplier"),dict) else {"name":c.get("supplier")}).get("name")
+                         for c in components ]
 
-              base = {
-                  "repository": repo,
-                  "github_license_spdx": github_license_spdx,
-                  "github_license_name": github_license_name,
-                  "local_spdx_license": local_spdx,
-                  "final_assigned_license": final_license,
-                  "num_trivy_components": len(trivy.get("components", []) or []),
-                  "num_syft_components": len(syft.get("components", []) or []),
-                  "num_merged_components": len(components),
-                  "num_conan_components": len(conan.get("components", [])),
-                  "component_names": component_names,
-                  "component_versions": component_versions,
-                  "component_purls": component_purls,
-                  "component_suppliers": component_suppliers,
-                  "trivy_scan_success": trivy != {},
-                  "syft_scan_success": syft != {},
-                  "conan_scan_success": conan != {},
-                  "sbom_empty": len(components) == 0,
-              }
+              base=dict(
+                repository=repo,
+                github_license_spdx=github_spdx,
+                github_license_name=github_name,
+                local_spdx_license=local_spdx,
+                final_assigned_license=final_license,
+                num_merged_components=len(components),
+                num_trivy_components=len(trivy.get("components",[]) or []),
+                num_syft_components=len(syft.get("components",[]) or []),
+                num_conan_components=len(conan.get("components",[]) or []),
+                component_names=names,
+                component_versions=vers,
+                component_purls=purls,
+                component_suppliers=suppliers
+              )
 
-              if score:
-                  rows.append({**base, "type": "score", **score})
-              if ntia:
-                  rows.append({**base, "type": "ntia", **ntia})
-              if bsi:
-                  rows.append({**base, "type": "bsi", **bsi})
+              if score: rows.append({**base,"type":"score",**score})
+              if ntia:  rows.append({**base,"type":"ntia",**ntia})
+              if bsi:   rows.append({**base,"type":"bsi",**bsi})
 
-          df = pd.json_normalize(rows)
-          df.to_csv("sbomqs_summary.csv", index=False)
+          pd.json_normalize(rows).to_csv("sbomqs_summary.csv", index=False)
           PY
 
       - name: Upload summary
