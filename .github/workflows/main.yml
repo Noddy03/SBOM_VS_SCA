@@ -16,7 +16,7 @@ permissions:
 jobs:
 
   ##############################
-  # FETCH TOP REPOSITORIES
+  # FETCH TOP REPOS
   ##############################
   fetch_top_repos:
     runs-on: ubuntu-latest
@@ -31,7 +31,7 @@ jobs:
         id: fetch
         env:
           LANG: ${{ github.event.inputs.language }}
-          GH_TOKEN: ${{ github.token }}   # ⭐ REQUIRED FIX
+          GH_TOKEN: ${{ github.token }}   # REQUIRED FIX
         run: |
           set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
@@ -46,7 +46,7 @@ jobs:
 
 
   ##############################
-  # MAIN SBOM + COMPLIANCE JOB
+  # SBOM JOB
   ##############################
   sbom_scan:
     needs: fetch_top_repos
@@ -60,9 +60,6 @@ jobs:
 
     steps:
 
-      # -------------------------
-      # Install tools
-      # -------------------------
       - name: Install Dependencies
         run: |
           sudo apt-get update -y
@@ -88,9 +85,7 @@ jobs:
         run: syft version
 
 
-      # -------------------------
-      # Checkout repository
-      # -------------------------
+      # CHECKOUT REPO
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -100,9 +95,9 @@ jobs:
           fetch-depth: 1
 
 
-      # -------------------------
-      # License metadata
-      # -------------------------
+      ##############################
+      # LICENSE DISCOVERY
+      ##############################
       - name: GitHub license metadata
         env:
           REPO: ${{ matrix.repo }}
@@ -121,9 +116,9 @@ jobs:
           fi
 
 
-      # -------------------------
-      # Generate SBOMs
-      # -------------------------
+      ##############################
+      # SBOM GENERATION
+      ##############################
       - name: Conan SBOM
         run: |
           cd project-src
@@ -151,9 +146,9 @@ jobs:
           done
 
 
-      # -------------------------
-      # Merge SBOMs
-      # -------------------------
+      ##############################
+      # MERGE SBOMS (WORKING)
+      ##############################
       - name: Merge SBOMs
         run: |
           python3 <<'PY'
@@ -201,9 +196,9 @@ jobs:
           PY
 
 
-      # -------------------------
-      # License injection
-      # -------------------------
+      ##############################
+      # LICENSE INJECTION
+      ##############################
       - name: Determine final license
         run: |
           GH=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
@@ -213,7 +208,7 @@ jobs:
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
 
-      - name: Apply license to SBOM
+      - name: Apply license to merged SBOM
         run: |
           L=$(cat project-src/final_license.txt)
           jq --arg lic "$L" '
@@ -222,9 +217,9 @@ jobs:
           > tmp && mv tmp project-src/merged-sbom.json
 
 
-      # -------------------------
-      # Compliance (NTIA FIXED)
-      # -------------------------
+      ##############################
+      # NTIA + BSI COMPLIANCE
+      ##############################
       - name: NTIA compliance (JSON FIXED)
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
@@ -250,9 +245,9 @@ jobs:
           || echo '{"error":true}' > project-src/score.json
 
 
-      # -------------------------
-      # Upload artifacts
-      # -------------------------
+      ##############################
+      # ARTIFACT UPLOAD
+      ##############################
       - name: Sanitize artifact name
         id: sanitize
         run: |
@@ -270,7 +265,7 @@ jobs:
 
 
   ##############################
-  # AGGREGATION JOB (FIXED)
+  # AGGREGATION (FIXED)
   ##############################
   aggregate_results:
     needs: sbom_scan
@@ -282,7 +277,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: results/
-          merge-multiple: true   # ⭐ REQUIRED
+          merge-multiple: true   # REQUIRED
 
 
       - name: Install Python
@@ -292,7 +287,7 @@ jobs:
           pip install pandas
 
 
-      - name: Aggregate SBOM results
+      - name: Aggregate into summary.csv
         run: |
           python3 <<'PY'
           import os, glob, json, pandas as pd, re
@@ -307,7 +302,8 @@ jobs:
 
           rows=[]
 
-          for repo_dir in glob.glob("results/*/"):
+          # ⭐ FIX: SEARCH CORRECT NESTING LEVEL
+          for repo_dir in glob.glob("results/*/*/"):
 
               merged = load(repo_dir + "merged-sbom.json")
               if not merged:
@@ -325,7 +321,7 @@ jobs:
               gh_name = gh.get("license",{}).get("name","")
 
               local = loadtext(repo_dir + "local-license.txt")
-              m=re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+]+)",local or "")
+              m=re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+]+)", local or "")
               local_spdx = m.group(1) if m else ""
 
               final_license = loadtext(repo_dir + "final_license.txt")
@@ -339,7 +335,7 @@ jobs:
                 for c in comps
               ]
 
-              repo = os.path.basename(repo_dir.rstrip("/"))
+              repo = os.path.basename(os.path.dirname(repo_dir.rstrip("/")))
 
               base=dict(
                 repository=repo,
