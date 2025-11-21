@@ -109,7 +109,6 @@ jobs:
               > project-src/gh-license.json 2>/dev/null \
               || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
 
-
       - name: Local SPDX fallback
         run: |
           FILE=$(find project-src -maxdepth=5 -type f \
@@ -235,11 +234,21 @@ jobs:
              ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json \
              > project-src/score.json || true
 
+      # -------------------------
+      # FIXED SANITIZATION BLOCK
+      # -------------------------
+      - name: Sanitize artifact name
+        id: sanitize
+        run: |
+          SAFE="${{ matrix.repo }}"
+          SAFE="${SAFE//\//_}"
+          echo "name=$SAFE" >> $GITHUB_OUTPUT
+
 
       - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-reports-${{ matrix.repo }}
+          name: sbom-reports-${{ steps.sanitize.outputs.name }}
           path: project-src/*.json
           if-no-files-found: warn
 
@@ -279,7 +288,7 @@ jobs:
 
           for folder in glob.glob("results/*/"):
               raw = os.path.basename(folder.rstrip("/"))
-              repo = raw.replace("sbom-reports-","")  # fix
+              repo = raw.replace("sbom-reports-","")  # sanitized name
 
               merged = load_json(os.path.join(folder,"merged-sbom.json")) or {}
               if not merged.get("components"):
