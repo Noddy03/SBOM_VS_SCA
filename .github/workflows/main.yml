@@ -62,11 +62,13 @@ jobs:
           pip install --upgrade pip
           pip install conan cyclonedx-bom
 
-          # Trivy installation
+          # Install Trivy
           curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+
           echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -cs) main" \
             | sudo tee /etc/apt/sources.list.d/trivy.list
+
           sudo apt-get update -y
           sudo apt-get install -y trivy
 
@@ -76,7 +78,7 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
             | sh -s -- -b $HOME/bin
           echo "$HOME/bin" >> $GITHUB_PATH
-          # Run syft explicitly because PATH is not updated within same step
+          # PATH does not update inside the same step, so call explicitly:
           $HOME/bin/syft version
 
       - name: Checkout repository
@@ -119,7 +121,7 @@ jobs:
           conan graph info . --format=json > conan-sbom.json \
               || echo '{"components":[]}' > conan-sbom.json
 
-      - name: Trivy SBOM (primary — vuln + license)
+      - name: Trivy SBOM (primary SBOM)
         if: env.skip_repo != 'true'
         run: |
           trivy fs --scanners vuln,license --format cyclonedx \
@@ -167,7 +169,6 @@ jobs:
           tcom = trivy.get("components",[]) or []
           scom = syft.get("components",[]) or []
 
-          # Syft indexes
           idx_purl={}
           idx_nv={}
           for c in scom:
@@ -175,55 +176,47 @@ jobs:
               name=c.get("name")
               ver=c.get("version")
               if purl: idx_purl[purl]=c
-              if name and ver: idx_nv[f"{name}:{ver}"]=c
+              if name and ver: idx_nv[(name,ver)] = c
 
           def enrich(base, extra):
               fields=["supplier","purl","hashes","externalReferences",
-                      "evidence","copyright","type","properties"]
+                      "evidence","type","properties","copyright"]
               for k in fields:
                   if not base.get(k) and extra.get(k):
                       base[k]=extra[k]
               return base
 
           merged=[]
-          existing_purls=set()
-          existing_nv=set()
+          seen_nv=set()
+          seen_purl=set()
 
-          # enrich trivy
           for c in tcom:
               new=dict(c)
+              matched=None
               purl=c.get("purl")
               name=c.get("name")
               ver=c.get("version")
 
-              matched=None
               if purl and purl in idx_purl:
                   matched=idx_purl[purl]
-              elif name and ver and f"{name}:{ver}" in idx_nv:
-                  matched=idx_nv[f"{name}:{ver}"]
+              elif name and ver and (name,ver) in idx_nv:
+                  matched=idx_nv[(name,ver)]
 
               if matched:
-                  new=enrich(new,matched)
+                  new=enrich(new, matched)
 
               merged.append(new)
 
+              seen_nv.add((new.get("name"),new.get("version")))
               if new.get("purl"):
-                  existing_purls.add(new["purl"])
-              existing_nv.add((new.get("name"), new.get("version")))
+                  seen_purl.add(new["purl"])
 
-          # append missing syft components
           for c in scom:
-              purl=c.get("purl")
-              name=c.get("name")
-              ver=c.get("version")
-              if purl and purl in existing_purls: continue
-              if name and ver and (name,ver) in existing_nv: continue
+              if c.get("purl") in seen_purl: continue
+              if (c.get("name"),c.get("version")) in seen_nv: continue
               merged.append(c)
 
-          if not merged:
-              merged=tcom
-
-          json.dump({"components":merged}, open(OUT,"w"), indent=2)
+          json.dump({"components": merged}, open(OUT,"w"), indent=2)
           PY
 
           # Safety fallback
@@ -250,8 +243,7 @@ jobs:
             .components |= map(
               if (.licenses?|length // 0)==0 then
                 . + {licenses:[{"license":{"id":$lic}}]}
-              else .
-              end
+              else . end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
@@ -283,11 +275,25 @@ jobs:
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
 
+      # ─────────────────────────────────────────────────────
+      # FIXED UPLOAD STEP (IMPORTANT!)
+      # Upload ONLY the SBOM output files (not source code)
+      # ─────────────────────────────────────────────────────
       - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
         with:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
-          path: project-src/*
+          path: |
+            project-src/merged-sbom.json
+            project-src/trivy-fs.json
+            project-src/syft-sbom.json
+            project-src/conan-sbom.json
+            project-src/score.json
+            project-src/compliance_NTIA.json
+            project-src/compliance_BSI.json
+            project-src/gh-license.json
+            project-src/local-license.txt
+            project-src/final_license.txt
           if-no-files-found: warn
 
   aggregate_results:
@@ -328,6 +334,9 @@ jobs:
               trivy=load_json(os.path.join(folder,"trivy-fs.json")) or {}
               syft =load_json(os.path.join(folder,"syft-sbom.json")) or {}
               conan=load_json(os.path.join(folder,"conan-sbom.json")) or {}
+
+              if not merged.get("components"):
+                  continue  # skip empty folders
 
               score=load_json(os.path.join(folder,"score.json"))
               ntia =load_json(os.path.join(folder,"compliance_NTIA.json"))
