@@ -1,10 +1,10 @@
-name: Fetch Top IoT Repositories + Full SBOM Scan (Trivy + Syft + Conan) with NTIA + BSI-V2 Compliance
+name: IoT Repositories – Full SBOM (Trivy + Syft + Conan) + NTIA + BSI-V2
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Programming language to scan (C++, Python…) "
+        description: "Language filter"
         required: true
         default: "C++"
 
@@ -22,9 +22,7 @@ jobs:
 
     steps:
       - name: Install jq
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+        run: sudo apt-get update -y && sudo apt-get install -y jq
 
       - name: Fetch repositories
         id: fetch
@@ -32,7 +30,6 @@ jobs:
           LANG: ${{ github.event.inputs.language }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
@@ -42,7 +39,6 @@ jobs:
               --jq '.items[].full_name')
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
 
 
   sbom_scan:
@@ -56,15 +52,15 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-
+      # --------------------------------
+      # Install tools
+      # --------------------------------
       - name: Install Conan + CycloneDX + jq + Trivy
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm
           pip install --upgrade pip
           pip install conan cyclonedx-bom
-
-          # install trivy
           curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
           echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -cs) main" \
@@ -72,11 +68,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y trivy
 
-
-      # -------------------------
-      #       SYFT FIX
-      # -------------------------
-      - name: Install Syft safely
+      - name: Install Syft
         run: |
           mkdir -p $HOME/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
@@ -84,13 +76,11 @@ jobs:
           echo "$HOME/bin" >> $GITHUB_PATH
 
       - name: Verify Syft
-        run: |
-          syft version
+        run: syft version
 
-
-      # -------------------------
-      #   FIXED CHECKOUT (NO SKIP)
-      # -------------------------
+      # --------------------------------
+      # Checkout repo
+      # --------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -99,25 +89,29 @@ jobs:
           path: project-src
           fetch-depth: 1
 
-
+      # --------------------------------
+      # License detection
+      # --------------------------------
       - name: GitHub license metadata
         env:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/license" \
+          gh api "/repos/$REPO/license" \
               > project-src/gh-license.json 2>/dev/null \
               || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
 
       - name: Local SPDX fallback
         run: |
           FILE=$(find project-src -maxdepth=5 -type f \
-             -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
+             -iregex ".*(LICENSE|LICENCE|COPYING|COPYRIGHT|LICENSE.md|LICENSE.txt)" | head -1)
           if [ -n "$FILE" ]; then cp "$FILE" project-src/local-license.txt
           else echo "" > project-src/local-license.txt
           fi
 
-
+      # --------------------------------
+      # SBOM generation
+      # --------------------------------
       - name: Conan SBOM
         run: |
           cd project-src
@@ -125,19 +119,16 @@ jobs:
           conan graph info . --format=json > conan-sbom.json \
               || echo '{"components":[]}' > conan-sbom.json
 
-
       - name: Trivy SBOM
         run: |
           trivy fs --scanners vuln,license --format cyclonedx \
-              -o project-src/trivy-fs.json project-src \
+            -o project-src/trivy-fs.json project-src \
               || echo '{"components":[]}' > project-src/trivy-fs.json
-
 
       - name: Syft SBOM
         run: |
           syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json \
             || echo '{"components":[]}' > project-src/syft-sbom.json
-
 
       - name: Normalize SBOMs
         run: |
@@ -148,8 +139,10 @@ jobs:
             ' "$f" > tmp && mv tmp "$f"
           done
 
-
-      - name: Merge Trivy + Syft into merged-sbom.json
+      # --------------------------------
+      # Merge SBOMs
+      # --------------------------------
+      - name: Merge SBOMs
         run: |
           python3 <<'PY'
           import json, os
@@ -173,7 +166,7 @@ jobs:
               for k in ["supplier","purl","hashes","externalReferences",
                         "evidence","type","properties","copyright"]:
                   if not a.get(k) and b.get(k):
-                      a[k] = b[k]
+                      a[k] = b.get(k)
               return a
 
           merged=[]
@@ -195,18 +188,19 @@ jobs:
           json.dump({"components":merged}, open("project-src/merged-sbom.json","w"), indent=2)
           PY
 
-
-      - name: Final license selection
+      # --------------------------------
+      # Final license application
+      # --------------------------------
+      - name: Determine final license
         run: |
           GH_LIC=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
-          FILE_LIC=$(grep -Eo "SPDX-License-Identifier:\s*[A-Za-z0-9.\-+]+" \
+          FILE_LIC=$(grep -Eo "SPDX-License-Identifier:\\s*[A-Za-z0-9.\\-+]+" \
                      project-src/local-license.txt | head -1 | awk -F': ' '{print $2}')
           FINAL="${GH_LIC:-$FILE_LIC}"
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
 
-
-      - name: Inject license into merged SBOM
+      - name: Inject license into SBOM
         run: |
           L=$(cat project-src/final_license.txt)
           jq --arg lic "$L" '
@@ -215,28 +209,32 @@ jobs:
             )
           ' project-src/merged-sbom.json > tmp && mv tmp project-src/merged-sbom.json
 
-
-      - name: NTIA compliance
+      # --------------------------------
+      # COMPLIANCES (NTIA FIXED!)
+      # --------------------------------
+      - name: NTIA compliance (fixed)
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
-             ghcr.io/interlynk-io/sbomqs compliance --ntia /sbom/merged-sbom.json \
-             > project-src/compliance_NTIA.json || true
+            ghcr.io/interlynk-io/sbomqs \
+              compliance --ntia --format json /sbom/merged-sbom.json \
+            > project-src/compliance_NTIA.json || echo '{}' > project-src/compliance_NTIA.json
 
-      - name: BSI v2 compliance
+      - name: BSI V2 compliance
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
-             ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 /sbom/merged-sbom.json \
-             > project-src/compliance_BSI.json || true
+            ghcr.io/interlynk-io/sbomqs \
+              compliance --bsi-v2 --format json /sbom/merged-sbom.json \
+            > project-src/compliance_BSI.json || echo '{}' > project-src/compliance_BSI.json
 
-      - name: Score merged SBOM
+      - name: Score SBOM
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
-             ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json \
-             > project-src/score.json || true
+            ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json \
+            > project-src/score.json || echo '{}' > project-src/score.json
 
-      # -------------------------
-      # FIXED SANITIZATION BLOCK
-      # -------------------------
+      # --------------------------------
+      # Sanitize artifact name
+      # --------------------------------
       - name: Sanitize artifact name
         id: sanitize
         run: |
@@ -244,17 +242,18 @@ jobs:
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
 
-
       - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
         with:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
+          # flatten JSON files!
           path: project-src/*.json
           if-no-files-found: warn
 
 
-
-
+  # ------------------------------------------
+  # AGGREGATOR — FIXED FOR FLATTENED ARTIFACTS
+  # ------------------------------------------
   aggregate_results:
     needs: sbom_scan
     runs-on: ubuntu-latest
@@ -264,6 +263,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: results/
+          merge-multiple: true   # ⭐ FIX FOR SUMMARY BLANK
 
       - name: Install Python + Pandas
         run: |
@@ -271,7 +271,7 @@ jobs:
           sudo apt-get install -y python3-pip
           pip install pandas
 
-      - name: Aggregate to summary.csv
+      - name: Aggregate into summary.csv
         run: |
           python3 <<'PY'
           import json, glob, pandas as pd, os, re
@@ -287,17 +287,15 @@ jobs:
           rows=[]
 
           for folder in glob.glob("results/*/"):
-              raw = os.path.basename(folder.rstrip("/"))
-              repo = raw.replace("sbom-reports-","")  # sanitized name
+              repo = os.path.basename(folder.rstrip("/"))
 
-              merged = load_json(os.path.join(folder,"merged-sbom.json")) or {}
-              if not merged.get("components"):
+              merged = load_json(os.path.join(folder,"merged-sbom.json"))
+              if not merged or not merged.get("components"):
                   continue
 
               trivy = load_json(os.path.join(folder,"trivy-fs.json")) or {}
               syft  = load_json(os.path.join(folder,"syft-sbom.json")) or {}
               conan = load_json(os.path.join(folder,"conan-sbom.json")) or {}
-
               score = load_json(os.path.join(folder,"score.json"))
               ntia  = load_json(os.path.join(folder,"compliance_NTIA.json"))
               bsi   = load_json(os.path.join(folder,"compliance_BSI.json"))
@@ -307,7 +305,7 @@ jobs:
               gh_name = gh.get("license",{}).get("name","")
 
               local = load_text(os.path.join(folder,"local-license.txt"))
-              m = re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+]+)", local)
+              m=re.search(r"SPDX-License-Identifier:\\s*([A-Za-z0-9.\\-+]+)",local)
               local_spdx = m.group(1) if m else ""
 
               final_license = load_text(os.path.join(folder,"final_license.txt"))
@@ -317,11 +315,12 @@ jobs:
               vers=[c.get("version") for c in comps]
               purls=[c.get("purl") for c in comps]
               suppliers=[
-                 (c.get("supplier",{}) if isinstance(c.get("supplier"),dict) else {"name":c.get("supplier")}).get("name")
-                 for c in comps
+                 (c.get("supplier",{}) if isinstance(c.get("supplier"),dict)
+                  else {"name":c.get("supplier")}).get("name")
+                  for c in comps
               ]
 
-              base = dict(
+              base=dict(
                 repository=repo,
                 github_license_spdx=gh_spdx,
                 github_license_name=gh_name,
@@ -334,7 +333,7 @@ jobs:
                 component_names=names,
                 component_versions=vers,
                 component_purls=purls,
-                component_suppliers=suppliers
+                component_suppliers=suppliers,
               )
 
               if score: rows.append({**base,"type":"score",**score})
