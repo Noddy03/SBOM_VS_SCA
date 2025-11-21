@@ -1,3 +1,4 @@
+
 name: IoT Repositories – Full SBOM (Trivy + Syft + Conan + Cdxgen) with NTIA + BSI-V2
 
 on:
@@ -43,7 +44,6 @@ jobs:
               --jq '.items[].full_name')
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
   ##############################
   # SBOM / SCAN JOB
   ##############################
@@ -62,10 +62,16 @@ jobs:
       - name: Install base deps
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm docker.io
+          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm 
           pip install --upgrade pip
           pip install cyclonedx-bom pandas
 
+      - name: Install Docker (safe for Ubuntu 24.04)
+        run: |
+          # Use official Docker installer to avoid containerd.io conflicts
+          curl -fsSL https://get.docker.com | sh
+          sudo systemctl enable --now docker || true
+          sudo usermod -aG docker $USER || true
       - name: Install Trivy
         run: |
           curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
@@ -73,14 +79,12 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -cs) main" \
             | sudo tee /etc/apt/sources.list.d/trivy.list
           sudo apt-get update -y && sudo apt-get install -y trivy
-
       - name: Install Syft
         run: |
           mkdir -p $HOME/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
             | sh -s -- -b $HOME/bin
           echo "$HOME/bin" >> $GITHUB_PATH
-
       - name: Try install cdxgen (npm) and mark fallback
         run: |
           set -euo pipefail
@@ -92,7 +96,6 @@ jobs:
           else
             echo "docker" > /tmp/cdxgen_fallback
           fi
-
       - name: Verify Syft
         run: syft version || true
 
@@ -115,7 +118,6 @@ jobs:
           gh api "/repos/$REPO/license" \
             > project-src/gh-license.json 2>/dev/null \
             || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
-
       - name: Local SPDX detection
         run: |
           FILE=$(find project-src -maxdepth=6 -type f \
@@ -123,7 +125,6 @@ jobs:
           if [ -n "$FILE" ]; then cp "$FILE" project-src/local-license.txt
           else echo "" > project-src/local-license.txt
           fi
-
       ##############################
       # SBOM GENERATION: Conan (optional), Trivy, Syft, Cdxgen
       ##############################
@@ -133,17 +134,14 @@ jobs:
           cd project-src || exit 0
           conan profile detect --force || true
           conan graph info . --format=json > conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
-
       - name: Trivy SBOM (CycloneDX)
         run: |
           trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
-
       - name: Syft SBOM
         run: |
           syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json \
             || echo '{"components":[]}' > project-src/syft-sbom.json
-
       - name: Cdxgen SBOM (local cdxgen if available, else docker)
         run: |
           set -euo pipefail
@@ -157,7 +155,6 @@ jobs:
               echo '{"components":[]}' > project-src/cdxgen-sbom.json
             fi
           fi
-
       - name: Normalize SBOM arrays
         run: |
           for f in project-src/trivy-fs.json project-src/syft-sbom.json project-src/cdxgen-sbom.json project-src/conan-sbom.json; do
@@ -167,7 +164,6 @@ jobs:
               echo '{"components":[]}' > "$f"
             fi
           done
-
       ##############################
       # MERGE SBOMS (Trivy + Syft + Cdxgen + Conan) — preserve component licenses
       ##############################
@@ -182,12 +178,10 @@ jobs:
           syft = load("project-src/syft-sbom.json")
           cdx = load("project-src/cdxgen-sbom.json")
           conan = load("project-src/conan-sbom.json")
-
           tcom = trivy.get("components",[]) or []
           scom = syft.get("components",[]) or []
           ccom = cdx.get("components",[]) or []
           gcom = conan.get("components",[]) or []
-
           # build enrichment indexes from syft + cdx
           idx_purl = {}
           idx_nv = {}
@@ -197,16 +191,13 @@ jobs:
               key=(comp.get("name"), comp.get("version"))
               if key not in idx_nv:
                   idx_nv[key] = comp
-
           def enrich(a,b):
               for k in ["supplier","purl","hashes","externalReferences","evidence","type","properties","copyright","licenses"]:
                   if not a.get(k) and b.get(k):
                       a[k] = b.get(k)
               return a
-
           merged=[]
           seen=set()
-
           for c in tcom:
               key=(c.get("name"), c.get("version"))
               match = idx_purl.get(c.get("purl")) or idx_nv.get(key)
@@ -215,21 +206,17 @@ jobs:
                   new = enrich(new, match)
               merged.append(new)
               seen.add(key)
-
           for c in scom + ccom + gcom:
               key=(c.get("name"), c.get("version"))
               if key not in seen:
                   merged.append(c)
                   seen.add(key)
-
           repo_license = ""
           if os.path.exists("project-src/final_license.txt"):
               repo_license = open("project-src/final_license.txt").read().strip()
-
           out = {"repo_license": repo_license, "components": merged}
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
           PY
-
       ##############################
       # FINAL REPO LICENSE (do not overwrite component licenses)
       ##############################
@@ -240,12 +227,10 @@ jobs:
           FINAL="${GH:-$FILE}"
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
-
       - name: Ensure merged-sbom.json contains repo_license (inject if missing)
         run: |
           L=$(cat project-src/final_license.txt)
           jq --arg lic "$L" '.repo_license = $lic' project-src/merged-sbom.json > tmp && mv tmp project-src/merged-sbom.json
-
       ##############################
       # TRIVY VULNERABILITIES (FULL)
       ##############################
@@ -253,12 +238,10 @@ jobs:
         run: |
           trivy fs --format json -o project-src/vulnerabilities_fs.json project-src \
             || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
-
       - name: Trivy SBOM vulnerability scan (full)
         run: |
           trivy sbom --format json -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json \
             || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
-
       ##############################
       # Create unified vulnerabilities list (json + csv) in project-src/
       ##############################
@@ -284,20 +267,16 @@ jobs:
                           "source": source
                       })
               return vulns
-
           fs = extract("project-src/vulnerabilities_fs.json","filesystem")
           sb = extract("project-src/vulnerabilities_sbom.json","sbom")
           allv = fs + sb
-
           json.dump(allv, open("project-src/vulnerabilities.json","w"), indent=2)
-
           with open("project-src/vulnerabilities.csv","w", newline='') as f:
               w = csv.writer(f)
               w.writerow(["id","package","version","severity","source","description"])
               for v in allv:
                   w.writerow([v.get("id"), v.get("package"), v.get("version"), v.get("severity"), v.get("source"), v.get("description")])
           PY
-
       ##############################
       # Create libraries list (libraries.json + csv) in project-src/
       ##############################
@@ -330,7 +309,6 @@ jobs:
               for l in libs:
                   w.writerow([l.get("name"), l.get("version"), l.get("purl"), l.get("supplier")])
           PY
-
       ##############################
       # NTIA + BSI V2 + SCORE (write JSON outputs)
       ##############################
@@ -341,7 +319,6 @@ jobs:
               compliance --ntia --format json /sbom/merged-sbom.json \
             > project-src/compliance_NTIA.json \
             || echo '{"error":true}' > project-src/compliance_NTIA.json
-
       - name: BSI-V2 compliance (json)
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
@@ -349,7 +326,6 @@ jobs:
               compliance --bsi-v2 --format json /sbom/merged-sbom.json \
             > project-src/compliance_BSI.json \
             || echo '{"error":true}' > project-src/compliance_BSI.json
-
       - name: SBOM Score (json)
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
@@ -357,7 +333,6 @@ jobs:
               score /sbom/merged-sbom.json --json \
             > project-src/score.json \
             || echo '{"error":true}' > project-src/score.json
-
       ##############################
       # Sanitize artifact name and upload all project-src files
       ##############################
@@ -367,7 +342,6 @@ jobs:
           SAFE="${{ matrix.repo }}"
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
-
       - name: Upload results (per-repo artifact)
         uses: actions/upload-artifact@v4
         with:
@@ -394,18 +368,15 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y python3-pip
           pip install pandas
-
       - name: Build summary.csv (repo_name, engine, ntia_sha256, bsi_v2_sha256, timestamp)
         run: |
           python3 <<'PY'
           import os, glob, json, hashlib, pandas as pd, datetime, re
-
           def load(path):
               try:
                   return json.load(open(path))
               except:
                   return None
-
           def sha256_of_file(path):
               try:
                   import hashlib
@@ -416,19 +387,15 @@ jobs:
                   return h.hexdigest()
               except:
                   return "error:no_file"
-
           rows=[]
-
           # iterate downloaded artifact directories
           for artifact_dir in glob.glob("results/*/"):
               if not artifact_dir.endswith("/"):
                   artifact_dir += "/"
-
               # possible bases inside artifact
               bases = [artifact_dir, os.path.join(artifact_dir, "project-src") + "/"]
               merged = None
               base_path = None
-
               # Try to find merged-sbom.json in known locations
               for b in bases:
                   if os.path.exists(os.path.join(b, "merged-sbom.json")):
@@ -438,7 +405,6 @@ jobs:
                           break
                       except:
                           merged = None
-
               # also support flattened/alternate filenames: e.g., artifact_merged-sbom.json
               if merged is None:
                   for f in glob.glob(os.path.join(artifact_dir, "*merged-sbom.json")):
@@ -448,18 +414,14 @@ jobs:
                           break
                       except:
                           merged = None
-
               if merged is None:
                   # nothing to aggregate here
                   continue
-
               # read compliance files and compute sha256 (or error:no_file)
               ntia_file = os.path.join(base_path, "compliance_NTIA.json")
               bsi_file = os.path.join(base_path, "compliance_BSI.json")
-
               ntia_hash = sha256_of_file(ntia_file) if os.path.exists(ntia_file) else "error:no_file"
               bsi_hash  = sha256_of_file(bsi_file) if os.path.exists(bsi_file) else "error:no_file"
-
               # determine engine string: which SBOM engines produced components
               engines = []
               for eng_name, fname in [("trivy","trivy-fs.json"),("syft","syft-sbom.json"),("cdxgen","cdxgen-sbom.json"),("conan","conan-sbom.json")]:
@@ -472,13 +434,10 @@ jobs:
                       except:
                           pass
               engine_str = ",".join(sorted(set(engines))) if engines else "unknown"
-
               # repo name: derive from artifact folder name
               artifact_name = os.path.basename(os.path.normpath(artifact_dir.rstrip("/")))
               repo_name = artifact_name.replace("sbom-reports-","").replace("_","/")
-
               timestamp = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
               rows.append({
                   "repo_name": repo_name,
                   "engine": engine_str,
@@ -486,18 +445,20 @@ jobs:
                   "bsi_v2_sha256": bsi_hash,
                   "timestamp": timestamp
               })
-
           if not rows:
               # produce an empty CSV with headers so the artifact exists
               df = pd.DataFrame(columns=["repo_name","engine","ntia_sha256","bsi_v2_sha256","timestamp"])
           else:
               df = pd.DataFrame(rows)
-
-          df.to_csv("summary.csv", index=False)
+          df.to_csv("sbom-reports/summary.csv", index=False)
           PY
+      - name: Move aggregated outputs into sbom-reports folder
+        run: |
+          mkdir -p sbom-reports
+          mv summary.csv sbom-reports/ || true
 
-      - name: Upload summary.csv
+      - name: Upload sbom-reports folder
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-summary
-          path: summary.csv
+          name: sbom-reports
+          path: sbom-reports
