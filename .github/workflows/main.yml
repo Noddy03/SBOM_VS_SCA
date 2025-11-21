@@ -15,29 +15,39 @@ permissions:
 
 jobs:
 
+  ##############################
+  # FETCH TOP REPOSITORIES
+  ##############################
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
 
     steps:
-      - run: sudo apt-get update -y && sudo apt-get install -y jq
+      - name: Install jq
+        run: sudo apt-get update -y && sudo apt-get install -y jq
 
-      - id: fetch
+      - name: Fetch repositories
+        id: fetch
         env:
           LANG: ${{ github.event.inputs.language }}
+          GH_TOKEN: ${{ github.token }}   # ⭐ REQUIRED FIX
         run: |
+          set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
-          REPOS=$(gh api /search/repositories \
-            --raw-field q="$RAW_Q" \
-            --raw-field sort=stars \
-            --raw-field order=desc \
-            --raw-field per_page=100 \
-            --jq '.items[].full_name')
-          JSON=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
-          echo "repo_list=$JSON" >> $GITHUB_OUTPUT
+          REPOS=$(gh api -X GET /search/repositories \
+              --raw-field q="$RAW_Q" \
+              --raw-field sort=stars \
+              --raw-field order=desc \
+              --raw-field per_page=100 \
+              --jq '.items[].full_name')
+          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
+          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
 
+  ##############################
+  # MAIN SBOM + COMPLIANCE JOB
+  ##############################
   sbom_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
@@ -50,9 +60,9 @@ jobs:
 
     steps:
 
-      # =======================
+      # -------------------------
       # Install tools
-      # =======================
+      # -------------------------
       - name: Install Dependencies
         run: |
           sudo apt-get update -y
@@ -71,16 +81,16 @@ jobs:
         run: |
           mkdir -p $HOME/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-              | sh -s -- -b $HOME/bin
+            | sh -s -- -b $HOME/bin
           echo "$HOME/bin" >> $GITHUB_PATH
 
       - name: Verify Syft
         run: syft version
 
 
-      # =======================
-      # Checkout repo
-      # =======================
+      # -------------------------
+      # Checkout repository
+      # -------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -90,12 +100,13 @@ jobs:
           fetch-depth: 1
 
 
-      # =======================
-      # License gathering
-      # =======================
+      # -------------------------
+      # License metadata
+      # -------------------------
       - name: GitHub license metadata
         env:
           REPO: ${{ matrix.repo }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh api "/repos/$REPO/license" \
             > project-src/gh-license.json 2>/dev/null \
@@ -110,9 +121,9 @@ jobs:
           fi
 
 
-      # =======================
-      # SBOM generation
-      # =======================
+      # -------------------------
+      # Generate SBOMs
+      # -------------------------
       - name: Conan SBOM
         run: |
           cd project-src
@@ -130,8 +141,7 @@ jobs:
           syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json \
             || echo '{"components":[]}' > project-src/syft-sbom.json
 
-
-      - name: Normalize SBOMs
+      - name: Normalize SBOM arrays
         run: |
           for f in project-src/trivy-fs.json project-src/syft-sbom.json; do
             jq '
@@ -141,13 +151,13 @@ jobs:
           done
 
 
-      # =======================
+      # -------------------------
       # Merge SBOMs
-      # =======================
+      # -------------------------
       - name: Merge SBOMs
         run: |
           python3 <<'PY'
-          import json, os
+          import json
 
           def load(f):
               try: return json.load(open(f))
@@ -185,13 +195,15 @@ jobs:
               if key not in seen:
                   merged.append(c)
 
-          json.dump({"components":merged},open("project-src/merged-sbom.json","w"),indent=2)
+          json.dump({"components":merged},
+                    open("project-src/merged-sbom.json","w"),
+                    indent=2)
           PY
 
 
-      # =======================
+      # -------------------------
       # License injection
-      # =======================
+      # -------------------------
       - name: Determine final license
         run: |
           GH=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
@@ -201,45 +213,46 @@ jobs:
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
 
-      - name: Apply license
+      - name: Apply license to SBOM
         run: |
           L=$(cat project-src/final_license.txt)
           jq --arg lic "$L" '
             .components |= map(.licenses=[{"license":{"id":$lic}}])
-          ' project-src/merged-sbom.json > tmp && mv tmp project-src/merged-sbom.json
+          ' project-src/merged-sbom.json \
+          > tmp && mv tmp project-src/merged-sbom.json
 
 
-      # =======================
+      # -------------------------
       # Compliance (NTIA FIXED)
-      # =======================
-      - name: NTIA compliance (JSON FIX)
+      # -------------------------
+      - name: NTIA compliance (JSON FIXED)
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
             ghcr.io/interlynk-io/sbomqs \
               compliance --ntia --format json /sbom/merged-sbom.json \
-            > project-src/compliance_NTIA.json \
-            || echo '{"error":true}' > project-src/compliance_NTIA.json
+          > project-src/compliance_NTIA.json \
+          || echo '{"error":true}' > project-src/compliance_NTIA.json
 
       - name: BSI V2 compliance
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
             ghcr.io/interlynk-io/sbomqs \
               compliance --bsi-v2 --format json /sbom/merged-sbom.json \
-            > project-src/compliance_BSI.json \
-            || echo '{"error":true}' > project-src/compliance_BSI.json
-
+          > project-src/compliance_BSI.json \
+          || echo '{"error":true}' > project-src/compliance_BSI.json
 
       - name: Score SBOM
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
-            ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json \
-            > project-src/score.json \
-            || echo '{"error":true}' > project-src/score.json
+            ghcr.io/interlynk-io/sbomqs \
+              score /sbom/merged-sbom.json --json \
+          > project-src/score.json \
+          || echo '{"error":true}' > project-src/score.json
 
 
-      # =======================
-      # Artifact naming
-      # =======================
+      # -------------------------
+      # Upload artifacts
+      # -------------------------
       - name: Sanitize artifact name
         id: sanitize
         run: |
@@ -247,7 +260,7 @@ jobs:
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
 
-      - name: Upload SBOM bundle
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
@@ -256,9 +269,9 @@ jobs:
 
 
 
-  # =======================
-  # AGGREGATOR (FIXED)
-  # =======================
+  ##############################
+  # AGGREGATION JOB (FIXED)
+  ##############################
   aggregate_results:
     needs: sbom_scan
     runs-on: ubuntu-latest
@@ -269,15 +282,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: results/
-          merge-multiple: true   # ⭐ REQUIRED FIX
+          merge-multiple: true   # ⭐ REQUIRED
 
-      - name: Install Python env
+
+      - name: Install Python
         run: |
           sudo apt-get update -y
           sudo apt-get install -y python3-pip
           pip install pandas
 
-      - name: Aggregate
+
+      - name: Aggregate SBOM results
         run: |
           python3 <<'PY'
           import os, glob, json, pandas as pd, re
@@ -293,9 +308,10 @@ jobs:
           rows=[]
 
           for repo_dir in glob.glob("results/*/"):
-              # each repo folder contains JSONs now
+
               merged = load(repo_dir + "merged-sbom.json")
-              if not merged: continue
+              if not merged:
+                  continue
 
               trivy = load(repo_dir + "trivy-fs.json") or {}
               syft  = load(repo_dir + "syft-sbom.json") or {}
@@ -323,7 +339,7 @@ jobs:
                 for c in comps
               ]
 
-              repo=os.path.basename(repo_dir.rstrip("/"))
+              repo = os.path.basename(repo_dir.rstrip("/"))
 
               base=dict(
                 repository=repo,
@@ -348,8 +364,9 @@ jobs:
           pd.json_normalize(rows).to_csv("summary.csv",index=False)
           PY
 
+
       - name: Upload summary
         uses: actions/upload-artifact@v4
         with:
-          name: sbomqs-summary
+          name: sbom-summary
           path: summary.csv
