@@ -156,93 +156,94 @@ jobs:
       - name: Merge SBOMs
         run: |
           python3 <<'PY'
-import json, os, copy
+          import json, os, copy
 
-def load(p):
-    try:
-        return json.load(open(p))
-    except:
-        return {"components": []}
+          def load(p):
+              try:
+                  return json.load(open(p))
+              except:
+                  return {"components": []}
 
-cdx = load("project-src/cdxgen-sbom.json")
-syf = load("project-src/syft-sbom.json")
-tri = load("project-src/trivy-fs.json")
-con = load("project-src/conan-sbom.json")
+          cdx = load("project-src/cdxgen-sbom.json")
+          syf = load("project-src/syft-sbom.json")
+          tri = load("project-src/trivy-fs.json")
+          con = load("project-src/conan-sbom.json")
 
-ccom = cdx.get("components", [])
-scom = syf.get("components", [])
-tcom = tri.get("components", [])
-gcom = con.get("components", [])
+          ccom = cdx.get("components", [])
+          scom = syf.get("components", [])
+          tcom = tri.get("components", [])
+          gcom = con.get("components", [])
 
-def key_nv(c):
-    return (c.get("name"), c.get("version"))
+          def key_nv(c):
+              return (c.get("name"), c.get("version"))
 
-def deep_merge(base, src):
-    for k in [
-        "supplier", "purl", "type", "copyright",
-        "evidence", "properties", "externalReferences",
-        "hashes", "licenses"
-    ]:
-        b = base.get(k)
-        s = src.get(k)
-        if not b and s:
-            base[k] = copy.deepcopy(s)
-        elif isinstance(b, list) and isinstance(s, list):
-            seen = {json.dumps(x, sort_keys=True) for x in b}
-            for item in s:
-                if json.dumps(item, sort_keys=True) not in seen:
-                    b.append(item)
-    for k, v in src.items():
-        if k not in base or base[k] in (None, ""):
-            base[k] = copy.deepcopy(v)
-    return base
+          def deep_merge(base, src):
+              for k in [
+                  "supplier", "purl", "type", "copyright",
+                  "evidence", "properties", "externalReferences",
+                  "hashes", "licenses"
+              ]:
+                  b = base.get(k)
+                  s = src.get(k)
+                  if not b and s:
+                      base[k] = copy.deepcopy(s)
+                  elif isinstance(b, list) and isinstance(s, list):
+                      seen = {json.dumps(x, sort_keys=True) for x in b}
+                      for item in s:
+                          if json.dumps(item, sort_keys=True) not in seen:
+                              b.append(item)
+              for k, v in src.items():
+                  if k not in base or base[k] in (None, ""):
+                      base[k] = copy.deepcopy(v)
+              return base
 
-merged = {}
+          merged = {}
 
-# cdxgen primary
-for c in ccom:
-    p = c.get("purl")
-    merged[p or key_nv(c)] = copy.deepcopy(c)
+          # cdxgen primary
+          for c in ccom:
+              p = c.get("purl")
+              merged[p or key_nv(c)] = copy.deepcopy(c)
 
-# syft enrichment
-for c in scom:
-    p = c.get("purl")
-    k = p if p in merged else key_nv(c)
-    if k in merged:
-        merged[k] = deep_merge(merged[k], c)
-    else:
-        merged[k] = copy.deepcopy(c)
+          # syft enrichment
+          for c in scom:
+              p = c.get("purl")
+              k = p if p in merged else key_nv(c)
+              if k in merged:
+                  merged[k] = deep_merge(merged[k], c)
+              else:
+                  merged[k] = copy.deepcopy(c)
 
-# trivy enhancement
-for c in tcom:
-    p = c.get("purl")
-    k = p if p in merged else key_nv(c)
-    if k in merged:
-        merged[k] = deep_merge(merged[k], c)
-    else:
-        if c.get("name"):
-            merged[k] = copy.deepcopy(c)
+          # trivy enhancement
+          for c in tcom:
+              p = c.get("purl")
+              k = p if p in merged else key_nv(c)
+              if k in merged:
+                  merged[k] = deep_merge(merged[k], c)
+              else:
+                  if c.get("name"):
+                      merged[k] = copy.deepcopy(c)
 
-# conan optional
-for c in gcom:
-    p = c.get("purl")
-    k = p or key_nv(c)
-    if k not in merged:
-        merged[k] = copy.deepcopy(c)
+          # conan optional
+          for c in gcom:
+              p = c.get("purl")
+              k = p or key_nv(c)
+              if k not in merged:
+                  merged[k] = copy.deepcopy(c)
 
-final_components = list(merged.values())
+          final_components = list(merged.values())
 
-# license detection
-repo_license = ""
-lic_path = "project-src/local-license.txt"
-if os.path.exists(lic_path):
-    txt = open(lic_path).read().strip()
-    if "SPDX" in txt:
-        repo_license = txt
+          # license detection
+          repo_license = ""
+          lic_path = "project-src/local-license.txt"
+          if os.path.exists(lic_path):
+              txt = open(lic_path).read().strip()
+              if "SPDX" in txt:
+                  repo_license = txt
 
-out = {"repo_license": repo_license, "components": final_components}
-json.dump(out, open("project-src/merged-sbom.json", "w"), indent=2)
-PY
+          out = {"repo_license": repo_license, "components": final_components}
+          json.dump(out, open("project-src/merged-sbom.json", "w"), indent=2)
+          PY
+
 
       - name: Determine final repository license
         run: |
