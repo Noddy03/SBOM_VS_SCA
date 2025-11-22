@@ -14,7 +14,6 @@ permissions:
   actions: read
 
 env:
-  # ensure non-interactive deb installs
   DEBIAN_FRONTEND: noninteractive
 
 jobs:
@@ -74,19 +73,15 @@ jobs:
       - name: Install base deps
         run: |
           sudo apt-get update -y
-          # Do NOT install docker.io (may conflict on some runners)
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git
           pip3 install --upgrade pip
           pip3 install cyclonedx-bom pandas
 
-      - name: Ensure Docker usable (safe)
+      - name: Ensure Docker usable (best-effort)
         run: |
-          # Try to ensure docker can be run with sudo; this is best-effort.
           sudo groupadd docker || true
           sudo usermod -aG docker $USER || true
-          # Restart docker if available
           sudo systemctl restart docker || true
-          # show docker status for logs
           sudo docker --version || true
           sudo docker info || true
 
@@ -129,7 +124,7 @@ jobs:
       ##############################
       # BULLETPROOF CHECKOUT
       ##############################
-      - name: Bulletproof checkout (no submodule cleanup)
+      - name: Bulletproof checkout (safe for submodules)
         run: |
           set -euo pipefail
           rm -rf project-src || true
@@ -175,7 +170,7 @@ jobs:
           fi
 
       ##############################
-      # SBOM GENERATION
+      # SBOM GENERATION — FULL RECURSIVE FILESYSTEM SCAN (rich detection + binary hashes)
       ##############################
       - name: Conan SBOM (optional)
         run: |
@@ -184,15 +179,22 @@ jobs:
           conan profile detect --force || true
           conan graph info . --format=json > conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
 
-      - name: Trivy SBOM (CycloneDX)
+      - name: Trivy FS SBOM (CycloneDX, recursive)
         run: |
           set -euo pipefail
-          trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src || echo '{"components":[]}' > project-src/trivy-fs.json
+          # Full recursive filesystem CycloneDX SBOM and vulnerability scan (licenses + vulns).
+          trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src \
+            || echo '{"components":[]}' > project-src/trivy-fs.json
+          # Also capture detailed vuln JSON for unified vuln list
+          trivy fs --format json -o project-src/vulnerabilities_fs.json project-src \
+            || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
 
-      - name: Syft SBOM
+      - name: Syft FS SBOM (CycloneDX, deep scan)
         run: |
           set -euo pipefail
-          syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json || echo '{"components":[]}' > project-src/syft-sbom.json
+          # syft filesystem scan (deep) — syft will analyze file types, binaries, and produce component hashes where available
+          syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json \
+            || echo '{"components":[]}' > project-src/syft-sbom.json
 
       - name: Cdxgen SBOM (local or docker fallback)
         run: |
@@ -219,7 +221,7 @@ jobs:
           done
 
       ##############################
-      # MERGE SBOMS
+      # MERGE SBOMS (preserve component licenses, write repo_license)
       ##############################
       - name: Merge SBOMs (preserve component licenses, write repo_license)
         run: |
@@ -289,15 +291,11 @@ jobs:
       ##############################
       # TRIVY VULNERABILITIES (FULL)
       ##############################
-      - name: Trivy filesystem vulnerability scan (full)
-        run: |
-          set -euo pipefail
-          trivy fs --format json -o project-src/vulnerabilities_fs.json project-src || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
-
       - name: Trivy SBOM vulnerability scan (full)
         run: |
           set -euo pipefail
-          trivy sbom --format json -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
+          trivy sbom --format json -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json \
+            || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
 
       ##############################
       # Create unified vulnerabilities list (json + csv)
@@ -426,7 +424,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
-          # include full project-src tree so aggregator can find files predictably
           path: project-src/**
           if-no-files-found: warn
 
@@ -470,10 +467,8 @@ jobs:
               except Exception:
                   return "error:no_file"
           rows = []
-          # Find merged-sbom.json anywhere under results/
           candidates = glob.glob("results/**/merged-sbom.json", recursive=True)
           candidates = sorted(set(candidates))
-          # fallback to other SBOMs if no merged found
           if not candidates:
               alt = glob.glob("results/**/trivy-fs.json", recursive=True) + \
                     glob.glob("results/**/syft-sbom.json", recursive=True) + \
@@ -484,7 +479,6 @@ jobs:
               merged_abs = os.path.abspath(merged_path)
               cur = os.path.dirname(merged_abs)
               root_candidate = None
-              # climb up until we find artifact root (sbom-reports-*) or results root
               while True:
                   base = os.path.basename(cur)
                   if base.startswith("sbom-reports-") or base == "results":
@@ -495,7 +489,6 @@ jobs:
                       root_candidate = cur
                       break
                   cur = parent
-              # Determine artifact_dir that contains the artifact files
               if "results" in root_candidate:
                   parts = root_candidate.split(os.sep)
                   try:
@@ -512,7 +505,6 @@ jobs:
               if artifact_dir in seen_roots:
                   continue
               seen_roots.add(artifact_dir)
-              # Build candidate base paths to search for typical files
               base_paths = [artifact_dir,
                             os.path.join(artifact_dir, "project-src") + os.sep,
                             os.path.join(artifact_dir, os.path.basename(artifact_dir.rstrip(os.sep))) + os.sep]
@@ -550,7 +542,6 @@ jobs:
                       break
               if merged is None:
                   continue
-              # load optional files
               trivy = try_load("trivy-fs.json") or {}
               syft = try_load("syft-sbom.json") or {}
               cdx = try_load("cdxgen-sbom.json") or {}
@@ -561,7 +552,6 @@ jobs:
               gh = try_load("gh-license.json") or {}
               gh_spdx = gh.get("license",{}).get("spdx_id","")
               gh_name = gh.get("license",{}).get("name","")
-              # vuln count
               vuln_count = 0
               vuln_list = try_load("vulnerabilities.json") or {}
               if isinstance(vuln_list, list):
@@ -576,7 +566,6 @@ jobs:
                           except:
                               vuln_count = 0
                           break
-              # local license
               local_txt = ""
               for b in base_paths:
                   p = os.path.join(b, "local-license.txt")
@@ -653,7 +642,6 @@ jobs:
                   vuln_count=vuln_count,
                   timestamp=timestamp
               )
-              # helper to always add a row, merging tool data if present
               def add_row(data, t):
                   row = {**base, "type": t}
                   if isinstance(data, dict):
@@ -661,7 +649,6 @@ jobs:
                   else:
                       row["error"] = True
                   rows.append(row)
-              # always add rows for score/ntia/bsi (ensures repo not skipped)
               add_row(score or {}, "score")
               add_row(ntia or {}, "ntia")
               add_row(bsi or {}, "bsi")
