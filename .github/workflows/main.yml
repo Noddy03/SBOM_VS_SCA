@@ -98,7 +98,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y trivy || true
 
-      - name: Trivy: download DB (best-effort)
+      - name: Trivy download DB (best-effort)
         run: |
           set -euo pipefail
           # prefetch DB to avoid empty results when network delay occurs
