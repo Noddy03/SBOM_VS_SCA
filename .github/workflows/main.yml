@@ -1,4 +1,3 @@
-
 name: IoT Repositories – Full SBOM (Trivy + Syft + Conan + Cdxgen) with NTIA + BSI-V2
 
 on:
@@ -44,6 +43,7 @@ jobs:
               --jq '.items[].full_name')
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
+
   ##############################
   # SBOM / SCAN JOB
   ##############################
@@ -59,36 +59,59 @@ jobs:
 
     steps:
 
-      - name: Install base deps
+      - name: Install base deps (without docker.io)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm docker.io
+          # NOTE: do NOT install docker.io (conflicts on Ubuntu 24.04)
+          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm
           pip install --upgrade pip
           pip install cyclonedx-bom pandas
-      - name: Install Trivy
+
+      - name: Install Docker (official script — avoids containerd.io conflict)
         run: |
-          curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
-            | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
-          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -cs) main" \
-            | sudo tee /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update -y && sudo apt-get install -y trivy
-      - name: Install Syft
+          set -euo pipefail
+          # use official installer which avoids the containerd.io apt conflict
+          curl -fsSL https://get.docker.com | sudo sh
+          # best-effort add runner user to docker group (non-fatal)
+          sudo usermod -aG docker $USER || true
+          # ensure docker is available (may not be started on some runners)
+          docker version || true
+
+      - name: Install Trivy (retry)
         run: |
-          mkdir -p $HOME/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-            | sh -s -- -b $HOME/bin
-          echo "$HOME/bin" >> $GITHUB_PATH
+          set -euo pipefail
+          for i in 1 2 3; do
+            curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
+              | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg \
+              && echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -cs) main" \
+                | sudo tee /etc/apt/sources.list.d/trivy.list \
+              && sudo apt-get update -y \
+              && sudo apt-get install -y trivy && break || sleep 5
+          done || true
+
+      - name: Install Syft (retry)
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            mkdir -p $HOME/bin
+            curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+              | sh -s -- -b $HOME/bin && echo "$HOME/bin" >> $GITHUB_PATH && syft version && break || sleep 3
+          done || true
+
       - name: Try install cdxgen (npm) and mark fallback
         run: |
           set -euo pipefail
           if npm --version >/dev/null 2>&1; then
+            # best-effort; do not fail the job if npm install fails
             sudo npm install -g @cyclonedx/cdxgen || true
           fi
           if command -v cdxgen >/dev/null 2>&1; then
             rm -f /tmp/cdxgen_fallback || true
           else
+            # fallback to docker-based cdxgen
             echo "docker" > /tmp/cdxgen_fallback
           fi
+
       - name: Verify Syft
         run: syft version || true
 
@@ -111,6 +134,7 @@ jobs:
           gh api "/repos/$REPO/license" \
             > project-src/gh-license.json 2>/dev/null \
             || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
+
       - name: Local SPDX detection
         run: |
           FILE=$(find project-src -maxdepth=6 -type f \
@@ -118,23 +142,36 @@ jobs:
           if [ -n "$FILE" ]; then cp "$FILE" project-src/local-license.txt
           else echo "" > project-src/local-license.txt
           fi
+
       ##############################
       # SBOM GENERATION: Conan (optional), Trivy, Syft, Cdxgen
       ##############################
-      - name: Conan SBOM (optional)
+
+      - name: Conan SBOM (optional, retry)
         run: |
           set -euo pipefail
           cd project-src || exit 0
-          conan profile detect --force || true
-          conan graph info . --format=json > conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
-      - name: Trivy SBOM (CycloneDX)
+          for i in 1 2; do
+            conan profile detect --force || true
+            conan graph info . --format=json > conan-sbom.json && break || (echo '{"components":[]}' > conan-sbom.json && sleep 2)
+          done || true
+
+      - name: Trivy SBOM (CycloneDX) (retry)
         run: |
-          trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src \
-            || echo '{"components":[]}' > project-src/trivy-fs.json
-      - name: Syft SBOM
+          set -euo pipefail
+          for i in 1 2 3; do
+            trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src && break || (echo "[]" > project-src/trivy-fs.json && sleep 3)
+          done || true
+          # ensure fallback structure
+          jq 'if has("components") then . else (. + {components: []}) end' project-src/trivy-fs.json > tmp || echo '{"components":[]}' > tmp; mv tmp project-src/trivy-fs.json
+
+      - name: Syft SBOM (retry)
         run: |
-          syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json \
-            || echo '{"components":[]}' > project-src/syft-sbom.json
+          set -euo pipefail
+          for i in 1 2 3; do
+            syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json && break || (echo '{"components":[]}' > project-src/syft-sbom.json && sleep 2)
+          done || true
+
       - name: Cdxgen SBOM (local cdxgen if available, else docker)
         run: |
           set -euo pipefail
@@ -148,25 +185,30 @@ jobs:
               echo '{"components":[]}' > project-src/cdxgen-sbom.json
             fi
           fi
-      - name: Normalize SBOM arrays
+
+      - name: Normalize SBOM arrays (safe)
         run: |
           for f in project-src/trivy-fs.json project-src/syft-sbom.json project-src/cdxgen-sbom.json project-src/conan-sbom.json; do
             if [ -f "$f" ]; then
-              jq 'if has("components") then . else (. + {components: []}) end | .components |= (if type=="array" then . else [] end)' "$f" > tmp && mv tmp "$f"
+              jq 'if has("components") then . else (. + {components: []}) end |
+                 .components |= (if type=="array" then . else [] end)' "$f" > tmp && mv tmp "$f"
             else
               echo '{"components":[]}' > "$f"
             fi
           done
+
       ##############################
       # MERGE SBOMS (Trivy + Syft + Cdxgen + Conan) — preserve component licenses
       ##############################
-      - name: Merge SBOMs (preserve component licenses, write repo_license field)
+      - name: Merge SBOMs
         run: |
           python3 <<'PY'
           import json, os
           def load(p):
-              try: return json.load(open(p))
-              except: return {"components":[]}
+              try:
+                  return json.load(open(p))
+              except:
+                  return {"components":[]}
           trivy = load("project-src/trivy-fs.json")
           syft = load("project-src/syft-sbom.json")
           cdx = load("project-src/cdxgen-sbom.json")
@@ -210,6 +252,7 @@ jobs:
           out = {"repo_license": repo_license, "components": merged}
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
           PY
+
       ##############################
       # FINAL REPO LICENSE (do not overwrite component licenses)
       ##############################
@@ -224,17 +267,24 @@ jobs:
         run: |
           L=$(cat project-src/final_license.txt)
           jq --arg lic "$L" '.repo_license = $lic' project-src/merged-sbom.json > tmp && mv tmp project-src/merged-sbom.json
+
       ##############################
       # TRIVY VULNERABILITIES (FULL)
       ##############################
       - name: Trivy filesystem vulnerability scan (full)
         run: |
-          trivy fs --format json -o project-src/vulnerabilities_fs.json project-src \
-            || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
+          set -euo pipefail
+          for i in 1 2; do
+            trivy fs --format json -o project-src/vulnerabilities_fs.json project-src && break || (echo '{"Results":[]}' > project-src/vulnerabilities_fs.json && sleep 3)
+          done || true
+
       - name: Trivy SBOM vulnerability scan (full)
         run: |
-          trivy sbom --format json -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json \
-            || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
+          set -euo pipefail
+          for i in 1 2; do
+            trivy sbom --format json -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json && break || (echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json && sleep 3)
+          done || true
+
       ##############################
       # Create unified vulnerabilities list (json + csv) in project-src/
       ##############################
@@ -270,6 +320,7 @@ jobs:
               for v in allv:
                   w.writerow([v.get("id"), v.get("package"), v.get("version"), v.get("severity"), v.get("source"), v.get("description")])
           PY
+
       ##############################
       # Create libraries list (libraries.json + csv) in project-src/
       ##############################
@@ -302,6 +353,7 @@ jobs:
               for l in libs:
                   w.writerow([l.get("name"), l.get("version"), l.get("purl"), l.get("supplier")])
           PY
+
       ##############################
       # NTIA + BSI V2 + SCORE (write JSON outputs)
       ##############################
@@ -326,6 +378,7 @@ jobs:
               score /sbom/merged-sbom.json --json \
             > project-src/score.json \
             || echo '{"error":true}' > project-src/score.json
+
       ##############################
       # Sanitize artifact name and upload all project-src files
       ##############################
@@ -443,10 +496,12 @@ jobs:
               df = pd.DataFrame(columns=["repo_name","engine","ntia_sha256","bsi_v2_sha256","timestamp"])
           else:
               df = pd.DataFrame(rows)
-          df.to_csv("summary.csv", index=False)
+          outdir = "sbom-reports"
+          os.makedirs(outdir, exist_ok=True)
+          df.to_csv(os.path.join(outdir,"summary.csv"), index=False)
           PY
       - name: Upload summary.csv
         uses: actions/upload-artifact@v4
         with:
           name: sbom-summary
-          path: summary.csv
+          path: sbom-reports/summary.csv
