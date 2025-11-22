@@ -62,16 +62,9 @@ jobs:
       - name: Install base deps
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm 
+          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm docker.io
           pip install --upgrade pip
           pip install cyclonedx-bom pandas
-
-      - name: Install Docker (safe for Ubuntu 24.04)
-        run: |
-          # Use official Docker installer to avoid containerd.io conflicts
-          curl -fsSL https://get.docker.com | sh
-          sudo systemctl enable --now docker || true
-          sudo usermod -aG docker $USER || true
       - name: Install Trivy
         run: |
           curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
@@ -450,15 +443,10 @@ jobs:
               df = pd.DataFrame(columns=["repo_name","engine","ntia_sha256","bsi_v2_sha256","timestamp"])
           else:
               df = pd.DataFrame(rows)
-          df.to_csv("sbom-reports/summary.csv", index=False)
+          df.to_csv("summary.csv", index=False)
           PY
-      - name: Move aggregated outputs into sbom-reports folder
-        run: |
-          mkdir -p sbom-reports
-          mv summary.csv sbom-reports/ || true
-
-      - name: Upload sbom-reports folder
+      - name: Upload summary.csv
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-reports
-          path: sbom-reports
+          name: sbom-summary
+          path: summary.csv
