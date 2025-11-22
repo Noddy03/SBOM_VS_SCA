@@ -1,15 +1,18 @@
-# GitHub Actions workflow: SBOM scan (cdxgen primary, syft enrich, trivy analyzer, conan optional)
+# Cleaned and corrected GitHub Actions SBOM workflow
+# (cdxgen primary, syft enricher, trivy analyzer, conan optional, automatic repo fetch)
+
 name: SBOM Matrix Scan (cdxgen-primary, trivy-analyzer, syft-enrich)
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Programming language filter"
+        description: "C++,Python,Java"
         required: true
         default: "C++"
 
 jobs:
+
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -17,7 +20,8 @@ jobs:
     steps:
       - name: Install jq
         run: sudo apt-get update -y && sudo apt-get install -y jq
-      - name: Fetch repositories (same logic as original YAML)
+
+      - name: Fetch repositories (top 100)
         id: fetch
         env:
           LANG: ${{ github.event.inputs.language }}
@@ -25,385 +29,219 @@ jobs:
         run: |
           set -euo pipefail
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
-          REPOS=$(gh api -X GET /search/repositories \
-              --raw-field q="$RAW_Q" \
-              --raw-field sort=stars \
-              --raw-field order=desc \
-              --raw-field per_page=100 \
-              --jq '.items[].full_name' || true)
+          REPOS=$(gh api -X GET /search/repositories               --raw-field q="$RAW_Q"               --raw-field sort=stars               --raw-field order=desc               --raw-field per_page=100               --jq '.items[].full_name' || true)
+
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
-            REPOS=$(gh api -X GET /search/repositories \
-              --raw-field q="$RAW_Q" \
-              --raw-field sort=stars \
-              --raw-field order=desc \
-              --raw-field per_page=100 \
-              --jq '.items[].full_name' || true)
+            REPOS=$(gh api -X GET /search/repositories               --raw-field q="$RAW_Q"               --raw-field sort=stars               --raw-field order=desc               --raw-field per_page=100               --jq '.items[].full_name' || true)
           fi
+
           JSON_ARRAY=$(printf "%s
-" "$REPOS" | jq -R -s -c 'split("
-")[:-1]')
+" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
+
 
   sbom_scan:
     needs: fetch_top_repos
-  sbom_scan:
     runs-on: ubuntu-latest
+
     strategy:
+      fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
-        fail-fast: false
 
     steps:
-      - name: Setup tools
+
+      - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y python3-pip jq git curl npm || true
+          sudo apt-get install -y python3-pip jq git curl wget npm || true
           pip3 install --upgrade pip || true
 
-      - name: Install Syft
+      - name: Install Syft (enricher)
         run: |
           mkdir -p $HOME/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b $HOME/bin || true
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh             | sh -s -- -b $HOME/bin || true
           echo "$HOME/bin" >> $GITHUB_PATH || true
-          syft version || true
 
-      - name: Try install cdxgen via npm (fallback to docker)
+      - name: Install Trivy (analyzer)
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh             | sudo sh -s -- -b /usr/local/bin || true
+
+      - name: Install cdxgen (primary SBOM generator)
         run: |
           if npm --version >/dev/null 2>&1; then
             sudo npm install -g @cyclonedx/cdxgen || true
           fi
-          if command -v cdxgen >/dev/null 2>&1; then
-            rm -f /tmp/cdxgen_fallback || true
-          else
+          if ! command -v cdxgen >/dev/null 2>&1; then
             echo "docker" > /tmp/cdxgen_fallback
           fi
 
-      - name: Install Trivy
-        run: |
-          sudo apt-get install -y wget || true
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin || true
-          trivy --version || true
-
-      ##############################
-      # Checkout target repository reliably
-      ##############################
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
           path: project-src
 
-      - name: Sanity list
-        run: |
-          echo "Top of project-src:"
-          ls -la project-src | sed -n '1,200p'
-
-      - name: GitHub license metadata
+      - name: GH License metadata
         env:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api "/repos/$REPO/license" > project-src/gh-license.json 2>/dev/null || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
+          gh api "/repos/$REPO/license" > project-src/gh-license.json 2>/dev/null             || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
 
       - name: Detect local license file
         run: |
-          FILE=$(find project-src -maxdepth 6 -type f -iregex ".*(LICENSE|COPYING|COPYRIGHT|LICENSE.md|LICENSE.txt)" | head -1)
+          FILE=$(find project-src -maxdepth=6 -type f -iregex ".*LICENSE.*" | head -1)
           if [ -n "$FILE" ]; then cp "$FILE" project-src/local-license.txt; else echo "" > project-src/local-license.txt; fi
 
-      ##############################
-      # SBOM generators
-      # 1) cdxgen (primary)
-      ##############################
-      - name: cdxgen SBOM (primary)
+
+      ###################################################
+      # SBOM GENERATION (cdxgen primary)
+      ###################################################
+
+      - name: Generate SBOM with cdxgen (primary)
         run: |
-          set -euo pipefail
-          if [ -f /tmp/cdxgen_fallback ] && grep -q docker /tmp/cdxgen_fallback 2>/dev/null; then
-            sudo docker run --rm -v "$PWD/project-src:/app:ro" ghcr.io/cyclonedx/cdxgen:latest cdxgen -o /app/cdxgen-sbom.json /app || echo '{"components":[]}' > project-src/cdxgen-sbom.json
+          if [ -f /tmp/cdxgen_fallback ]; then
+            docker run --rm -v "$PWD/project-src:/app" ghcr.io/cyclonedx/cdxgen:latest               cdxgen -o /app/cdxgen-sbom.json /app               || echo '{"components":[]}' > project-src/cdxgen-sbom.json
           else
-            if command -v cdxgen >/dev/null 2>&1; then
-              cdxgen -o project-src/cdxgen-sbom.json project-src || echo '{"components":[]}' > project-src/cdxgen-sbom.json
-            else
-              echo '{"components":[]}' > project-src/cdxgen-sbom.json
-            fi
+            cdxgen -o project-src/cdxgen-sbom.json project-src               || echo '{"components":[]}' > project-src/cdxgen-sbom.json
           fi
 
-      ##############################
-      # 2) Syft (enricher)
-      ##############################
-      - name: Syft FS SBOM (enricher)
+      - name: Syft SBOM (enrichment)
         run: |
-          set -euo pipefail
-          syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json || echo '{"components":[]}' > project-src/syft-sbom.json
+          syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json             || echo '{"components":[]}' > project-src/syft-sbom.json
 
-      ##############################
-      # 3) Trivy FS (lightweight) - will also be used for vulnerabilities
-      ##############################
-      - name: Trivy FS SBOM (fallback / extra info)
+      - name: Trivy SBOM (fallback/enhancer)
         run: |
-          set -euo pipefail
-          trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src || echo '{"components":[]}' > project-src/trivy-fs.json
+          trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src             || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      ##############################
-      # Conan optional: run only if conanfile.* exists
-      ##############################
-      - name: Conan SBOM (optional)
+      - name: Conan optional
         run: |
-          set -euo pipefail
           cd project-src || exit 0
           if ls conanfile.* >/dev/null 2>&1; then
             conan profile detect --force || true
             conan graph info . --format=json > conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
           else
             echo '{"components":[]}' > conan-sbom.json
-            echo "No conanfile.* found; skipping conan"
           fi
 
-      ##############################
-      # Normalize SBOM arrays to ensure 'components' exists
-      ##############################
-      - name: Normalize SBOM arrays
-        run: |
-          for f in project-src/trivy-fs.json project-src/syft-sbom.json project-src/cdxgen-sbom.json project-src/conan-sbom.json; do
-            if [ -f "$f" ]; then
-              jq 'if has("components") then . else (. + {components: []}) end | .components |= (if type=="array" then . else [] end)' "$f" > tmp && mv tmp "$f"
-            else
-              echo '{"components":[]}' > "$f"
-            fi
-          done
 
-      ##############################
-      # MERGE SBOMs: cdxgen primary, syft enrich, trivy enhance, conan optional (only new)
-      ##############################
-      - name: Merge SBOMs (cdxgen primary, syft enrich, trivy enhance, conan optional)
+      ###################################################
+      # MERGE SBOMs (cdxgen → syft → trivy → conan)
+      ###################################################
+
+      - name: Merge SBOMs
         run: |
           python3 <<'PY'
-          import json, os, copy
+import json, os, copy
 
-          def load(p):
-              try:
-                  return json.load(open(p))
-              except:
-                  return {"components": []}
+def load(p):
+    try: return json.load(open(p))
+    except: return {"components": []}
 
-          cdx = load('project-src/cdxgen-sbom.json')
-          syf = load('project-src/syft-sbom.json')
-          tri = load('project-src/trivy-fs.json')
-          con = load('project-src/conan-sbom.json')
+cdx = load("project-src/cdxgen-sbom.json")
+syf = load("project-src/syft-sbom.json")
+tri = load("project-src/trivy-fs.json")
+con = load("project-src/conan-sbom.json")
 
-          ccom = cdx.get('components',[]) or []
-          scom = syf.get('components',[]) or []
-          tcom = tri.get('components',[]) or []
-          gcom = con.get('components',[]) or []
+ccom = cdx["components"]
+scom = syf["components"]
+tcom = tri["components"]
+gcom = con["components"]
 
-          def key_nv(c):
-              return (c.get('name'), c.get('version'))
+def key_nv(c): return (c.get("name"), c.get("version"))
 
-          def deep_merge(base, src):
-              for k in ['supplier','purl','type','copyright','evidence','properties','externalReferences','hashes','licenses']:
-                  b = base.get(k)
-                  s = src.get(k)
-                  if not b and s:
-                      base[k] = copy.deepcopy(s)
-                      continue
-                  if isinstance(b, list) and isinstance(s, list):
-                      seen = {json.dumps(x, sort_keys=True) for x in b}
-                      for item in s:
-                          key = json.dumps(item, sort_keys=True)
-                          if key not in seen:
-                              b.append(item)
-                      base[k] = b
-              # also copy over any other fields that are missing
-              for k,v in src.items():
-                  if k not in base or base.get(k) in (None,''):
-                      base[k] = copy.deepcopy(v)
-              return base
+def deep_merge(base, src):
+    for k in [
+        "supplier","purl","type","copyright",
+        "evidence","properties","externalReferences",
+        "hashes","licenses"
+    ]:
+        b = base.get(k)
+        s = src.get(k)
+        if not b and s:
+            base[k] = copy.deepcopy(s)
+        elif isinstance(b, list) and isinstance(s, list):
+            seen = {json.dumps(x, sort_keys=True) for x in b}
+            for item in s:
+                if json.dumps(item, sort_keys=True) not in seen:
+                    b.append(item)
+    for k,v in src.items():
+        if k not in base or base[k] in (None,""):
+            base[k] = copy.deepcopy(v)
+    return base
 
-          merged = {}
+merged = {}
 
-          # 1) cdxgen primary
-          for c in ccom:
-              p = c.get('purl')
-              if p:
-                  merged[p] = copy.deepcopy(c)
-              else:
-                  merged[key_nv(c)] = copy.deepcopy(c)
+# cdxgen primary
+for c in ccom:
+    p = c.get("purl")
+    merged[p or key_nv(c)] = copy.deepcopy(c)
 
-          # 2) syft enrich
-          for c in scom:
-              p = c.get('purl')
-              if p and p in merged:
-                  merged[p] = deep_merge(merged[p], c)
-              else:
-                  nv = key_nv(c)
-                  if nv in merged:
-                      merged[nv] = deep_merge(merged[nv], c)
-                  else:
-                      if p:
-                          merged[p] = copy.deepcopy(c)
-                      else:
-                          merged[nv] = copy.deepcopy(c)
+# syft enrich
+for c in scom:
+    p = c.get("purl")
+    k = p if p in merged else key_nv(c)
+    if k in merged:
+        merged[k] = deep_merge(merged[k], c)
+    else:
+        merged[k] = copy.deepcopy(c)
 
-          # 3) trivy enhance (do not override; only fill)
-          for c in tcom:
-              p = c.get('purl')
-              nv = key_nv(c)
-              target = None
-              if p and p in merged:
-                  target = merged[p]
-              elif nv in merged:
-                  target = merged[nv]
-              if target:
-                  merged_val = deep_merge(target, c)
-                  # prefer existing purl if trivy's is missing
-                  merged[p if p in merged else nv] = merged_val
-              else:
-                  # only add if trivy has a name (avoid empty placeholders)
-                  if c.get('name'):
-                      if p:
-                          merged[p] = copy.deepcopy(c)
-                      else:
-                          merged[nv] = copy.deepcopy(c)
+# trivy enhance
+for c in tcom:
+    p = c.get("purl")
+    k = p if p in merged else key_nv(c)
+    if k in merged:
+        merged[k] = deep_merge(merged[k], c)
+    else:
+        if c.get("name"):
+            merged[k] = copy.deepcopy(c)
 
-          # 4) conan optional: add only if new (do not override)
-          for c in gcom:
-              p = c.get('purl')
-              nv = key_nv(c)
-              if (p and p in merged) or (nv in merged):
-                  continue
-              if p:
-                  merged[p] = copy.deepcopy(c)
-              else:
-                  merged[nv] = copy.deepcopy(c)
+# conan optional
+for c in gcom:
+    p = c.get("purl")
+    k = p or key_nv(c)
+    if k not in merged:
+        merged[k] = copy.deepcopy(c)
 
-          final_components = list(merged.values())
+final_components = list(merged.values())
 
-          repo_license = ''
-          if os.path.exists('project-src/final_license.txt'):
-              repo_license = open('project-src/final_license.txt').read().strip()
+# license
+repo_license = ""
+if os.path.exists("project-src/local-license.txt"):
+    txt = open("project-src/local-license.txt").read().strip()
+    if "SPDX" in txt:
+        repo_license = txt
 
-          out = {'repo_license': repo_license, 'components': final_components}
-          json.dump(out, open('project-src/merged-sbom.json','w'), indent=2)
-          PY
+out = {"repo_license": repo_license, "components": final_components}
+json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
+PY
 
-      ##############################
-      # Determine final license and ensure merged-sbom contains it
-      ##############################
-      - name: Determine final repository license
+
+      ###################################################
+      # TRIVY VULNERABILITY SCAN (main analyzer)
+      ###################################################
+
+      - name: Trivy SBOM vuln scan
         run: |
-          GH=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
-          FILE=$(grep -Eo "SPDX-License-Identifier:\s*[A-Za-z0-9.\-+]+" project-src/local-license.txt | head -1 | awk -F': ' '{print $2}')
-          FINAL="${GH:-$FILE}"
-          [ -z "$FINAL" ] && FINAL="NOASSERTION"
-          echo "$FINAL" > project-src/final_license.txt
+          trivy sbom --format json --vuln-type library,os             -o project-src/vulnerabilities_sbom.json             project-src/merged-sbom.json             || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
 
-      - name: Ensure merged-sbom.json contains repo_license
-        run: |
-          L=$(cat project-src/final_license.txt)
-          jq --arg lic "$L" '.repo_license = $lic' project-src/merged-sbom.json > tmp && mv tmp project-src/merged-sbom.json || true
 
-      ##############################
-      # Trivy SBOM vulnerability scan using the merged SBOM (Trivy as main analyser)
-      ##############################
-      - name: Trivy SBOM vulnerability scan (use merged SBOM)
-        run: |
-          set -euo pipefail
-          trivy sbom --format json --vuln-type library,os -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
+      ###################################################
+      # ARTIFACT UPLOAD
+      ###################################################
 
-      - name: Trivy FS vulnerability scan (filesystem)
-        run: |
-          set -euo pipefail
-          trivy fs --format json --vuln-type library,os -o project-src/vulnerabilities_fs.json project-src || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
-
-      ##############################
-      # Create unified vulnerabilities list (json + csv)
-      ##############################
-      - name: Create unified vulnerabilities list (json + csv)
-        run: |
-          python3 <<'PY'
-          import json, csv
-          def extract(path, source):
-              try:
-                  data=json.load(open(path))
-              except:
-                  return []
-              vulns=[]
-              for r in data.get('Results',[]):
-                  for v in r.get('Vulnerabilities',[]) or []:
-                      vulns.append({
-                          'id': v.get('VulnerabilityID'),
-                          'package': v.get('PkgName'),
-                          'version': v.get('InstalledVersion'),
-                          'severity': v.get('Severity'),
-                          'cvss': v.get('CVSS',{}),
-                          'description': (v.get('Description') or '').strip(),
-                          'source': source
-                      })
-              return vulns
-          fs = extract('project-src/vulnerabilities_fs.json','filesystem')
-          sb = extract('project-src/vulnerabilities_sbom.json','sbom')
-          allv = fs + sb
-          json.dump(allv, open('project-src/vulnerabilities.json','w'), indent=2)
-          with open('project-src/vulnerabilities.csv','w', newline='') as f:
-              w = csv.writer(f)
-              w.writerow(['id','package','version','severity','source','description'])
-              for v in allv:
-                  w.writerow([v.get('id'), v.get('package'), v.get('version'), v.get('severity'), v.get('source'), v.get('description')])
-          PY
-
-      ##############################
-      # Create libraries list (json + csv)
-      ##############################
-      - name: Create libraries list (json + csv)
-        run: |
-          python3 <<'PY'
-          import json, csv
-          try:
-              data=json.load(open('project-src/merged-sbom.json'))
-          except:
-              data={'components':[]}
-          libs=[]
-          for c in data.get('components',[]):
-              supplier=None
-              supp=c.get('supplier')
-              if isinstance(supp, dict):
-                  supplier=supp.get('name')
-              elif supp:
-                  supplier=supp
-              libs.append({'name':c.get('name'),'version':c.get('version'),'purl':c.get('purl'),'supplier':supplier})
-          json.dump(libs, open('project-src/libraries.json','w'), indent=2)
-          with open('project-src/libraries.csv','w', newline='') as f:
-              w=csv.writer(f)
-              w.writerow(['name','version','purl','supplier'])
-              for l in libs:
-                  w.writerow([l.get('name'), l.get('version'), l.get('purl'), l.get('supplier')])
-          PY
-
-      - name: NTIA compliance (json)
-        run: |
-          set -euo pipefail
-          (sudo docker run --rm -v "$PWD/project-src:/sbom" ghcr.io/interlynk-io/sbomqs compliance --ntia --format json /sbom/merged-sbom.json > project-src/compliance_NTIA.json) || (echo '{"error":true}' > project-src/compliance_NTIA.json)
-
-      - name: BSI-V2 compliance (json)
-        run: |
-          set -euo pipefail
-          (sudo docker run --rm -v "$PWD/project-src:/sbom" ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --format json /sbom/merged-sbom.json > project-src/compliance_BSI.json) || (echo '{"error":true}' > project-src/compliance_BSI.json)
-
-      - name: SBOM Score (json)
-        run: |
-          set -euo pipefail
-          (sudo docker run --rm -v "$PWD/project-src:/sbom" ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json > project-src/score.json) || (echo '{"error":true}' > project-src/score.json)
-
-      - name: Sanitize artifact name
-        id: sanitize
+      - name: Prepare artifact
+        id: prep
         run: |
           SAFE="${{ matrix.repo }}"
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
 
-      - name: Upload results (per-repo artifact)
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-reports-${{ steps.sanitize.outputs.name }}
+          name: sbom-${{ steps.prep.outputs.name }}
           path: project-src/**
           if-no-files-found: warn
