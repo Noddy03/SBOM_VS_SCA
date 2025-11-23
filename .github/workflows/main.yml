@@ -363,3 +363,99 @@ jobs:
         with:
           name: ${{ steps.sanitize.outputs.name }}
           path: project-src
+
+      - name: Create summary.csv
+        run: |
+          python3 << 'PY'
+          import json, csv, os
+
+          repo = "${{ matrix.repo }}"
+
+          # Load merged SBOM
+          try:
+              sbom = json.load(open("project-src/merged-sbom.json"))
+              comp_count = len(sbom.get("components", []))
+              repo_license = sbom.get("repo_license", "NOASSERTION")
+          except:
+              comp_count = 0
+              repo_license = "NOASSERTION"
+
+          # Load vulns FS
+          try:
+              vfs = json.load(open("project-src/vulnerabilities_fs.json"))
+              vfs_count = sum(len(r.get("Vulnerabilities", []) or []) for r in vfs.get("Results", []))
+          except:
+              vfs_count = 0
+
+          # Load vulns SBOM
+          try:
+              vsb = json.load(open("project-src/vulnerabilities_sbom.json"))
+              vsb_count = sum(len(r.get("Vulnerabilities", []) or []) for r in vsb.get("Results", []))
+          except:
+              vsb_count = 0
+
+          # Severity breakdown
+          high = 0
+          critical = 0
+          for src in ("vulnerabilities_fs.json", "vulnerabilities_sbom.json"):
+              try:
+                  d = json.load(open(f"project-src/{src}"))
+                  for r in d.get("Results", []):
+                      for v in r.get("Vulnerabilities", []) or []:
+                          sev = (v.get("Severity") or "").upper()
+                          if sev == "HIGH": high += 1
+                          if sev == "CRITICAL": critical += 1
+              except:
+                  pass
+
+          # SBOM Score
+          try:
+              score = json.load(open("project-src/score.json")).get("score", None)
+          except:
+              score = None
+
+          # NTIA pass?
+          try:
+              ntia = json.load(open("project-src/compliance_NTIA.json"))
+              ntia_pass = "error" not in ntia
+          except:
+              ntia_pass = False
+
+          # BSI pass?
+          try:
+              bsi = json.load(open("project-src/compliance_BSI.json"))
+              bsi_pass = "error" not in bsi
+          except:
+              bsi_pass = False
+
+          # Write CSV
+          with open("project-src/summary.csv", "w", newline="") as f:
+              w = csv.writer(f)
+              w.writerow([
+                  "repo",
+                  "repo_license",
+                  "component_count",
+                  "vuln_fs_total",
+                  "vuln_sbom_total",
+                  "vuln_total",
+                  "vuln_high",
+                  "vuln_critical",
+                  "score_value",
+                  "ntia_pass",
+                  "bsi_pass"
+              ])
+              w.writerow([
+                  repo,
+                  repo_license,
+                  comp_count,
+                  vfs_count,
+                  vsb_count,
+                  vfs_count + vsb_count,
+                  high,
+                  critical,
+                  score,
+                  ntia_pass,
+                  bsi_pass
+              ])
+          PY
+
