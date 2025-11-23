@@ -277,7 +277,7 @@ jobs:
               print("SBOM_VALID")
           except Exception as e:
               print("SBOM_VALIDATION_ERROR", e)
-          PY || true
+          PY 
 
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
