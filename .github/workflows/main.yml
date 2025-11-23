@@ -236,7 +236,7 @@ jobs:
       - name: Ensure merged-sbom contains license
         run: |
           GH=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
-          FILE=$(grep -Eo "SPDX-License-Identifier:\\s*[A-Za-z0-9.\\-+]+" project-src/local-license.txt | head -1 | awk -F': ' '{print $2}')
+          FILE=$(grep -Eo "SPDX-License-Identifier:\\s*[A-Za-z0-9.+-]+" project-src/local-license.txt | head -1 | awk -F': ' '{print $2}')
           FINAL="${GH:-$FILE}"
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
@@ -469,7 +469,7 @@ jobs:
                           break
                       except:
                           local_txt = ""
-              m = re.search(r"SPDX-License-Identifier:\\s*([A-Za-z0-9.\\-+]+)", local_txt or "")
+              m = re.search(r"SPDX-License-Identifier:\\s*([A-Za-z0-9.+-]+)", local_txt or "")
               local_spdx = m.group(1) if m else ""
 
               final_license = ""
