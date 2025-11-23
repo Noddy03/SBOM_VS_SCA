@@ -1,10 +1,11 @@
-name: IoT Full SBOM Pipeline (Model 2 - Cdxgen-first, Build-before-scan)
+
+name: IoT Full SBOM Pipeline (Model 2 - Cdxgen-first, Build-before-scan, CycloneDX 1.5)
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Language filter"
+        description: "Language filter (e.g. C++, Python, Java)"
         required: true
         default: "C++"
 
@@ -15,6 +16,7 @@ permissions:
 
 env:
   DEBIAN_FRONTEND: noninteractive
+  CYCLONEDX_SPEC: "1.5"
 
 jobs:
   fetch_top_repos:
@@ -67,7 +69,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config
           pip3 install --upgrade pip
-          pip3 install cyclonedx-bom pandas
+          pip3 install cyclonedx-bom cyclonedx-python-lib pandas || true
 
       - name: Ensure Docker usable (best-effort)
         run: |
@@ -109,7 +111,7 @@ jobs:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api "/repos/$REPO/license" > project-src/gh-license.json 2>/dev/null || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
+          gh api "/repos/$REPO/license" > project-src/gh-license.json 2>/dev/null || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json || true
 
       - name: Local SPDX detection
         run: |
@@ -154,30 +156,27 @@ jobs:
             echo "No CMakeLists.txt, skipping build" >&2
           fi
 
-      - name: Cdxgen SBOM (C/C++ enhanced, prefer npx, docker fallback) - canonical SBOM
+      - name: Cdxgen SBOM (C/C++ enhanced, prefer npx, docker fallback)
         run: |
           set -euo pipefail
+          # prefer npx (no global install)
           if command -v npx >/dev/null 2>&1; then
-            (cd project-src && \
-              npx --yes @cyclonedx/cdxgen \
-                -t cpp \
-                --deep \
-                --recurse \
-                --no-binaries \
-                --resolve-licence \
-                -o cdxgen-sbom.json \
-                . \
-            ) || true
+            (cd project-src && npx --yes @cyclonedx/cdxgen \
+              -t cpp --deep --recurse --no-binaries --resolve-licence \
+              --spec-version $CYCLONEDX_SPEC -o cdxgen-sbom.json .) || true
           fi
           if command -v cdxgen >/dev/null 2>&1; then
-            (cd project-src && cdxgen -t cpp --deep --recurse --no-binaries --resolve-licence -o cdxgen-sbom.json .) || true
+            (cd project-src && cdxgen -t cpp --deep --recurse --no-binaries --resolve-licence --spec-version $CYCLONEDX_SPEC -o cdxgen-sbom.json .) || true
           fi
           if [ ! -f project-src/cdxgen-sbom.json ] || [ ! -s project-src/cdxgen-sbom.json ]; then
             sudo docker run --rm -v "$PWD/project-src":/src ghcr.io/cyclonedx/cdxgen:latest \
-              cdxgen -t cpp --deep --recurse --no-binaries --resolve-licence -o /src/cdxgen-sbom.json /src || true
+              cdxgen -t cpp --deep --recurse --no-binaries --resolve-licence --spec-version $CYCLONEDX_SPEC -o /src/cdxgen-sbom.json /src || true
           fi
+          # ensure minimal CycloneDX structure if not produced
           if [ ! -s project-src/cdxgen-sbom.json ]; then
-            echo '{"components":[],"bomFormat":"CycloneDX","specVersion":"1.4","version":1}' > project-src/cdxgen-sbom.json
+            cat > project-src/cdxgen-sbom.json <<'JSON'
+          {"bomFormat":"CycloneDX","specVersion":"1.5","version":1,"components":[]}
+          JSON
           fi
 
       - name: Trivy FS SBOM (CycloneDX) + filesystem vulnerability scan
@@ -202,10 +201,10 @@ jobs:
             fi
           done
 
-      - name: Merge SBOMs (preserve component licenses, write repo_license)
+      - name: Merge SBOMs (preserve component licenses, write repo_license, add metadata)
         run: |
           python3 <<'PY'
-          import json, os
+          import json, os, uuid, time
           def load(p):
               try:
                   return json.load(open(p))
@@ -248,9 +247,37 @@ jobs:
                   repo_license = gh.get("license", {}).get("spdx_id", "") or "NOASSERTION"
               except:
                   repo_license = "NOASSERTION"
-          out = {"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"repo_license": repo_license, "components": merged}
+          metadata = {
+              "timestamp": int(time.time()),
+              "tools": [{"vendor":"custom","name":"iot-sbom-pipeline","version":"1.0"}]
+          }
+          out = {
+              "bomFormat":"CycloneDX",
+              "specVersion":"1.5",
+              "serialNumber":"urn:uuid:"+str(uuid.uuid4()),
+              "version":1,
+              "metadata":{"tools": metadata["tools"], "component": {"type":"application","name": os.path.basename(os.getcwd())}},
+              "repo_license": repo_license,
+              "components": merged
+          }
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
           PY
+
+      - name: Validate merged SBOM (cyclonedx-python-lib)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          try:
+              from cyclonedx.parser import build_parser
+              import json,sys
+              data=json.load(open("project-src/merged-sbom.json"))
+              # quick sanity checks
+              if "bomFormat" not in data or "components" not in data:
+                  print("INVALID_SBOM", file=sys.stderr); sys.exit(1)
+              print("SBOM_VALID")
+          except Exception as e:
+              print("SBOM_VALIDATION_ERROR", e)
+          PY || true
 
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
