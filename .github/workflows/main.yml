@@ -306,7 +306,7 @@ jobs:
               w.writerow(['name','version','purl','supplier'])
               for l in libs:
                   w.writerow([l.get('name'), l.get('version'), l.get('purl'), l.get('supplier')])
-          PY
+PY
 
       - name: NTIA compliance
         run: |
@@ -469,7 +469,7 @@ jobs:
                           break
                       except:
                           local_txt = ""
-              m = re.search(r"SPDX-License-Identifier:\\s*([A-Za-z0-9.\\-+]+)", local_txt or "")
+              m = re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.+-]+)", local_txt or "")
               local_spdx = m.group(1) if m else ""
 
               final_license = ""
@@ -568,4 +568,4 @@ jobs:
               df = df.reindex(columns=cols, fill_value="")
           df.to_csv(os.path.join(outdir,"summary.csv"), index=False)
           print("Wrote", os.path.join(outdir,"summary.csv"))
-          PY
+PY
