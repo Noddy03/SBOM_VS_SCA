@@ -231,7 +231,7 @@ jobs:
 
           out = {"repo_license": repo_license, "components": final_components}
           json.dump(out, open("project-src/merged-sbom.json", "w"), indent=2)
-PY
+          PY
 
       - name: Ensure merged-sbom contains license
         run: |
@@ -281,7 +281,7 @@ PY
               w.writerow(['id','package','version','severity','source','description'])
               for v in allv:
                   w.writerow([v.get('id'), v.get('package'), v.get('version'), v.get('severity'), v.get('source'), v.get('description')])
-PY
+          PY
 
       - name: Create libraries list
         run: |
@@ -306,7 +306,7 @@ PY
               w.writerow(['name','version','purl','supplier'])
               for l in libs:
                   w.writerow([l.get('name'), l.get('version'), l.get('purl'), l.get('supplier')])
-PY
+          PY
 
       - name: NTIA compliance
         run: |
@@ -568,4 +568,4 @@ PY
               df = df.reindex(columns=cols, fill_value="")
           df.to_csv(os.path.join(outdir,"summary.csv"), index=False)
           print("Wrote", os.path.join(outdir,"summary.csv"))
-PY
+          PY
