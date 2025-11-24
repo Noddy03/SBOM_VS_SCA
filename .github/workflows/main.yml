@@ -68,7 +68,8 @@ jobs:
       - name: Install base deps
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder
+          # Added 'timeout' utility installation
+          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder timeout
           # Ensure cyclonedx-python-lib is installed for validation
           pip3 install --upgrade pip
           # Ensure the latest available version is installed
@@ -296,17 +297,23 @@ jobs:
       - name: Create and Run File Enrichment & Static Analysis Script
         run: |
           cat > project-src/enrich_and_scan.py <<'PY'
-          import os, json, hashlib, uuid, time, subprocess
+          import sys, os, json, hashlib, uuid, time, subprocess
           
           ROOT='project-src'
+          # Increased skip list for common build/dependency folders in C/C++ and IoT
           SKIP_DIR_NAMES={'build','build_output','cmake-build-debug','cmake-build-release',
-                          'sdk','toolchain','tools','espressif','esp-idf','components','.arduino','.cargo','.pio','.venv'}
+                          'sdk','toolchain','tools','espressif','esp-idf','components','.arduino','.cargo','.pio','.venv',
+                          'deps','downloads','vcpkg_installed','node_modules','vendor'}
           MAX_FILES=50000
           MAX_HASH_SIZE=5*1024*1024
           MAX_TOTAL_BYTES=1024*1024*1024
           MAX_DEPTH=10
           DIR_MAX_FILES=5000
           DIR_MAX_BYTES=200*1024*1024
+          
+          # Static Analysis Timeouts (in seconds)
+          CPPCHECK_TIMEOUT=300 # 5 minutes
+          FLAWFINDER_TIMEOUT=300 # 5 minutes
           
           def safe_dir_size_and_count(path):
               total=0; count=0
@@ -340,6 +347,7 @@ jobs:
           
           def sha256_file(p):
               h=hashlib.sha256()
+              # Reading in chunks is robust for large files, though limited by MAX_HASH_SIZE check earlier
               with open(p,'rb') as f:
                   for chunk in iter(lambda:f.read(8192),b''):
                       h.update(chunk)
@@ -347,21 +355,38 @@ jobs:
           
           files=[]; total_hash_bytes=0; skipped_dirs_sample=[]
           
+          # --- FILE DISCOVERY AND HASHING ---
           for dirpath, dirnames, filenames in os.walk(ROOT, followlinks=False):
+              # Prune dirnames list in place to skip subdirectories
+              dirnames[:] = [d for d in dirnames if not should_skip_dir(os.path.join(dirpath, d))]
+              
               rel=os.path.relpath(dirpath, ROOT); depth=0 if rel=='.' else rel.count(os.sep)+1
-              if depth>MAX_DEPTH: dirnames[:] = []; continue
-              if should_skip_dir(dirpath): skipped_dirs_sample.append(dirpath); dirnames[:] = []; continue
+              if depth>MAX_DEPTH: continue
+
               for fn in filenames:
                   full=os.path.join(dirpath, fn); size=os.path.getsize(full) if os.path.exists(full) else 0
+                  
+                  # Check if we should skip *this* file path's parent directory
+                  if should_skip_dir(dirpath): continue
+
                   entry={'path':os.path.relpath(full, ROOT), 'size': size}
+                  
+                  # Hash only if file size is reasonable and we haven't hit the total hash budget
                   if size <= MAX_HASH_SIZE and total_hash_bytes + size <= MAX_TOTAL_BYTES and not is_binary(full):
-                      try: entry['sha256'] = sha256_file(full); total_hash_bytes += size
-                      except: entry['sha256'] = None
-                  else: entry['sha256'] = None
+                      try: 
+                          entry['sha256'] = sha256_file(full); 
+                          total_hash_bytes += size
+                      except Exception as e: 
+                          print(f"Warning: Failed to hash {full}. Error: {e}", file=sys.stderr)
+                          entry['sha256'] = None
+                  else: 
+                      entry['sha256'] = None
+
                   files.append(entry)
                   if len(files) >= MAX_FILES: break
               if len(files) >= MAX_FILES: break
           
+          # --- SBOM ENRICHMENT ---
           try: data = json.load(open(os.path.join(ROOT,'merged-sbom.json')))
           except: data = {'components': [], 'metadata': {}}
           
@@ -399,22 +424,55 @@ jobs:
           json.dump(data, open(os.path.join(ROOT,'merged-sbom.json'), 'w'), indent=2)
           print('File enrichment added', len(files), 'files')
           
+          # --- STATIC ANALYSIS (WITH TIMEOUTS) ---
+          
+          # Cppcheck
           try:
               hashed_count = sum(1 for f in files if f.get('sha256'))
               if hashed_count <= 5000:
-                  cmd = ['cppcheck','--enable=warning,style,performance,portability,information,missingInclude','--inline-suppr','--xml-version=2', ROOT]
+                  print(f"Starting cppcheck scan (timeout {CPPCHECK_TIMEOUT}s)...")
+                  # Use 'timeout' utility to enforce a strict limit
+                  cmd = ['timeout', str(CPPCHECK_TIMEOUT), 'cppcheck','--enable=warning,style,performance,portability,information,missingInclude','--inline-suppr','--xml-version=2', ROOT]
+                  # We use a shell-wrapped call to handle the 'timeout' utility gracefully
                   out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                  
+                  if out.returncode == 124: # 124 is the return code for 'timeout' expiring
+                      print("Warning: cppcheck timed out.", file=sys.stderr)
+                  elif out.returncode != 0 and out.returncode != 1: # cppcheck often exits with 0 or 1 on success/minor issues
+                      print(f"Warning: cppcheck exited with code {out.returncode}", file=sys.stderr)
+                      
+                  # Write the raw output (either successful or truncated)
                   open(os.path.join(ROOT,'cppcheck_raw.xml'),'wb').write(out.stderr)
+                  # Create empty JSON placeholder
                   json.dump([], open(os.path.join(ROOT,'cppcheck.json'),'w')) 
-              else: json.dump([], open(os.path.join(ROOT,'cppcheck.json'),'w'))
-          except Exception: json.dump([], open(os.path.join(ROOT,'cppcheck.json'),'w'))
+              else: 
+                  print(f"Skipping cppcheck: {hashed_count} files > 5000 limit")
+                  json.dump([], open(os.path.join(ROOT,'cppcheck.json'),'w'))
+          except Exception as e: 
+              print(f"Error during cppcheck execution: {e}", file=sys.stderr)
+              json.dump([], open(os.path.join(ROOT,'cppcheck.json'),'w'))
           
+          # Flawfinder
           try:
               if len(files) <= 20000:
-                  out = subprocess.run(['flawfinder','--quiet','--dataonly', ROOT], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                  print(f"Starting flawfinder scan (timeout {FLAWFINDER_TIMEOUT}s)...")
+                  # Use 'timeout' utility to enforce a strict limit
+                  cmd = ['timeout', str(FLAWFINDER_TIMEOUT), 'flawfinder','--quiet','--dataonly', ROOT]
+                  out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+
+                  if out.returncode == 124:
+                      print("Warning: flawfinder timed out.", file=sys.stderr)
+                  elif out.returncode != 0:
+                      print(f"Warning: flawfinder exited with code {out.returncode}", file=sys.stderr)
+                      
+                  # Create empty JSON placeholder (The output format of flawfinder --dataonly is hard to parse reliably)
                   json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w')) 
-              else: json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'))
-          except Exception: json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'))
+              else: 
+                  print(f"Skipping flawfinder: {len(files)} files > 20000 limit")
+                  json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'))
+          except Exception as e: 
+              print(f"Error during flawfinder execution: {e}", file=sys.stderr)
+              json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'))
           
           PY
           python3 project-src/enrich_and_scan.py || true
@@ -561,12 +619,31 @@ jobs:
                   w.writerow([l.get("name"), l.get("version"), l.get("purl"), l.get("supplier")])
           PY
 
-      - name: NTIA/BSI Compliance Checks
+      - name: NTIA/BSI Compliance Checks 🛠️
         run: |
-          # The SBOM should now pass schema validation, allowing sbomqs to proceed beyond the initial error check.
-          (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --format json /sbom/merged-sbom.json > project-src/compliance_NTIA.json) || echo '{"error":true}' > project-src/compliance_NTIA.json
-          (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --format json /sbom/merged-sbom.json > project-src/compliance_BSI.json) || echo '{"error":true}' > project-src/compliance_BSI.json
-          (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json > project-src/score.json) || echo '{"error":true}' > project-src/score.json
+          # The SBOM should now pass schema validation, allowing sbomqs to proceed.
+          # Temporarily disable 'exit on error' for sbomqs commands, as they return non-zero
+          # on compliance failure, but we still want the JSON report they write to stdout.
+          set +e 
+          
+          # Run NTIA compliance check and capture full output
+          sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --format json /sbom/merged-sbom.json > project-src/compliance_NTIA.json 2>/dev/null
+          
+          # Run BSI V2 compliance check and capture full output
+          sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --format json /sbom/merged-sbom.json > project-src/compliance_BSI.json 2>/dev/null
+          
+          # Run score calculation and capture full output
+          sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json > project-src/score.json 2>/dev/null
+          
+          # Re-enable 'exit on error'
+          set -e
+          
+          # Fallback: Ensure all files exist and are not empty, otherwise write a structured error JSON.
+          for f in project-src/compliance_NTIA.json project-src/compliance_BSI.json project-src/score.json; do
+              if [ ! -s "$f" ]; then
+                  echo '{"error":true, "reason":"sbomqs command failed to produce non-empty output"}' > "$f"
+              fi
+          done
 
       - name: Create per-repo summary.csv
         run: |
@@ -604,6 +681,8 @@ jobs:
               try:
                   d = json.load(open(fname))
                   # Check if the result array exists and pass is explicitly true
+                  # This works because the fixed compliance step now guarantees a valid JSON structure 
+                  # (either the full report or the structured error fallback)
                   return 'true' if 'results' in d and isinstance(d['results'], list) and any(res.get('pass') == True for res in d['results']) else 'false'
               except:
                   return 'false'
