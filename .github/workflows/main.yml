@@ -181,7 +181,7 @@ jobs:
               echo '{"components":[]}' > "$f"
             fi
           done
-            - name: Merge SBOMs (NTIA/BSI enriched)
+      - name: Merge SBOMs (NTIA/BSI enriched)
         run: |
           set -euo pipefail
           cat > project-src/merged_and_enrich.py <<'PY'
