@@ -458,7 +458,7 @@ jobs:
           PY
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
-      - name: Validate merged SBOM against CycloneDX Schema ✅ (Final Fix: String Validation)
+      - name: Validate merged SBOM against CycloneDX Schema ✅ (Final Fix String Validation)
         run: |
           set -euo pipefail
           python3 <<'PY'
