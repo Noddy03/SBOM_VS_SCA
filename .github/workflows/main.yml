@@ -186,8 +186,6 @@ jobs:
             fi
           done
       
-      # FIX: Removed the failing base64 step here.
-      
       - name: Merge and Enrich SBOM (NTIA/BSI-compliant)
         run: |
           cat > project-src/merged_and_enrich.py <<'PY'
@@ -650,8 +648,16 @@ jobs:
       - name: NTIA compliance (json)
         run: |
           set -euo pipefail
-          # Temporarily disable 'set -e' so a non-compliant SBOM (non-zero exit code) doesn't fail the step, 
-          # but we still capture the JSON output.
+          
+          SBOM_FILE="project-src/merged-sbom.json"
+          # Check if the SBOM file exists and is not empty
+          if [ ! -s "$SBOM_FILE" ]; then
+            echo "ERROR: SBOM file $SBOM_FILE is missing or empty. Skipping NTIA compliance check." >&2
+            echo '{"error":true, "reason":"Input SBOM file missing or empty"}' > project-src/compliance_NTIA.json
+            exit 0 # Exit successfully since the failure is handled
+          fi
+          
+          # Temporarily disable 'set -e' so a non-compliant SBOM (non-zero exit code) doesn't fail the step.
           set +e
           # 1. Run the command and redirect output to a temporary file
           sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --format json /sbom/merged-sbom.json > project-src/compliance_NTIA.json.tmp
@@ -659,7 +665,6 @@ jobs:
           set -e # Re-enable 'set -e'
           
           # 2. Check if the command failed AND the temp file is empty/missing.
-          # If it produced output (even with a non-zero exit code), use the output.
           if [ $EXIT_CODE -ne 0 ] && [ ! -s project-src/compliance_NTIA.json.tmp ]; then
             echo '{"error":true, "reason":"sbomqs command failed or produced no output"}' > project-src/compliance_NTIA.json
           else
@@ -670,8 +675,16 @@ jobs:
       - name: BSI-V2 compliance (json)
         run: |
           set -euo pipefail
-          # Temporarily disable 'set -e' so a non-compliant SBOM (non-zero exit code) doesn't fail the step, 
-          # but we still capture the JSON output.
+          
+          SBOM_FILE="project-src/merged-sbom.json"
+          # Check if the SBOM file exists and is not empty
+          if [ ! -s "$SBOM_FILE" ]; then
+            echo "ERROR: SBOM file $SBOM_FILE is missing or empty. Skipping BSI compliance check." >&2
+            echo '{"error":true, "reason":"Input SBOM file missing or empty"}' > project-src/compliance_BSI.json
+            exit 0 # Exit successfully since the failure is handled
+          fi
+          
+          # Temporarily disable 'set -e' so a non-compliant SBOM (non-zero exit code) doesn't fail the step.
           set +e
           # 1. Run the command and redirect output to a temporary file
           sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --format json /sbom/merged-sbom.json > project-src/compliance_BSI.json.tmp
@@ -679,10 +692,10 @@ jobs:
           set -e # Re-enable 'set -e'
           
           # 2. Check if the command failed AND the temp file is empty/missing.
-          # If it produced output (even with a non-zero exit code), use the output.
           if [ $EXIT_CODE -ne 0 ] && [ ! -s project-src/compliance_BSI.json.tmp ]; then
             echo '{"error":true, "reason":"sbomqs command failed or produced no output"}' > project-src/compliance_BSI.json
           else
+            # On success (or output creation), move the temp file
             mv project-src/compliance_BSI.json.tmp project-src/compliance_BSI.json
           fi
           echo "BSI Compliance Report written."
