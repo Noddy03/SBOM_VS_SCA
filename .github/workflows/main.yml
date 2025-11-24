@@ -482,23 +482,26 @@ jobs:
         run: |
           pip install --upgrade cyclonedx-python-lib
 
-
-
-      - name: Validate merged SBOM (cyclonedx-python-lib friendly)
+      - name: Validate merged SBOM (CycloneDX 1.5)
         run: |
           set -euo pipefail
           python3 <<'PY'
-          import json, sys
-          from cyclonedx.parser import build_parser
+          import sys, json
+          from cyclonedx.parser.json import JsonParser
 
           try:
-              data = json.load(open("project-src/merged-sbom.json"))
-              if "bomFormat" not in data or "components" not in data:
+              with open("project-src/merged-sbom.json") as f:
+                  parser = JsonParser(f)
+                  bom = parser.get_bom()  
+              if bom is None or bom.components is None:
                   print("INVALID_SBOM", file=sys.stderr)
                   sys.exit(1)
+
               print("SBOM_VALID")
+
           except Exception as e:
               print("SBOM_VALIDATION_ERROR", e)
+              sys.exit(1)
           PY
 
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
