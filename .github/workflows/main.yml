@@ -1,4 +1,4 @@
-name: IoT Full SBOM Pipeline (Model 2 - Cdxgen-first, Build-before-scan, CycloneDX 1.5)
+name: IoT Full SBOM Pipeline (Model 3 - Final Fix)
 
 on:
   workflow_dispatch:
@@ -68,11 +68,8 @@ jobs:
       - name: Install base deps
         run: |
           sudo apt-get update -y
-          # 'timeout' is removed from this list as it is part of coreutils and pre-installed
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder
-          # Ensure cyclonedx-python-lib is installed for validation
           pip3 install --upgrade pip
-          # Ensure the latest available version is installed
           pip3 install cyclonedx-bom cyclonedx-python-lib pandas sbomqs || true
       - name: Ensure Docker usable (best-effort)
         run: |
@@ -172,7 +169,6 @@ jobs:
       - name: Trivy FS SBOM + Vulnerability Scan
         run: |
           set -euo pipefail
-          # Use Trivy's V1.5 spec output for better compatibility with sbomqs
           trivy fs --format cyclonedx --cyclonedx-spec 1.5 -o project-src/trivy-fs.json project-src || echo '{"components":[]}' > project-src/trivy-fs.json
           trivy fs --format json --vuln-type library,os --security-checks vuln -o project-src/vulnerabilities_fs.json project-src || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
           
@@ -192,10 +188,10 @@ jobs:
             fi
           done
 
-      - name: Create & Run SBOM Merge Script (NTIA/BSI Component Fix)
+      - name: Create & Run SBOM Merge Script (Timestamp Fix) ⏰
         run: |
           cat > project-src/merged_and_enrich.py <<'PY'
-          import os, json, uuid, time, hashlib
+          import os, json, uuid, time, hashlib, datetime
 
           ROOT = "project-src"
           OUT  = os.path.join(ROOT, "merged-sbom.json")
@@ -232,7 +228,6 @@ jobs:
 
           unique = {}
           for c in merged:
-              # CRITICAL FIX: Use 'purl' if available for better deduplication
               key = c.get("purl") or (c.get("name"), c.get("version"))
               if key not in unique:
                   unique[key] = c
@@ -264,13 +259,16 @@ jobs:
               "dependsOn": [c["bom-ref"] for c in final_components if c["bom-ref"] != root_ref]
           }]
 
+          # CRITICAL FIX: Use ISO 8601 formatted string for timestamp
+          timestamp_str = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+
           sbom = {
               "bomFormat": "CycloneDX",
               "specVersion": "1.5",
               "serialNumber": "urn:uuid:" + str(uuid.uuid4()),
               "version": 1,
               "metadata": {
-                  "timestamp": int(time.time()),
+                  "timestamp": timestamp_str,
                   "component": root_component,
                   "tools": [{"vendor": "custom", "name": "iot-sbom-pipeline", "version": "1.0"}]
               },
@@ -302,10 +300,7 @@ jobs:
           import sys, os, json, hashlib, uuid, time, subprocess
           
           ROOT='project-src'
-          # CRITICAL FIX 1: Only add source/header files as file components to avoid SBOM bloat
           FILE_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.ino', '.py', '.go', '.rs'}
-          
-          # Increased skip list for common build/dependency folders in C/C++ and IoT
           SKIP_DIR_NAMES={'build','build_output','cmake-build-debug','cmake-build-release',
                           'sdk','toolchain','tools','espressif','esp-idf','components','.arduino','.cargo','.pio','.venv',
                           'deps','downloads','vcpkg_installed','node_modules','vendor','out','target'}
@@ -313,10 +308,8 @@ jobs:
           MAX_HASH_SIZE=5*1024*1024
           MAX_TOTAL_BYTES=1024*1024*1024
           MAX_DEPTH=10
-          
-          # Static Analysis Timeouts (in seconds)
-          CPPCHECK_TIMEOUT=300 # 5 minutes
-          FLAWFINDER_TIMEOUT=300 # 5 minutes
+          CPPCHECK_TIMEOUT=300 
+          FLAWFINDER_TIMEOUT=300
           
           def safe_dir_size_and_count(path):
               total=0; count=0
@@ -335,7 +328,6 @@ jobs:
           def should_skip_dir(path):
               base=os.path.basename(path).lower()
               if base in SKIP_DIR_NAMES: return True
-              # Relying on SKIP_DIR_NAMES is more reliable than file count checks which often fail
               return False
           
           def is_binary(path):
@@ -354,9 +346,7 @@ jobs:
           
           files=[]; total_hash_bytes=0; skipped_dirs_sample=[]
           
-          # --- FILE DISCOVERY AND HASHING ---
           for dirpath, dirnames, filenames in os.walk(ROOT, followlinks=False):
-              # Prune dirnames list in place to skip subdirectories
               dirnames[:] = [d for d in dirnames if not should_skip_dir(os.path.join(dirpath, d))]
               
               rel=os.path.relpath(dirpath, ROOT); depth=0 if rel=='.' else rel.count(os.sep)+1
@@ -365,17 +355,14 @@ jobs:
               for fn in filenames:
                   full=os.path.join(dirpath, fn); size=os.path.getsize(full) if os.path.exists(full) else 0
                   
-                  # Check if we should skip *this* file path's parent directory
                   if should_skip_dir(dirpath): continue
                   
-                  # CRITICAL FIX: Only add file components for specific source file types
                   _, ext = os.path.splitext(fn)
                   if ext.lower() not in FILE_EXTENSIONS:
                       continue
 
                   entry={'path':os.path.relpath(full, ROOT), 'size': size}
                   
-                  # Hash only if file size is reasonable and we haven't hit the total hash budget and is not binary
                   if size <= MAX_HASH_SIZE and total_hash_bytes + size <= MAX_TOTAL_BYTES and not is_binary(full):
                       try: 
                           entry['sha256'] = sha256_file(full); 
@@ -390,7 +377,6 @@ jobs:
                   if len(files) >= MAX_FILES: break
               if len(files) >= MAX_FILES: break
           
-          # --- SBOM ENRICHMENT ---
           try: data = json.load(open(os.path.join(ROOT,'merged-sbom.json')))
           except: data = {'components': [], 'metadata': {}, 'dependencies': []}
           
@@ -407,7 +393,6 @@ jobs:
                   'purl': 'pkg:github/'+(owner_repo if owner_repo else name)+'@'+version,
                   'externalReferences': [{'type':'vcs','url':'https://github.com/'+(owner_repo if owner_repo else name)}],
                   'properties': [{'name':'size','value': str(f['size'])}],
-                  # CRITICAL FIX 2: Ensure bom-ref is compatible with sbomqs (no '/' or other special chars)
                   'bom-ref': 'file-'+nm.replace("/", "_").replace(" ", "_").replace(".", "_"),
                   'supplier': {'name': root_comp.get('supplier', {}).get('name', name)},
                   'licenses': [{"license": {"id": root_comp.get('licenses', [{}])[0].get('license', {}).get('id', 'NOASSERTION')}}]
@@ -425,7 +410,9 @@ jobs:
               data.setdefault('components', []).append(comp)
           
           data['serialNumber'] = data.get('serialNumber') or 'urn:uuid:'+str(uuid.uuid4())
-          data['metadata'] = data.get('metadata') or {}; data['metadata']['timestamp'] = int(time.time())
+          data['metadata'] = data.get('metadata') or {}
+          # FIX: Do not overwrite the timestamp here. It was set correctly in the previous step.
+          
           json.dump(data, open(os.path.join(ROOT,'merged-sbom.json'), 'w'), indent=2)
           print('File enrichment added', len(files), 'files')
           
@@ -436,7 +423,6 @@ jobs:
               hashed_count = sum(1 for f in files if f.get('sha256'))
               if hashed_count <= 5000:
                   print(f"Starting cppcheck scan (timeout {CPPCHECK_TIMEOUT}s)...")
-                  # FIX: Use Python's built-in timeout mechanism
                   cmd = ['cppcheck','--enable=warning,style,performance,portability,information,missingInclude','--inline-suppr','--xml-version=2', ROOT]
                   out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=CPPCHECK_TIMEOUT)
                   
@@ -460,7 +446,6 @@ jobs:
           try:
               if len(files) <= 20000:
                   print(f"Starting flawfinder scan (timeout {FLAWFINDER_TIMEOUT}s)...")
-                  # FIX: Use Python's built-in timeout mechanism
                   cmd = ['flawfinder','--quiet','--dataonly', ROOT]
                   out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=FLAWFINDER_TIMEOUT)
 
@@ -485,7 +470,7 @@ jobs:
         run: |
           pip install cyclonedx-python-lib || true
           cat > project-src/enrich_ntia_bsi_hybrid.py <<'PY'
-          import os, json, time, uuid
+          import os, json, time, uuid, datetime
 
           ROOT = "project-src"; PATH = os.path.join(ROOT, "merged-sbom.json")
           def load(path):
@@ -494,7 +479,13 @@ jobs:
 
           data = load(PATH)
           data.setdefault("bomFormat", "CycloneDX"); data.setdefault("specVersion", "1.5"); data.setdefault("serialNumber", "urn:uuid:" + str(uuid.uuid4())); data.setdefault("version", 1)
-          meta = data.setdefault("metadata", {}); meta.setdefault("timestamp", int(time.time())); meta.setdefault("tools", []); meta.setdefault("component", {})
+          meta = data.setdefault("metadata", {}); 
+          
+          # CRITICAL FIX: Ensure timestamp is a valid ISO 8601 string if missing or malformed
+          if not meta.get("timestamp") or not isinstance(meta.get("timestamp"), str):
+              meta["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+              
+          meta.setdefault("tools", []); meta.setdefault("component", {})
           root = meta["component"]
           if "name" not in root: root["name"] = "unknown"
           if "version" not in root: root["version"] = "0"
@@ -505,13 +496,11 @@ jobs:
           for c in data.get("components", []):
               if "supplier" not in c: c["supplier"] = {"name": root["name"]}
               if "licenses" not in c: c["licenses"] = [{"license": {"id": "NOASSERTION"}}]
-              # Use the component's purl or name/version for a stable bom-ref if missing
               if "bom-ref" not in c:
                   if c.get("purl"):
                       c["bom-ref"] = c["purl"].replace(":", "_").replace("@", "_") 
                   else:
                       c["bom-ref"] = "pkg:auto-" + str(uuid.uuid4())
-              # Strip problematic characters from bom-ref if it's a file component
               if c.get('type') == 'file':
                  c['bom-ref'] = 'file-' + c['name'].replace("/", "_").replace(" ", "_").replace(".", "_")
 
@@ -551,19 +540,16 @@ jobs:
               validation_errors = []
               success = False
               
-              # Try 1: validate_dict (Modern method)
               try:
                   print("Attempting validation with 'validate_dict'...")
                   validation_errors = list(validator.validate_dict(bom_data_dict))
                   success = True
               except AttributeError:
-                  # Try 2: validate (Previous modern method, often takes string)
                   try:
                       print("Falling back to validation with 'validate' (string)...")
                       validation_errors = list(validator.validate(bom_data_str))
                       success = True
                   except AttributeError:
-                      # Try 3: validate (Assuming it takes a dict)
                       try:
                           print("Falling back to validation with 'validate' (dict)...")
                           validation_errors = list(validator.validate(bom_data_dict))
@@ -582,7 +568,6 @@ jobs:
                   sys.exit(0)
           
           except Exception as e:
-              # This catches errors in setup (e.g., failed import, malformed JSON)
               print(f"FATAL VALIDATION ERROR (Catch-all): {e}", file=sys.stderr)
               sys.exit(1)
           PY
@@ -602,28 +587,22 @@ jobs:
                   
               filtered_components = []
               for component in sbom.get('components', []):
-                  # Keep 'application' (root) and 'library' components
                   if component.get('type') in ['application', 'library']:
                       filtered_components.append(component)
 
-              # Update the SBOM with the filtered components
               sbom['components'] = filtered_components
               return sbom
 
-          # Input/Output paths
           INPUT_PATH = os.path.join("project-src", "merged-sbom.json")
           OUTPUT_PATH = os.path.join("project-src", "sbomqs-input.json")
           
-          # Load, filter, and save
           filtered_sbom = load_and_filter_components(INPUT_PATH)
           
           if filtered_sbom:
-              # Re-create dependencies based on the remaining components
               root_ref = filtered_sbom.get('metadata', {}).get('component', {}).get('bom-ref')
               component_refs = {c["bom-ref"] for c in filtered_sbom.get("components", []) if c.get("bom-ref") != root_ref and c.get("bom-ref")}
 
               if root_ref and component_refs:
-                  # Only add dependencies if there are components to depend on
                   filtered_sbom["dependencies"] = [{"ref": root_ref, "dependsOn": sorted(list(component_refs))}]
               else:
                   filtered_sbom["dependencies"] = []
@@ -680,34 +659,29 @@ jobs:
                   w.writerow([l.get("name"), l.get("version"), l.get("purl"), l.get("supplier")])
           PY
 
-      - name: NTIA/BSI Compliance Checks 🛠️
+      - name: NTIA/BSI Compliance Checks (Final Fix: Flags) 🛠️
         run: |
-          # Temporarily disable 'exit on error' for sbomqs commands, as they return non-zero
-          # on compliance failure, but we still want the JSON report they write to stdout.
           set +e 
-          
-          # CRITICAL FIX: Add a 5 minute timeout and use the filtered SBOM (sbomqs-input.json)
           INPUT_SBOM="project-src/sbomqs-input.json"
           TIMEOUT_SECONDS=300
 
           echo "Running sbomqs NTIA check with timeout ($TIMEOUT_SECONDS seconds) on filtered SBOM..."
-          # Wrap docker run in 'timeout'
-          timeout $TIMEOUT_SECONDS sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --format json /sbom/sbomqs-input.json > project-src/compliance_NTIA.json
+          # FIX 1: Removed '--format json' and replaced with the correct flag '--json'
+          timeout $TIMEOUT_SECONDS sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --json /sbom/sbomqs-input.json > project-src/compliance_NTIA.json
           
           echo "Running sbomqs BSI V2 check with timeout ($TIMEOUT_SECONDS seconds) on filtered SBOM..."
-          # Wrap docker run in 'timeout'
-          timeout $TIMEOUT_SECONDS sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --format json /sbom/sbomqs-input.json > project-src/compliance_BSI.json
+          # FIX 1: Removed '--format json' and replaced with the correct flag '--json'
+          timeout $TIMEOUT_SECONDS sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --json /sbom/sbomqs-input.json > project-src/compliance_BSI.json
           
           echo "Running sbomqs Score calculation with timeout ($TIMEOUT_SECONDS seconds) on filtered SBOM..."
-          # Wrap docker run in 'timeout'
+          # Score calculation command was correct
           timeout $TIMEOUT_SECONDS sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs score /sbom/sbomqs-input.json --json > project-src/score.json
           
-          # Re-enable 'exit on error'
           set -e
           
-          # Fallback: Ensure all files exist and are not empty, otherwise write a structured error JSON.
           for f in project-src/compliance_NTIA.json project-src/compliance_BSI.json project-src/score.json; do
               if [ ! -s "$f" ]; then
+                  # Fallback structure updated to match the original expected error for consistency
                   echo '{"error":true, "reason":"sbomqs command failed to produce non-empty output or was blocked (timeout/crash)"}' > "$f"
               fi
           done
@@ -741,10 +715,9 @@ jobs:
           vsb_count, h2, c2 = count_vulns("project-src/vulnerabilities_sbom.json")
           high = h1 + h2; critical = c1 + c2
           
-          try: score = json.load(open("project-src/score.json")).get("score", None)
+          try: score_data = json.load(open("project-src/score.json")); score = score_data.get("score")
           except: score = None
           
-          # This function is now more robust against the structured error fallback
           def passcheck(fname):
               try:
                   d = json.load(open(fname))
@@ -752,7 +725,8 @@ jobs:
                   if d.get("error") == True:
                       return 'error'
                   # Check for compliance pass status in a normal sbomqs report structure
-                  return 'true' if 'results' in d and isinstance(d['results'], list) and any(res.get('pass') == True for res in d['results']) else 'false'
+                  # The compliance reports have a top-level 'pass' boolean
+                  return 'true' if d.get('pass') == True else 'false'
               except:
                   return 'false'
                   
@@ -768,18 +742,12 @@ jobs:
       - name: Cleanup Intermediate Files 🧹
         run: |
           set -euo pipefail
-          # Remove input SBOMs
           rm -f project-src/cdxgen-sbom.json
           rm -f project-src/trivy-fs.json
           rm -f project-src/syft-sbom.json
-          # Remove the temporary filtered SBOM
           rm -f project-src/sbomqs-input.json
-          
-          # Remove license files
           rm -f project-src/gh-license.json
           rm -f project-src/local-license.txt
-          
-          # Remove helper Python scripts and raw analysis
           rm -f project-src/*.py
           rm -f project-src/cppcheck_raw.xml
           
