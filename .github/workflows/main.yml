@@ -71,8 +71,8 @@ jobs:
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder
           # Ensure cyclonedx-python-lib is installed for validation
           pip3 install --upgrade pip
-          # FIX: Force a specific, known-good version of cyclonedx-python-lib to resolve API conflict.
-          pip3 install cyclonedx-bom cyclonedx-python-lib==2.8.3 pandas sbomqs || true
+          # FIX 1: Remove version lock to grab the latest stable cyclonedx-python-lib
+          pip3 install cyclonedx-bom cyclonedx-python-lib pandas sbomqs || true
       - name: Ensure Docker usable (best-effort)
         run: |
           sudo groupadd docker || true
@@ -459,7 +459,7 @@ jobs:
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
       - name: Validate merged SBOM against CycloneDX Schema ⚠️ (FIXED AGAIN)
-        # FINAL FIX: Force-installing a stable version and using the 'validate_dict' method.
+        # FIX 2: Use the 'validate' method, which is often a universal alias for dictionary validation.
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -476,8 +476,8 @@ jobs:
               schema_version = SchemaVersion.V1_5
               validator = JsonStrictValidator(schema_version)
               
-              # FIX: Use 'validate_dict' to validate the Python dictionary object.
-              validation_errors = list(validator.validate_dict(bom_data))
+              # FIX: Use the 'validate' method.
+              validation_errors = list(validator.validate(bom_data))
 
               if validation_errors:
                   print("\nSBOM FAILED SCHEMA VALIDATION ❌", file=sys.stderr)
