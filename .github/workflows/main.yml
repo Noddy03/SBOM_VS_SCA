@@ -109,12 +109,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # 1. Fetch GitHub license
           gh api "/repos/$REPO/license" > project-src/gh-license.json 2>/dev/null || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json || true
-          # 2. Check for local license file
           FILE=$(find project-src -maxdepth=6 -type f -iregex ".*(LICENSE|COPYING|COPYRIGHT|LICENSE.md|LICENSE.txt)" | head -1 || true)
           if [ -n "$FILE" ]; then cp "$FILE" project-src/local-license.txt; else echo "" > project-src/local-license.txt; fi
-          # 3. Determine final license
           GH=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
           FILE=$(grep -Eo "SPDX-License-Identifier:\s*[A-Za-z0-9.\-+]+" project-src/local-license.txt | head -1 | awk -F': ' '{print $2}' || true)
           FINAL="${GH:-$FILE}"
@@ -309,51 +306,45 @@ jobs:
           DIR_MAX_FILES=5000
           DIR_MAX_BYTES=200*1024*1024
           
-          # Helper functions omitted for brevity (same as before)
-          def safe_dir_size_and_count(path): # ...
-            # Implementation remains the same
-            total=0; count=0
-            try:
-                with os.scandir(path) as it:
-                    for e in it:
-                        try:
-                            if e.is_file(follow_symlinks=False):
-                                count+=1; total+=e.stat().st_size
-                            elif e.is_dir(follow_symlinks=False):
-                                count+=1
-                        except: continue
-            except: return (0,0)
-            return (count,total)
+          def safe_dir_size_and_count(path):
+              total=0; count=0
+              try:
+                  with os.scandir(path) as it:
+                      for e in it:
+                          try:
+                              if e.is_file(follow_symlinks=False):
+                                  count+=1; total+=e.stat().st_size
+                              elif e.is_dir(follow_symlinks=False):
+                                  count+=1
+                          except: continue
+              except: return (0,0)
+              return (count,total)
           
-          def should_skip_dir(path): # ...
-            # Implementation remains the same
-            base=os.path.basename(path).lower()
-            if base in SKIP_DIR_NAMES: return True
-            try:
-                cnt, sz = safe_dir_size_and_count(path)
-                if cnt > DIR_MAX_FILES or sz > DIR_MAX_BYTES: return True
-            except: return True
-            return False
+          def should_skip_dir(path):
+              base=os.path.basename(path).lower()
+              if base in SKIP_DIR_NAMES: return True
+              try:
+                  cnt, sz = safe_dir_size_and_count(path)
+                  if cnt > DIR_MAX_FILES or sz > DIR_MAX_BYTES: return True
+              except: return True
+              return False
           
-          def is_binary(path): # ...
-            # Implementation remains the same
-            try:
-                with open(path,'rb') as f:
-                    chunk = f.read(1024)
-                    return b'\0' in chunk
-            except: return True
+          def is_binary(path):
+              try:
+                  with open(path,'rb') as f:
+                      chunk = f.read(1024)
+                      return b'\0' in chunk
+              except: return True
           
-          def sha256_file(p): # ...
-            # Implementation remains the same
-            h=hashlib.sha256()
-            with open(p,'rb') as f:
-                for chunk in iter(lambda:f.read(8192),b''):
-                    h.update(chunk)
-            return h.hexdigest()
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for chunk in iter(lambda:f.read(8192),b''):
+                      h.update(chunk)
+              return h.hexdigest()
           
           files=[]; total_hash_bytes=0; skipped_dirs_sample=[]
           
-          # Walk repository safely
           for dirpath, dirnames, filenames in os.walk(ROOT, followlinks=False):
               rel=os.path.relpath(dirpath, ROOT); depth=0 if rel=='.' else rel.count(os.sep)+1
               if depth>MAX_DEPTH: dirnames[:] = []; continue
@@ -369,7 +360,6 @@ jobs:
                   if len(files) >= MAX_FILES: break
               if len(files) >= MAX_FILES: break
           
-          # Load merged sbom and enrich
           try: data = json.load(open(os.path.join(ROOT,'merged-sbom.json')))
           except: data = {'components': [], 'metadata': {}}
           
@@ -407,7 +397,6 @@ jobs:
           json.dump(data, open(os.path.join(ROOT,'merged-sbom.json'), 'w'), indent=2)
           print('File enrichment added', len(files), 'files')
           
-          # --- Static Analysis ---
           try:
               hashed_count = sum(1 for f in files if f.get('sha256'))
               if hashed_count <= 5000:
@@ -467,24 +456,55 @@ jobs:
           PY
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
+      - name: Validate merged SBOM against CycloneDX Schema ⚠️
+        # CRITICAL FIX: Explicit schema validation to diagnose why 'sbomqs' fails with {"error":true}.
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import sys, json, os
+          from cyclonedx.schema import SchemaVersion
+          from cyclonedx.validation.json import JsonStrictValidator
+
+          try:
+              with open(os.path.join("project-src", "merged-sbom.json"), 'r') as f:
+                  bom_data = json.load(f)
+
+              schema_version = SchemaVersion.V1_5
+              validator = JsonStrictValidator(schema_version)
+              validation_errors = list(validator.validate_string(json.dumps(bom_data)))
+
+              if validation_errors:
+                  print("\nSBOM FAILED SCHEMA VALIDATION ❌", file=sys.stderr)
+                  for error in validation_errors:
+                      print(f"  - {error.message} (Path: {error.json_path})", file=sys.stderr)
+                  # Fail the step if validation fails
+                  sys.exit(1)
+              else:
+                  print("\nSBOM PASSED SCHEMA VALIDATION ✅")
+                  sys.exit(0)
+          
+          except Exception as e:
+              print(f"FATAL VALIDATION ERROR: {e}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
           set -euo pipefail
-          trivy sbom --format json --vuln-type library,os -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
+          trivy sbom --format json --vuln-type library,os --security-checks vuln -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
           
       - name: Create unified reports (json + csv)
         run: |
           python3 <<'PY'
           import json, csv
-          def extract_vulns(path, source): # ...
-            # Implementation remains the same
-            try: data=json.load(open(path))
-            except: return []
-            vulns=[]
-            for r in data.get("Results",[]):
-                for v in r.get("Vulnerabilities",[]) or []:
-                    vulns.append({"id": v.get("VulnerabilityID"),"package": v.get("PkgName"),"version": v.get("InstalledVersion"),"severity": v.get("Severity"),"source": source})
-            return vulns
+          def extract_vulns(path, source):
+              try: data=json.load(open(path))
+              except: return []
+              vulns=[]
+              for r in data.get("Results",[]):
+                  for v in r.get("Vulnerabilities",[]) or []:
+                      vulns.append({"id": v.get("VulnerabilityID"),"package": v.get("PkgName"),"version": v.get("InstalledVersion"),"severity": v.get("Severity"),"source": source})
+              return vulns
           fs = extract_vulns("project-src/vulnerabilities_fs.json","filesystem")
           sb = extract_vulns("project-src/vulnerabilities_sbom.json","sbom")
           allv = fs + sb
@@ -550,7 +570,6 @@ jobs:
           def passcheck(fname):
               try:
                   d = json.load(open(fname))
-                  # Check if the result array exists and pass is explicitly true
                   return 'true' if 'results' in d and isinstance(d['results'], list) and any(res.get('pass') == True for res in d['results']) else 'false'
               except:
                   return 'false'
@@ -567,16 +586,16 @@ jobs:
       - name: Cleanup Intermediate Files 🧹
         run: |
           set -euo pipefail
-          # Remove input SBOMs (data is merged into merged-sbom.json)
+          # Remove input SBOMs
           rm -f project-src/cdxgen-sbom.json
           rm -f project-src/trivy-fs.json
           rm -f project-src/syft-sbom.json
           
-          # Remove raw license files (data is in final_license.txt)
+          # Remove license files
           rm -f project-src/gh-license.json
           rm -f project-src/local-license.txt
           
-          # Remove helper Python scripts and raw XML output
+          # Remove helper Python scripts and raw analysis
           rm -f project-src/*.py
           rm -f project-src/cppcheck_raw.xml
           
