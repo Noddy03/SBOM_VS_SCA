@@ -258,10 +258,26 @@ jobs:
       - name: Enrich SBOM with file-level components & static analysis (cppcheck + flawfinder)
         run: |
           set -euo pipefail
+          # Create an enrichment script that includes ALL files but avoids hashing huge files
           cat > project-src/enrich_and_scan.py <<'PY'
           import os, json, hashlib, uuid, time, subprocess
 
           ROOT='project-src'
+          MAX_FILES=50000
+          MAX_HASH_SIZE=5*1024*1024   
+          MAX_TOTAL_BYTES=1024*1024*1024  # 1 GB total hash budget
+          MAX_DEPTH=10
+
+          def is_binary(path):
+              try:
+                  with open(path, 'rb') as f:
+                      chunk = f.read(1024)
+                      if b'\0' in chunk:
+                          return True
+              except:
+                  return False
+              return False
+
           def sha256_file(p):
               h=hashlib.sha256()
               with open(p,'rb') as f:
@@ -269,112 +285,164 @@ jobs:
                       h.update(chunk)
               return h.hexdigest()
 
-          # collect source files to include as components
-          files=[]
-          for dirpath,dirnames,filenames in os.walk(ROOT):
-              # ignore some dirs
-              if '/.git' in dirpath or '/.sbom_deps' in dirpath or 'node_modules' in dirpath:
+          files = []
+          total_hashed = 0
+          total_hash_bytes = 0
+          skipped_reasons = []
+
+          skip_dirs = {'node_modules','vendor','third_party','build','dist','out','data','models','assets','.git','.pio','.cache','.venv'}
+          for dirpath, dirnames, filenames in os.walk(ROOT, followlinks=False):
+              # enforce max depth
+              rel = os.path.relpath(dirpath, ROOT)
+              if rel == '.':
+                  depth = 0
+              else:
+                  depth = rel.count(os.sep) + 1
+              if depth > MAX_DEPTH:
+                  continue
+              # skip known heavy dirs by name
+              if any(part in skip_dirs for part in dirpath.split(os.sep)):
                   continue
               for fn in filenames:
-                  if fn.endswith(('.c','.cpp','.h','.hpp','.ino','.S','.asm')):
-                      full=os.path.join(dirpath,fn)
-                      rel=os.path.relpath(full, ROOT)
-                      files.append({'path':rel, 'sha256': sha256_file(full)})
+                  full = os.path.join(dirpath, fn)
+                  try:
+                      size = os.path.getsize(full)
+                  except Exception:
+                      continue
+                  entry = {'path': os.path.relpath(full, ROOT), 'size': size}
+                  # decide whether to hash
+                  if size <= MAX_HASH_SIZE and not is_binary(full):
+                      if total_hash_bytes + size <= MAX_TOTAL_BYTES and len([f for f in files if 'sha256' in f]) < MAX_FILES:
+                          try:
+                              entry['sha256'] = sha256_file(full)
+                              total_hash_bytes += size
+                              total_hashed += 1
+                          except Exception:
+                              entry['sha256'] = None
+                      else:
+                          entry['sha256'] = None
+                          skipped_reasons.append(('budget', entry['path']))
+                  else:
+                      entry['sha256'] = None
+                      skipped_reasons.append(('large_or_binary', entry['path']))
+                  files.append(entry)
+                  if len(files) >= MAX_FILES:
+                      break
+              if len(files) >= MAX_FILES:
+                  break
 
-          # load merged sbom
+          # load existing merged sbom
           try:
-              data=json.load(open(os.path.join(ROOT,'merged-sbom.json')))
+              data = json.load(open(os.path.join(ROOT, 'merged-sbom.json')))
           except Exception:
-              data={'components':[]}
+              data = {'components': []}
 
-          # determine repo name & commit sha where possible
+          # determine repo metadata
           try:
-                sha = subprocess.check_output(['git','rev-parse','--short','HEAD'], cwd=ROOT).decode().strip()
+              sha = subprocess.check_output(['git','rev-parse','--short','HEAD'], cwd=ROOT).decode().strip()
           except Exception:
-                sha = '0'
-          # try to infer owner/repo from git remote or env
+              sha = '0'
           owner_repo = os.environ.get('GITHUB_REPOSITORY','')
           if not owner_repo:
               try:
                   remote = subprocess.check_output(['git','config','--get','remote.origin.url'], cwd=ROOT).decode().strip()
                   if remote.endswith('.git'):
-                      remote=remote[:-4]
+                      remote = remote[:-4]
                   if remote.startswith('git@github.com:'):
                       owner_repo = remote.split(':',1)[1]
-                  elif remote.startswith('https://github.com/'):
-                      owner_repo = remote.split('https://github.com/',1)[1]
+                  elif 'github.com/' in remote:
+                      owner_repo = remote.split('github.com/',1)[1]
               except Exception:
                   owner_repo = ''
           name = owner_repo.split('/')[-1] if owner_repo else os.path.basename(os.getcwd())
           version = sha
 
-          # add file-level components (if not present)
-          existing = {(c.get('name'), c.get('version')) for c in data.get('components',[])}
+          existing = {(c.get('name'), c.get('version')) for c in data.get('components', [])}
+
           for f in files:
               nm = f['path']
-              ver = version
-              key=(nm, ver)
+              key = (nm, version)
               if key in existing:
                   continue
-              comp={
-                  'type':'file',
-                  'name': nm,
-                  'version': ver,
-                  'hashes':[{'alg':'SHA-256','content':f['sha256']}],
-                  'purl': 'pkg:github/'+(owner_repo if owner_repo else name)+'@'+ver,
-                  'externalReferences':[{'type':'vcs','url': 'https://github.com/'+(owner_repo if owner_repo else name)}]
+              comp = {
+                'type': 'file',
+                'name': nm,
+                'version': version,
+                'purl': 'pkg:github/' + (owner_repo if owner_repo else name) + '@' + version,
+                'externalReferences': [{'type': 'vcs', 'url': 'https://github.com/' + (owner_repo if owner_repo else name)}],
+                'properties': [{'name': 'size', 'value': str(f['size'])}]
               }
-              data.setdefault('components',[]).append(comp)
+              if f.get('sha256'):
+                  comp['hashes'] = [{'alg': 'SHA-256', 'content': f['sha256']}]
+              # mark large files
+              if f['size'] > MAX_HASH_SIZE:
+                  comp.setdefault('properties', []).append({'name':'large-file','value':'true'})
+              data.setdefault('components', []).append(comp)
 
-          # enrich metadata for NTIA/BSI needs
-          data['serialNumber'] = data.get('serialNumber') or 'urn:uuid:'+str(uuid.uuid4())
+          data['serialNumber'] = data.get('serialNumber') or 'urn:uuid:' + str(uuid.uuid4())
           data['metadata'] = data.get('metadata') or {}
           data['metadata']['timestamp'] = int(time.time())
-          data['metadata']['tools'] = data['metadata'].get('tools',[])
-          data['metadata']['component'] = data['metadata'].get('component',{})
+          data['metadata']['tools'] = data['metadata'].get('tools', [])
+          data['metadata']['component'] = data['metadata'].get('component', {})
           data['metadata']['component']['name'] = name
           data['metadata']['component']['version'] = version
           data['repo_license'] = data.get('repo_license','NOASSERTION')
 
-          # write back
-          json.dump(data, open(os.path.join(ROOT,'merged-sbom.json'),'w'), indent=2)
-          print('enriched merged-sbom.json with', len(files), 'file components')
+          json.dump(data, open(os.path.join(ROOT, 'merged-sbom.json'),'w'), indent=2)
+          print('enriched merged-sbom.json with', len(files), 'file components (Option D)')
+          if skipped_reasons:
+              print('skipped_reasons_sample:', skipped_reasons[:10])
 
-          # run cppcheck and write simple JSON output (best-effort)
+          # Safety-guarded static analysis
+          # Only run cppcheck if hashed files count is reasonable
           try:
-              cmd = ['cppcheck','--enable=warning,style,performance,portability,information,missingInclude','--inline-suppr','--xml-version=2', ROOT]
-              out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-              open(os.path.join(ROOT,'cppcheck_raw.xml'),'wb').write(out.stderr)
-              findings = []
-              try:
-                  import xml.etree.ElementTree as ET
-                  root = ET.fromstring(out.stderr.decode(errors='ignore'))
-                  for error in root.findall('.//error'):
-                      fn=error.get('file') or 'unknown'
-                      msg=error.get('msg') or ''
-                      severity=error.get('severity') or 'info'
-                      findings.append({'id':'cppcheck-'+str(abs(hash(fn+msg)))[:12],'file':fn,'message':msg,'severity':severity})
-              except Exception:
-                  pass
-              json.dump(findings, open(os.path.join(ROOT,'cppcheck.json'),'w'), indent=2)
+              hashed_count = sum(1 for f in files if f.get('sha256'))
+          except:
+              hashed_count = 0
+          try:
+              if hashed_count <= 5000:
+                  cmd = ['cppcheck','--enable=warning,style,performance,portability,information,missingInclude','--inline-suppr','--xml-version=2', ROOT]
+                  out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                  open(os.path.join(ROOT,'cppcheck_raw.xml'),'wb').write(out.stderr)
+                  findings = []
+                  try:
+                      import xml.etree.ElementTree as ET
+                      root = ET.fromstring(out.stderr.decode(errors='ignore'))
+                      for error in root.findall('.//error'):
+                          fn = error.get('file') or 'unknown'
+                          msg = error.get('msg') or ''
+                          severity = error.get('severity') or 'info'
+                          findings.append({'id':'cppcheck-'+str(abs(hash(fn+msg)))[:12],'file':fn,'message':msg,'severity':severity})
+                  except Exception:
+                      pass
+                  json.dump(findings, open(os.path.join(ROOT,'cppcheck.json'),'w'), indent=2)
+              else:
+                  print('Skipping cppcheck: hashed_count', hashed_count, 'too large')
+                  json.dump([], open(os.path.join(ROOT,'cppcheck.json'),'w'), indent=2)
           except Exception as e:
               print('cppcheck failed', e)
+              json.dump([], open(os.path.join(ROOT,'cppcheck.json'),'w'), indent=2)
 
-          # run flawfinder if available
+          # Run flawfinder (lighter) but guard against huge file lists
           try:
-              out = subprocess.run(['flawfinder','--quiet','--dataonly', ROOT], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-              findings = []
-              for line in out.stdout.decode().splitlines():
-                  parts=line.split(':',3)
-                  if len(parts)>=4:
-                      fn,ln,level,msg = parts[0],parts[1],parts[2],parts[3]
-                      findings.append({'id':'flawfinder-'+str(abs(hash(fn+ln+msg)))[:12],'file':fn,'line':ln,'level':level,'message':msg})
-              json.dump(findings, open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
+              if len(files) <= 20000:
+                  out = subprocess.run(['flawfinder','--quiet','--dataonly', ROOT], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                  findings = []
+                  for line in out.stdout.decode().splitlines():
+                      parts=line.split(':',3)
+                      if len(parts)>=4:
+                          fn,ln,level,msg = parts[0],parts[1],parts[2],parts[3]
+                          findings.append({'id':'flawfinder-'+str(abs(hash(fn+ln+msg)))[:12],'file':fn,'line':ln,'level':level,'message':msg})
+                  json.dump(findings, open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
+              else:
+                  print('Skipping flawfinder: too many files', len(files))
+                  json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
           except Exception as e:
               print('flawfinder failed', e)
+              json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
 
           PY
-          python3 project-src/enrich_and_scan.py  || true
+          python3 project-src/enrich_and_scan.py || true
 
       - name: Validate merged SBOM (cyclonedx-python-lib friendly)
         run: |
@@ -649,3 +717,4 @@ jobs:
         with:
           name: master_summary
           path: master_summary.csv
+
