@@ -71,7 +71,8 @@ jobs:
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder
           # Ensure cyclonedx-python-lib is installed for validation
           pip3 install --upgrade pip
-          pip3 install cyclonedx-bom cyclonedx-python-lib pandas sbomqs || true
+          # FIX: Force a specific, known-good version of cyclonedx-python-lib to resolve API conflict.
+          pip3 install cyclonedx-bom cyclonedx-python-lib==2.8.3 pandas sbomqs || true
       - name: Ensure Docker usable (best-effort)
         run: |
           sudo groupadd docker || true
@@ -458,8 +459,7 @@ jobs:
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
       - name: Validate merged SBOM against CycloneDX Schema ⚠️ (FIXED AGAIN)
-        # RE-FIX: Use 'validate_string' with a JSON string input, which is the most stable method
-        # for older/mixed versions of 'cyclonedx-python-lib'.
+        # FINAL FIX: Force-installing a stable version and using the 'validate_dict' method.
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -470,16 +470,14 @@ jobs:
           try:
               sbom_path = os.path.join("project-src", "merged-sbom.json")
               with open(sbom_path, 'r') as f:
+                  # Load the data as a Python dictionary
                   bom_data = json.load(f)
-
-              # Convert the Python dict back to a JSON string for validation
-              bom_json_string = json.dumps(bom_data)
 
               schema_version = SchemaVersion.V1_5
               validator = JsonStrictValidator(schema_version)
               
-              # Use the 'validate_string' method
-              validation_errors = list(validator.validate_string(bom_json_string))
+              # FIX: Use 'validate_dict' to validate the Python dictionary object.
+              validation_errors = list(validator.validate_dict(bom_data))
 
               if validation_errors:
                   print("\nSBOM FAILED SCHEMA VALIDATION ❌", file=sys.stderr)
@@ -491,6 +489,7 @@ jobs:
                   sys.exit(0)
           
           except Exception as e:
+              # This will catch errors related to the validation method itself not existing
               print(f"FATAL VALIDATION ERROR: {e}", file=sys.stderr)
               sys.exit(1)
           PY
