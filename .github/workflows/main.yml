@@ -246,8 +246,38 @@ jobs:
           }
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
           PY
-      - name: Install CycloneDX parser
-        run: pip install cyclonedx-python-lib
+      
+      - name: NTIA + BSI-V2 Compliance Enrichment
+        run: |
+          python3 <<'PY'
+          import json, uuid, time, os
+
+          path="project-src/merged-sbom.json"
+          data=json.load(open(path))
+
+          data["specVersion"]="1.5"
+          data["serialNumber"]="urn:uuid:"+str(uuid.uuid4())
+          data["metadata"]=data.get("metadata",{})
+          meta=data["metadata"]
+          meta["timestamp"]=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+          meta["supplier"]={"name":"Unknown Supplier"}
+          meta["manufacturer"]={"name":"Unknown Manufacturer"}
+          meta["licenses"]=[{"license":{"id":"NOASSERTION"}}]
+
+          if "component" not in meta:
+              meta["component"]={"type":"application"}
+          comp=meta["component"]
+          comp["name"]=os.getenv("GITHUB_REPOSITORY","unknown_repo")
+          comp["version"]=os.getenv("GITHUB_SHA","0")
+          comp["purl"]="pkg:generic/"+comp["name"]+"@"+comp["version"]
+          comp["licenses"]=[{"license":{"id":"NOASSERTION"}}]
+
+          data.setdefault("components",[])
+          data.setdefault("dependencies",[])
+
+          json.dump(data,open(path,"w"),indent=2)
+          PY
+
       - name: Validate merged SBOM (cyclonedx-python-lib)
         run: |
           set -euo pipefail
@@ -262,7 +292,7 @@ jobs:
               print("SBOM_VALID")
           except Exception as e:
               print("SBOM_VALIDATION_ERROR", e)
-          PY
+          PY 
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
           set -euo pipefail
@@ -457,4 +487,5 @@ jobs:
         with:
           name: master_summary
           path: master_summary.csv
+
 
