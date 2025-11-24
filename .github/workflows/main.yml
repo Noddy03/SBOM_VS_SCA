@@ -478,30 +478,33 @@ jobs:
 
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
-      - name: Install CycloneDX parser
-        run: |
-          pip install --upgrade cyclonedx-python-lib
-          pip install --upgrade cyclonedx-bom
+    
 
-      - name: Validate merged SBOM (CycloneDX 1.5)
+      
+      - name: Validate merged SBOM (universal CycloneDX 1.5 validator)
         run: |
           set -euo pipefail
           python3 <<'PY'
-          import sys, json
-
-          # CycloneDX-bom provides the modern parser
-          from cyclonedx.model import Bom
-          from cyclonedx.schema import JsonSchemaVersion
-          from cyclonedx.output.json import JsonOutput
-
+          import sys, json  
           try:
-              import json
               with open("project-src/merged-sbom.json") as f:
                   data = json.load(f)
 
-              # Basic validation: check required fields
-              if "bomFormat" not in data or "components" not in data:
-                  print("INVALID_SBOM", file=sys.stderr)
+              # Minimal CycloneDX validity checks
+              required_fields = ["bomFormat", "specVersion", "components"]
+              missing = [f for f in required_fields if f not in data]
+
+              if missing:
+                  print("INVALID_SBOM: Missing fields:", missing, file=sys.stderr)
+                  sys.exit(1)
+
+              if not isinstance(data.get("components"), list):
+                  print("INVALID_SBOM: components must be an array", file=sys.stderr)
+                  sys.exit(1)
+
+              # Very basic semantic checks
+              if data["bomFormat"] not in ["CycloneDX"]:
+                  print("INVALID_SBOM: wrong bomFormat", file=sys.stderr)
                   sys.exit(1)
 
               print("SBOM_VALID")
@@ -510,6 +513,7 @@ jobs:
               print("SBOM_VALIDATION_ERROR", e)
               sys.exit(1)
           PY
+
 
 
 
