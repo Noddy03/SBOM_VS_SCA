@@ -659,7 +659,7 @@ jobs:
                   w.writerow([l.get("name"), l.get("version"), l.get("purl"), l.get("supplier")])
           PY
 
-      - name: NTIA/BSI Compliance Checks (Final Fix: Flags) 🛠️
+      - name: NTIA/BSI Compliance Checks (Final Fix Flags) 🛠️
         run: |
           set +e 
           INPUT_SBOM="project-src/sbomqs-input.json"
