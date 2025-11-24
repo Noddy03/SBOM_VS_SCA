@@ -458,7 +458,8 @@ jobs:
           PY
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
-      - name: Validate merged SBOM against CycloneDX Schema ✅ (Final Fix String Validation)
+      - name: Validate merged SBOM against CycloneDX Schema ✅ (Final Fix: Dict Validation)
+        # FIX: Reverting to the most stable and backward-compatible method: validating a Python dictionary using 'validate_dict'.
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -469,14 +470,14 @@ jobs:
           try:
               sbom_path = os.path.join("project-src", "merged-sbom.json")
               with open(sbom_path, 'r') as f:
-                  # Read the content as a raw JSON string
-                  bom_data_str = f.read()
+                  # Load the content directly into a Python dictionary
+                  bom_data_dict = json.load(f)
               
               schema_version = SchemaVersion.V1_5
               validator = JsonStrictValidator(schema_version)
               
-              # Use the 'validate' method and pass the raw JSON string.
-              validation_errors = list(validator.validate(bom_data_str))
+              # FIX: Explicitly call 'validate_dict'
+              validation_errors = list(validator.validate_dict(bom_data_dict))
 
               if validation_errors:
                   print("\nSBOM FAILED SCHEMA VALIDATION ❌", file=sys.stderr)
@@ -488,6 +489,7 @@ jobs:
                   sys.exit(0)
           
           except Exception as e:
+              # Fallback to catch any remaining API mismatch errors
               print(f"FATAL VALIDATION ERROR (Final Fallback): {e}", file=sys.stderr)
               sys.exit(1)
           PY
