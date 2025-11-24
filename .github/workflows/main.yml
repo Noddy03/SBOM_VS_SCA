@@ -16,6 +16,7 @@ permissions:
 env:
   DEBIAN_FRONTEND: noninteractive
   CYCLONEDX_SPEC: "1.5"
+
 jobs:
   fetch_top_repos:
     runs-on: ubuntu-latest
@@ -245,7 +246,7 @@ jobs:
           }
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
           PY
-      - name: Enrich SBOM with file-level components (Option F)
+            - name: Enrich SBOM with file-level components (Option F)
         run: |
           set -euo pipefail
           cat > project-src/enrich_and_scan.py <<'PY'
