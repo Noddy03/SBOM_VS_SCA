@@ -457,8 +457,9 @@ jobs:
           PY
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
-      - name: Validate merged SBOM against CycloneDX Schema ⚠️ (FIXED)
-        # CRITICAL FIX: Changed 'validate_string' to 'validate_json' to resolve method not found error.
+      - name: Validate merged SBOM against CycloneDX Schema ⚠️ (FIXED AGAIN)
+        # RE-FIX: Use 'validate_string' with a JSON string input, which is the most stable method
+        # for older/mixed versions of 'cyclonedx-python-lib'.
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -471,11 +472,14 @@ jobs:
               with open(sbom_path, 'r') as f:
                   bom_data = json.load(f)
 
+              # Convert the Python dict back to a JSON string for validation
+              bom_json_string = json.dumps(bom_data)
+
               schema_version = SchemaVersion.V1_5
               validator = JsonStrictValidator(schema_version)
               
-              # FIX: Use validate_json instead of validate_string
-              validation_errors = list(validator.validate_json(bom_data))
+              # Use the 'validate_string' method
+              validation_errors = list(validator.validate_string(bom_json_string))
 
               if validation_errors:
                   print("\nSBOM FAILED SCHEMA VALIDATION ❌", file=sys.stderr)
@@ -488,7 +492,6 @@ jobs:
           
           except Exception as e:
               print(f"FATAL VALIDATION ERROR: {e}", file=sys.stderr)
-              # If the validation step itself fails, it's a critical error.
               sys.exit(1)
           PY
 
