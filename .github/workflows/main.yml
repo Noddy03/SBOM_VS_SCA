@@ -393,7 +393,7 @@ jobs:
           except Exception as e:
               print('flawfinder failed', e)
               json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
-PY
+          PY
           python3 project-src/enrich_and_scan.py || true
       - name: NTIA & BSI hybrid enrichment (fill missing metadata)
 
@@ -512,7 +512,7 @@ PY
       - name: Overwrite enrich_ntia_bsi_hybrid.py with normalized metadata enforcer
         run: |
           cat > project-src/enrich_ntia_bsi_hybrid.py <<'PY'
-# -*- coding: utf-8 -*-
+          # -*- coding: utf-8 -*-
           import os, json, time, uuid, subprocess, sys
 
           ROOT = "project-src"
