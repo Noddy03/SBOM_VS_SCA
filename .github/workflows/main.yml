@@ -1,6 +1,6 @@
 name: IoT Full SBOM Pipeline (Model 2 - Cdxgen-first, Build-before-scan, CycloneDX 1.5)
 
-on:
+ on:
   workflow_dispatch:
     inputs:
       language:
@@ -8,16 +8,16 @@ on:
         required: true
         default: "C++"
 
-permissions:
+ permissions:
   contents: read
   security-events: write
   actions: read
 
-env:
+ env:
   DEBIAN_FRONTEND: noninteractive
   CYCLONEDX_SPEC: "1.5"
 
-jobs:
+ jobs:
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -246,7 +246,116 @@ jobs:
           }
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
           PY
-      - name: Validate merged SBOM (cyclonedx-python-lib)
+      - name: Enrich SBOM with file-level components (Option F)
+        run: |
+          set -euo pipefail
+          cat > project-src/enrich_and_scan.py <<'PY'
+          import os, json, hashlib, uuid, time, subprocess
+
+          ROOT='project-src'
+          SKIP_DIR_NAMES={'build','build_output','cmake-build-debug','cmake-build-release',
+                          'sdk','toolchain','tools','espressif','esp-idf','components','.arduino','.cargo'}
+          MAX_FILES=50000
+          MAX_HASH_SIZE=5*1024*1024
+          MAX_TOTAL_BYTES=1024*1024*1024
+          MAX_DEPTH=10
+          DIR_MAX_FILES=5000
+          DIR_MAX_BYTES=200*1024*1024
+
+          def should_skip_dir(path):
+              base=os.path.basename(path).lower()
+              if base in SKIP_DIR_NAMES:
+                  return True
+              try:
+                  with os.scandir(path) as it:
+                      count=0; size=0
+                      for e in it:
+                          if e.is_file():
+                              size+=e.stat().st_size
+                              count+=1
+                          elif e.is_dir():
+                              count+=1
+                          if count>DIR_MAX_FILES or size>DIR_MAX_BYTES:
+                              return True
+              except:
+                  return True
+              return False
+
+          def is_binary(path):
+              try:
+                  with open(path,'rb') as f:
+                      return b' ' in f.read(512)
+              except:
+                  return True
+
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for chunk in iter(lambda:f.read(8192),b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          files=[]
+          total_hash_bytes=0
+
+          for dirpath,dirnames,filenames in os.walk(ROOT,followlinks=False):
+              rel=os.path.relpath(dirpath,ROOT)
+              depth=0 if rel=="." else rel.count(os.sep)+1
+              if depth>MAX_DEPTH or should_skip_dir(dirpath):
+                  continue
+              for fn in filenames:
+                  full=os.path.join(dirpath,fn)
+                  try: size=os.path.getsize(full)
+                  except: continue
+                  entry={'path':os.path.relpath(full,ROOT),'size':size}
+                  if size<=MAX_HASH_SIZE and total_hash_bytes+size<=MAX_TOTAL_BYTES and not is_binary(full):
+                      try:
+                          entry['sha256']=sha256_file(full)
+                          total_hash_bytes+=size
+                      except:
+                          entry['sha256']=None
+                  files.append(entry)
+                  if len(files)>=MAX_FILES:
+                      break
+              if len(files)>=MAX_FILES:
+                  break
+
+          try:
+              data=json.load(open(os.path.join(ROOT,'merged-sbom.json')))
+          except:
+              data={'components':[]}
+
+          try:
+              sha=subprocess.check_output(['git','rev-parse','--short','HEAD'],cwd=ROOT).decode().strip()
+          except:
+              sha='0'
+          owner_repo=os.environ.get('GITHUB_REPOSITORY','')
+          name=owner_repo.split('/')[-1] if owner_repo else 'repo'
+          version=sha
+
+          existing={(c.get('name'),c.get('version')) for c in data.get('components',[])}
+
+          for f in files:
+              key=(f['path'],version)
+              if key in existing: continue
+              comp={'type':'file','name':f['path'],'version':version,
+                    'purl':'pkg:github/'+(owner_repo if owner_repo else name)+'@'+version,
+                    'properties':[{'name':'size','value':str(f['size'])}]}
+              if f.get('sha256'):
+                  comp['hashes']=[{'alg':'SHA-256','content':f['sha256']}]
+              data.setdefault('components',[]).append(comp)
+
+          data['serialNumber']=data.get('serialNumber') or 'urn:uuid:'+str(uuid.uuid4())
+          data['metadata']=data.get('metadata') or {}
+          data['metadata']['timestamp']=int(time.time())
+          data['metadata']['component']={'name':name,'version':version}
+
+          json.dump(data,open(os.path.join(ROOT,'merged-sbom.json'),'w'),indent=2)
+          print("Option F enriched", len(files), "files")
+
+          PY
+          python3 project-src/enrich_and_scan.py || true
+- name: Validate merged SBOM (cyclonedx-python-lib)
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -455,4 +564,5 @@ jobs:
         with:
           name: master_summary
           path: master_summary.csv
+
 
