@@ -1,7 +1,6 @@
-
 name: IoT Full SBOM Pipeline (Model 2 - Cdxgen-first, Build-before-scan, CycloneDX 1.5)
 
- on:
+on:
   workflow_dispatch:
     inputs:
       language:
@@ -9,12 +8,12 @@ name: IoT Full SBOM Pipeline (Model 2 - Cdxgen-first, Build-before-scan, Cyclone
         required: true
         default: "C++"
 
- permissions:
+permissions:
   contents: read
   security-events: write
   actions: read
 
- env:
+env:
   DEBIAN_FRONTEND: noninteractive
   CYCLONEDX_SPEC: "1.5"
 jobs:
