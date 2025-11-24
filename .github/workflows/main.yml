@@ -478,6 +478,11 @@ jobs:
 
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
+      - name: Install CycloneDX Python Parser
+        run: |
+          pip install --upgrade cyclonedx-python-lib
+
+
 
       - name: Validate merged SBOM (cyclonedx-python-lib friendly)
         run: |
