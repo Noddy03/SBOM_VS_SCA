@@ -708,8 +708,7 @@ jobs:
             project-src/cppcheck_raw.xml
             project-src/flawfinder_raw.txt
           retention-days: 7
-
-<hr>
+            <hr>
 
   # ----------------------------------------------------
   # JOB 2: AGGREGATE RESULTS
