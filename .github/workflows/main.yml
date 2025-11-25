@@ -1,311 +1,244 @@
-name: Universal SBOM Pipeline (High Quality)
+name: 🐙 High-Quality Multi-Repository SBOM Harvester
 
 on:
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
   workflow_dispatch:
     inputs:
-      language:
-        description: "Language filter for deep scan (e.g. C++, Python, Java). Use 'none' to skip."
+      target_repos:
+        description: 'Comma-separated list of TARGET GitHub repos (e.g., org/repo1, org/repo2)'
         required: true
-        default: "C++"
+        default: 'actions/checkout, actions/setup-python' 
+      language:
+        description: 'Language filter for deep scan (e.g., C++, Python). Use "none" for generic scan.'
+        required: true
+        default: 'C++'
 
 jobs:
-  sbom_pipeline:
+  # ----------------------------------------------------
+  # JOB 1: HARVEST AND SCAN REPOSITORIES (Parallel Matrix)
+  # ----------------------------------------------------
+  harvest_repos:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false 
+      matrix:
+        repository: ${{ fromJson(format('["{0}"]', replace(github.event.inputs.target_repos, ',', '","'))) }}
+    
     steps:
-    - name: ⬇️ Checkout Repository
-      uses: actions/checkout@v4
+      - name: ⬇️ Checkout Target Repository (${{ matrix.repository }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          token: ${{ secrets.GITHUB_TOKEN }} 
+          path: repo-source # Checkout into a dedicated sub-directory
 
-    # ----------------------------------------------------
-    # 1. CORE SCANNERS (Trivy as Main Baseline, Syft as Enrichment)
-    # ----------------------------------------------------
-    # Syft (Enrichment): Provides a high-quality, comprehensive list of files and dependencies.
-    - name: 📦 Generate SBOM with Syft (Filesystem)
-      uses: anchore/syft-action/source@v0.19.0
-      with:
-        output: "cyclonedx-json"
-        file: "syft-sbom.json"
+      - name: 🐍 Setup Python for Deep Scans & Merge Script
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
 
-    # Trivy (Main Analyser/Baseline): Scans filesystem for OS packages and file dependencies.
-    - name: 🛡️ Generate SBOM with Trivy (Filesystem/Vulnerabilities)
-      uses: aquasecurity/trivy-action@master
-      with:
-        scan-type: 'fs'
-        format: 'cyclonedx-json'
-        output: 'trivy-fs.json'
-        vuln-type: 'os,library'
-        security-checks: 'vuln'
-        output-path: 'vulnerabilities_fs.json'
+      - name: ⚙️ Install Tools (CDXGen, Merge Dependencies)
+        run: |
+          npm install -g @cyclonedx/cdxgen
+          pip install jsonpath-ng
 
-    # ----------------------------------------------------
-    # 2. LANGUAGE-SPECIFIC DEEP SCANS (CDXGen as Main, Conan as Optional)
-    # ----------------------------------------------------
-    - name: 🐍 Setup Python for Deep Scans & Merge Script
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.x'
+      # ----------------------------------------------------
+      # 1. ENRICHMENT SCANNER (Syft)
+      # ----------------------------------------------------
+      # Syft (Enrichment): Provides OS and filesystem components to enrich the final SBOM.
+      - name: 📦 Generate SBOM with Syft (Enrichment)
+        uses: anchore/syft-action/source@v0.19.0
+        with:
+          directory: ./repo-source
+          output: "cyclonedx-json"
+          file: "syft-sbom.json"
 
-    - name: ⚙️ Install Global NPM Dependencies for CDXGen/Conan
-      run: |
-        npm install -g @cyclonedx/cdxgen
-
-    # CDXGen (Main Deep Scanner)
-    - name: ⚙️ Optional Deep Scan (CDXGen ${{ github.event.inputs.language }})
-      id: cdxgen_scan
-      # Run if the input is a standard language (not C/C++ or none)
-      if: |
-        github.event.inputs.language != '' && 
-        github.event.inputs.language != 'none' && 
-        !startsWith(github.event.inputs.language, 'C') &&
-        !startsWith(github.event.inputs.language, 'c')
-      run: |
-        LANG_INPUT="${{ github.event.inputs.language }}"
-        LANG=$(echo "$LANG_INPUT" | tr '[:upper:]' '[:lower:]')
-        OUTPUT_FILE="cdxgen-${LANG}-sbom.json"
-        
-        # Install JDK if needed for Java/Maven/Gradle projects
-        if [ "$LANG" == "java" ]; then
-            sudo apt-get update && sudo apt-get install -y default-jdk
-        fi
-        
-        cdxgen -o "$OUTPUT_FILE" --type "$LANG"
-
-        echo "CDXGEN_OUTPUT_FILE=$OUTPUT_FILE" >> $GITHUB_ENV
-        echo "sbom_file_exists=true" >> $GITHUB_OUTPUT
-      continue-on-error: true
-
-    # Conan (Optional C/C++ Scanner)
-    - name: ⚙️ Optional C/C++ Deep Scan (Conan)
-      id: conan_scan
-      # Run specifically if C, C++, or similar is requested
-      if: |
-        startsWith(github.event.inputs.language, 'C') ||
-        startsWith(github.event.inputs.language, 'c')
-      run: |
-        CONAN_FILE="conan-sbom.json"
-        
-        # Install necessary tools
-        pip install conan
-        
-        # Run cdxgen against the source directory, leveraging its native support for Conan lockfiles
-        # NOTE: This assumes a conanfile or lockfile exists in the root.
-        cdxgen -o "$CONAN_FILE" --type cpp
-
-        echo "CONAN_OUTPUT_FILE=$CONAN_FILE" >> $GITHUB_ENV
-        echo "sbom_file_exists=true" >> $GITHUB_OUTPUT
-      continue-on-error: true
-
-
-    # ----------------------------------------------------
-    # 3. DATA ENRICHMENT AND MERGING (The Quality Fix)
-    # ----------------------------------------------------
-    - name: ⚙️ Install Python Dependencies for Merge
-      run: pip install jsonpath-ng
-
-    - name: 📝 Create & Run SBOM Merge Script (Supplier/Timestamp Fix)
-      id: merge_and_enrich
-      env:
-        REPO_NAME: ${{ github.repository }}
-        CDXGEN_FILE: ${{ steps.cdxgen_scan.outputs.sbom_file_exists && env.CDXGEN_OUTPUT_FILE || '' }}
-        CONAN_FILE: ${{ steps.conan_scan.outputs.sbom_file_exists && env.CONAN_OUTPUT_FILE || '' }} # Collect Conan output
-      run: |
-        cat << 'EOF' > merged_and_enrich.py
-        import json
-        import re
-        import os
-        from datetime import datetime
-
-        def normalize_component(component, default_supplier):
-            """Enriches a component with necessary fields (Supplier) based on PURL to fix NTIA compliance."""
-            purl = component.get("purl", "")
-            supplier_name = ""
-
-            # 1. Keep a valid supplier if already set by the scanner (highest confidence)
-            existing_supplier = component.get("supplier", {}).get("name", "")
-            if existing_supplier and existing_supplier.lower() != default_supplier.lower():
-                return component
-
-            # 2. Infer supplier from PURL (Critical Fix for NTIA/High Quality)
-            if purl:
-                purl_match = re.match(r"pkg:(\w+)/([\w\-\.]+)/?([^@\?#]*)", purl)
-                if purl_match:
-                    pkg_type = purl_match.group(1)
-                    namespace = purl_match.group(2)
-            
-            # Ecosystem/Vendor Specific Logic 
-            if pkg_type == "github":
-                org_map = {
-                    "actions": "GitHub, Inc. (Official Actions)", 
-                    "arduino": "Arduino LLC", 
-                    "codecov": "Codecov, Inc."
-                }
-                if namespace in org_map:
-                    supplier_name = org_map[namespace]
-                else:
-                    supplier_name = f"{namespace} (via GitHub)"
-
-            elif pkg_type in ["maven", "pypi", "npm", "nuget", "golang"]:
-                # High-confidence supplier for common package ecosystems
-                supplier_map = {
-                    "maven": "Maven Central Repository",
-                    "pypi": "Python Software Foundation",
-                    "npm": "npm, Inc.",
-                    "nuget": "Microsoft Corporation",
-                    "golang": "Google LLC"
-                }
-                supplier_name = supplier_map.get(pkg_type, namespace)
-            
-            elif namespace:
-                 supplier_name = namespace
-
-            # 3. Apply the inferred supplier, or fall back to the project name
-            if supplier_name:
-                component["supplier"] = {"name": supplier_name}
-            elif not component.get("supplier"):
-                component["supplier"] = {"name": default_supplier}
-        
-            return component
-
-        def merge_and_enrich(files, default_supplier):
-            sboms = []
-            for f in files:
-                if not f or not os.path.exists(f):
-                    continue
-                try:
-                    with open(f, 'r') as fp:
-                        sbom_data = json.load(fp)
-                        if isinstance(sbom_data, dict):
-                            sboms.append(sbom_data)
-                except Exception as e:
-                    print(f"Warning: {f} could not be loaded or decoded. Error: {e}")
-            
-            if not sboms:
-                print("Error: No valid SBOM files found for merging.")
-                return None
-
-            merged_sbom = sboms[0]  
-            merged_sbom['metadata']['timestamp'] = datetime.now().isoformat() + 'Z'
-            merged_sbom['metadata']['component']['supplier'] = {"name": default_supplier}    
-            # Deduplicate and normalize components
-            component_map = {}
-            for sbom in sboms:
-                if 'components' in sbom:
-                    for c in sbom['components']:
-                        ref = c.get("bom-ref", c.get("purl", c.get("name")))
-                        if ref and ref not in component_map:
-                            component_map[ref] = c
-
-            final_components = [normalize_component(c, default_supplier) for c in component_map.values()]
-
-            merged_sbom['components'] = final_components    
-            return merged_sbom
-        if __name__ == "__main__":
-            # Collect core and optional SBOMs
-            SBOM_FILES = ["syft-sbom.json", "trivy-fs.json"]    
-            cdxgen_file = os.environ.get("CDXGEN_FILE")
-            if cdxgen_file:
-                SBOM_FILES.append(cdxgen_file)       
-            conan_file = os.environ.get("CONAN_FILE")
-            if conan_file:
-                SBOM_FILES.append(conan_file)        
-            DEFAULT_SUPPLIER = os.environ.get("REPO_NAME")
-
-            merged_data = merge_and_enrich(SBOM_FILES, DEFAULT_SUPPLIER)
-
-            if merged_data:
-                with open('merged-sbom.json', 'w') as f:
-                    json.dump(merged_data, f, indent=2)
-                print("✅ Successfully generated merged-sbom.json")
-            else:
-                print("❌ Failed to generate merged SBOM. Exiting.")
-                exit(1)
-        
-        EOF
-            python merged_and_enrich.py
-
-    # ----------------------------------------------------
-    # 4. COMPLIANCE, SCORING, AND VULNERABILITY CHECKS (Trivy as Main Analyser)
-    # ----------------------------------------------------
-    - name: 💯 Check Quality Score (SBOMQS)
-      uses: interlynk-io/sbomqs-action@v0.0.1
-      with:
-        input-file: merged-sbom.json
-        output-file: score.json
-        continue-on-error: true 
-
-    - name: 📜 Check NTIA Compliance (SBOMQS)
-      uses: interlynk-io/sbomqs-action@v0.0.1
-      with:
-        input-file: merged-sbom.json
-        output-file: compliance_NTIA.json
-        profile: ntia
-        continue-on-error: true 
-
-    - name: 🏰 Check BSI V2 Compliance (SBOMQS)
-      uses: interlynk-io/sbomqs-action@v0.0.1
-      with:
-        input-file: merged-sbom.json
-        output-file: compliance_BSI.json
-        profile: bsi
-        continue-on-error: true 
-
-    # Trivy's final role: Main Analyser for Vulnerabilities against the merged SBOM
-    - name: 🪱 Scan for Vulnerabilities in Merged SBOM (Trivy)
-      uses: aquasecurity/trivy-action@master
-      with:
-        scan-type: 'sbom'
-        input: 'merged-sbom.json'
-        format: 'json'
-        output: 'vulnerabilities_sbom.json'
+      # ----------------------------------------------------
+      # 2. PRIMARY SBOM MAKERS (CDXGen Primary, Conan Optional)
+      # ----------------------------------------------------
+      # CDXGen (Primary SBOM Maker)
+      - name: ⚙️ Conditional Deep Scan (CDXGen)
+        id: cdxgen_scan
+        if: |
+          github.event.inputs.language != '' && 
+          github.event.inputs.language != 'none' && 
+          !startsWith(github.event.inputs.language, 'C') &&
+          !startsWith(github.event.inputs.language, 'c')
+        run: |
+          LANG_INPUT="${{ github.event.inputs.language }}"
+          LANG=$(echo "$LANG_INPUT" | tr '[:upper:]' '[:lower:]')
+          OUTPUT_FILE="cdxgen-${LANG}-sbom.json"
+          cdxgen -o "$OUTPUT_FILE" --type "$LANG" ./repo-source
+          echo "CDXGEN_OUTPUT_FILE=$OUTPUT_FILE" >> $GITHUB_ENV
+          echo "sbom_file_exists=true" >> $GITHUB_OUTPUT
         continue-on-error: true
 
-    # ----------------------------------------------------
-    # 5. FINAL AGGREGATION AND REPORTING
-    # ----------------------------------------------------
-    - name: 📊 Aggregate Final Summary
-      id: aggregate_summary
-      run: |
-        sudo apt-get install -y jq bc
-        
-        # Safely extract scores, defaulting to 'error' if file is missing
-        NTIA_SCORE=$(jq -r '.summary.total_score // "error"' compliance_NTIA.json 2>/dev/null || echo "error")
-        BSI_SCORE=$(jq -r '.summary.total_score // "error"' compliance_BSI.json 2>/dev/null || echo "error")
-        OVERALL_SCORE=$(jq -r '.files[0].sbom_quality_score // "error"' score.json 2>/dev/null || echo "error")
+      # Conan (Optional SBOM Maker for C/C++)
+      - name: ⚙️ Conditional C/C++ Deep Scan (Conan)
+        id: conan_scan
+        if: |
+          startsWith(github.event.inputs.language, 'C') ||
+          startsWith(github.event.inputs.language, 'c')
+        run: |
+          CONAN_FILE="conan-sbom.json"
+          pip install conan # Install Conan only when needed
+          cdxgen -o "$CONAN_FILE" --type cpp ./repo-source
+          echo "CONAN_OUTPUT_FILE=$CONAN_FILE" >> $GITHUB_ENV
+          echo "sbom_file_exists=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
 
-        # Safely extract vuln counts from the SBOM scan, defaulting to 0
-        VULN_TOTAL=$(jq '[.Results[] | .Vulnerabilities | length] | add' vulnerabilities_sbom.json 2>/dev/null || echo 0)
-        VULN_HIGH=$(jq '[.Results[] | .Vulnerabilities[] | select(.Severity == "HIGH") ] | length' vulnerabilities_sbom.json 2>/dev/null || echo 0)
-        VULN_CRITICAL=$(jq '[.Results[] | .Vulnerabilities[] | select(.Severity == "CRITICAL") ] | length' vulnerabilities_sbom.json 2>/dev/null || echo 0)
-        
-        # Get component count and repo metadata
-        COMPONENT_COUNT=$(jq '.components | length' merged-sbom.json 2>/dev/null || echo 0)
-        REPO_LICENSE=$(jq -r '.metadata.component.licenses[0].license.id' merged-sbom.json 2>/dev/null || echo "N/A")
+      # ----------------------------------------------------
+      # 3. DATA MERGING (Creates the Final Enriched Artifact)
+      # ----------------------------------------------------
+      - name: 📝 Run SBOM Merge Script (Supplier Enrichment & Merge)
+        id: merge_and_enrich
+        env:
+          REPO_NAME: ${{ matrix.repository }}
+          CDXGEN_FILE: ${{ steps.cdxgen_scan.outputs.sbom_file_exists && env.CDXGEN_OUTPUT_FILE || '' }}
+          CONAN_FILE: ${{ steps.conan_scan.outputs.sbom_file_exists && env.CONAN_OUTPUT_FILE || '' }}
+        run: |
+          cat << 'EOF' > merged_and_enrich.py
+          import json
+          import re
+          import os
+          from datetime import datetime
 
-        # Generate simplified pass/fail (NTIA pass > 9.0, BSI pass > 5.0)
-        NTIA_PASS_STATUS=$([ "$(echo "$NTIA_SCORE > 9.0" | bc -l)" -eq 1 ] && echo "pass" || echo "fail")
-        BSI_PASS_STATUS=$([ "$(echo "$BSI_SCORE > 5.0" | bc -l)" -eq 1 ] && echo "pass" || echo "fail")
+          def normalize_component(component, default_supplier):
+              # CRITICAL: Ensures NTIA compliance by setting a Supplier if missing
+              purl = component.get("purl", "")
+              supplier_name = ""
+              existing_supplier = component.get("supplier", {}).get("name", "")    
+              # 1. Infer supplier from PURL if needed
+              if not existing_supplier and purl:
+                  purl_match = re.match(r"pkg:(\w+)/([\w\-\.]+)/?([^@\?#]*)", purl)
+                  if purl_match:
+                      pkg_type = purl_match.group(1)
+                      namespace = purl_match.group(2)
+            
+                      supplier_map = {
+                          "maven": "Maven Central Repository",
+                          "pypi": "Python Software Foundation",
+                          "npm": "npm, Inc.",
+                      }
+                      supplier_name = supplier_map.get(pkg_type, namespace)
+            
+              if supplier_name:
+                  component["supplier"] = {"name": supplier_name}
+              elif not component.get("supplier"):
+                  component["supplier"] = {"name": default_supplier}        
+              return component
 
-        # Create/Update the summary CSV
-        SUMMARY_HEADER="repo,repo_license,component_count,vuln_sbom_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass"
-        SUMMARY_DATA="${{ github.repository }},$REPO_LICENSE,$COMPONENT_COUNT,$VULN_TOTAL,$VULN_HIGH,$VULN_CRITICAL,$OVERALL_SCORE,$NTIA_PASS_STATUS,$BSI_PASS_STATUS"
-        
-        echo "$SUMMARY_HEADER" > summary.csv
-        echo "$SUMMARY_DATA" >> summary.csv
-        
-    - name: 📤 Upload Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: sbom-reports-high-quality
-        path: |
-          merged-sbom.json
-          score.json
-          compliance_NTIA.json
-          compliance_BSI.json
-          vulnerabilities_fs.json
-          vulnerabilities_sbom.json
-          summary.csv
-          cdxgen-*-sbom.json
-          conan-sbom.json
+          def merge_and_enrich(files, default_supplier):
+              sboms = []
+              for f in files:
+                  if os.path.exists(f):
+                      with open(f, 'r') as fp:
+                          try:
+                              sboms.append(json.load(fp))
+                          except:
+                              print(f"Warning: Failed to load {f}")   
+              if not sboms: return None
+              merged_sbom = sboms[0]    
+              # CRITICAL: Set timestamp and root component supplier
+              merged_sbom['metadata']['timestamp'] = datetime.now().isoformat() + 'Z'
+              merged_sbom['metadata']['component']['supplier'] = {"name": default_supplier}    
+              component_map = {}
+              for sbom in sboms:
+                  if 'components' in sbom:
+                      for c in sbom['components']:
+                          # Deduplication logic (name/version/purl)
+                          ref = c.get("purl", c.get("name") + c.get("version", ""))
+                          if ref and ref not in component_map:
+                              component_map[ref] = c
+
+              final_components = [normalize_component(c, default_supplier) for c in component_map.values()]
+              merged_sbom['components'] = final_components    
+              return merged_sbom
+
+          if __name__ == "__main__":
+              # Collect Syft (Enrichment) and CDXGen/Conan (Primary Makers)
+              SBOM_FILES = ["syft-sbom.json"]
+              if os.environ.get("CDXGEN_FILE"): SBOM_FILES.append(os.environ["CDXGEN_FILE"])
+              if os.environ.get("CONAN_FILE"): SBOM_FILES.append(os.environ["CONAN_FILE"])        
+              merged_data = merge_and_enrich(SBOM_FILES, os.environ.get("REPO_NAME"))
+
+              if merged_data:
+                  with open('merged-sbom.json', 'w') as f:
+                      json.dump(merged_data, f, indent=2)
+                  print("✅ Successfully generated merged-sbom.json")
+              else:
+                  exit(1)        
+          EOF
+                  python merged_and_enrich.py
+
+      # ----------------------------------------------------
+      # 4. PRIMARY ANALYSER (Trivy)
+      # ----------------------------------------------------
+      # Trivy (Analysis): Scans the complete, highly enriched merged SBOM.
+      - name: 🪱 Scan for Vulnerabilities in Merged SBOM (Trivy Analysis)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'sbom'
+          input: 'merged-sbom.json'
+          format: 'json'
+          output: 'vulnerabilities.json'
+          continue-on-error: true
+        id: trivy_final_scan
+      
+      # --- Create Structured Summary for Aggregation ---
+      - name: 📝 Create Repo Summary JSON
+        id: create_summary
+        run: |
+          VULN_TOTAL=$(jq '[.Results[] | .Vulnerabilities | length] | add' vulnerabilities.json 2>/dev/null || echo 0)
+          VULN_CRITICAL=$(jq '[.Results[] | .Vulnerabilities[] | select(.Severity == "CRITICAL") ] | length' vulnerabilities.json 2>/dev/null || echo 0)
+          
+          if [ -f merged-sbom.json ]; then
+            COMPONENT_COUNT=$(jq '.components | length' merged-sbom.json)
+          else
+            COMPONENT_COUNT=0
+          fi
+          
+          echo "{" >> summary.json
+          echo "  \"repo\": \"${{ matrix.repository }}\"," >> summary.json
+          echo "  \"component_count\": $COMPONENT_COUNT," >> summary.json
+          echo "  \"vuln_total\": $VULN_TOTAL," >> summary.json
+          echo "  \"vuln_critical\": $VULN_CRITICAL" >> summary.json
+          echo "}" >> summary.json
+
+      - name: 📤 Upload Summary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.repository }}-summary
+          path: summary.json
+          retention-days: 1
+          
+  # ----------------------------------------------------
+  # JOB 2: AGGREGATE RESULTS
+  # ----------------------------------------------------
+  aggregate_results:
+    runs-on: ubuntu-latest
+    needs: harvest_repos 
+    steps:
+      - name: 📥 Download All Summaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: '*-summary'
+          merge-multiple: true 
+          
+      - name: 📊 Aggregate Final Master CSV Report
+        run: |
+          sudo apt-get install -y jq
+          echo "repo,component_count,vuln_total,vuln_critical" > master_report.csv
+          find artifacts -name "summary.json" -print0 | while IFS= read -r -d $'\0' file; do
+            REPO=$(jq -r '.repo' "$file")
+            COUNT=$(jq -r '.component_count' "$file")
+            TOTAL=$(jq -r '.vuln_total' "$file")
+            CRIT=$(jq -r '.vuln_critical' "$file")
+            echo "$REPO,$COUNT,$TOTAL,$CRIT" >> master_report.csv
+          done
+          
+      - name: 📤 Upload Final Master Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: multi-repo-master-report
+          path: master_report.csv
