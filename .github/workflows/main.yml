@@ -53,7 +53,7 @@ jobs:
         npm install -g @cyclonedx/cdxgen
 
     # CDXGen (Main Deep Scanner)
-    - name: ⚙️ Optional Deep Scan (CDXGen: ${{ github.event.inputs.language }})
+    - name: ⚙️ Optional Deep Scan (CDXGen ${{ github.event.inputs.language }})
       id: cdxgen_scan
       # Run if the input is a standard language (not C/C++ or none)
       if: |
@@ -105,35 +105,35 @@ jobs:
     - name: ⚙️ Install Python Dependencies for Merge
       run: pip install jsonpath-ng
 
-   - name: 📝 Create & Run SBOM Merge Script (Supplier/Timestamp Fix)
-  id: merge_and_enrich
-  env:
-    REPO_NAME: ${{ github.repository }}
-    CDXGEN_FILE: ${{ steps.cdxgen_scan.outputs.sbom_file_exists && env.CDXGEN_OUTPUT_FILE || '' }}
-    CONAN_FILE: ${{ steps.conan_scan.outputs.sbom_file_exists && env.CONAN_OUTPUT_FILE || '' }} # Collect Conan output
-  run: |
-    cat << 'EOF' > merged_and_enrich.py
-import json
-import re
-import os
-from datetime import datetime
+    - name: 📝 Create & Run SBOM Merge Script (Supplier/Timestamp Fix)
+      id: merge_and_enrich
+      env:
+        REPO_NAME: ${{ github.repository }}
+        CDXGEN_FILE: ${{ steps.cdxgen_scan.outputs.sbom_file_exists && env.CDXGEN_OUTPUT_FILE || '' }}
+        CONAN_FILE: ${{ steps.conan_scan.outputs.sbom_file_exists && env.CONAN_OUTPUT_FILE || '' }} # Collect Conan output
+      run: |
+        cat << 'EOF' > merged_and_enrich.py
+        import json
+        import re
+        import os
+        from datetime import datetime
 
-def normalize_component(component, default_supplier):
-    """Enriches a component with necessary fields (Supplier) based on PURL to fix NTIA compliance."""
-    purl = component.get("purl", "")
-    supplier_name = ""
+        def normalize_component(component, default_supplier):
+            """Enriches a component with necessary fields (Supplier) based on PURL to fix NTIA compliance."""
+            purl = component.get("purl", "")
+            supplier_name = ""
 
-    # 1. Keep a valid supplier if already set by the scanner (highest confidence)
-    existing_supplier = component.get("supplier", {}).get("name", "")
-    if existing_supplier and existing_supplier.lower() != default_supplier.lower():
-        return component
+            # 1. Keep a valid supplier if already set by the scanner (highest confidence)
+            existing_supplier = component.get("supplier", {}).get("name", "")
+            if existing_supplier and existing_supplier.lower() != default_supplier.lower():
+                return component
 
-    # 2. Infer supplier from PURL (Critical Fix for NTIA/High Quality)
-    if purl:
-        purl_match = re.match(r"pkg:(\w+)/([\w\-\.]+)/?([^@\?#]*)", purl)
-        if purl_match:
-            pkg_type = purl_match.group(1)
-            namespace = purl_match.group(2)
+            # 2. Infer supplier from PURL (Critical Fix for NTIA/High Quality)
+            if purl:
+                purl_match = re.match(r"pkg:(\w+)/([\w\-\.]+)/?([^@\?#]*)", purl)
+                if purl_match:
+                    pkg_type = purl_match.group(1)
+                    namespace = purl_match.group(2)
             
             # Ecosystem/Vendor Specific Logic 
             if pkg_type == "github":
@@ -161,77 +161,70 @@ def normalize_component(component, default_supplier):
             elif namespace:
                  supplier_name = namespace
 
-    # 3. Apply the inferred supplier, or fall back to the project name
-    if supplier_name:
-        component["supplier"] = {"name": supplier_name}
-    elif not component.get("supplier"):
-        component["supplier"] = {"name": default_supplier}
+            # 3. Apply the inferred supplier, or fall back to the project name
+            if supplier_name:
+                component["supplier"] = {"name": supplier_name}
+            elif not component.get("supplier"):
+                component["supplier"] = {"name": default_supplier}
         
-    return component
+            return component
 
-def merge_and_enrich(files, default_supplier):
-    sboms = []
-    for f in files:
-        if not f or not os.path.exists(f):
-            continue
-        try:
-            with open(f, 'r') as fp:
-                sbom_data = json.load(fp)
-                if isinstance(sbom_data, dict):
-                    sboms.append(sbom_data)
-        except Exception as e:
-            print(f"Warning: {f} could not be loaded or decoded. Error: {e}")
+        def merge_and_enrich(files, default_supplier):
+            sboms = []
+            for f in files:
+                if not f or not os.path.exists(f):
+                    continue
+                try:
+                    with open(f, 'r') as fp:
+                        sbom_data = json.load(fp)
+                        if isinstance(sbom_data, dict):
+                            sboms.append(sbom_data)
+                except Exception as e:
+                    print(f"Warning: {f} could not be loaded or decoded. Error: {e}")
             
-    if not sboms:
-        print("Error: No valid SBOM files found for merging.")
-        return None
+            if not sboms:
+                print("Error: No valid SBOM files found for merging.")
+                return None
 
-    merged_sbom = sboms[0]
-    
-    merged_sbom['metadata']['timestamp'] = datetime.now().isoformat() + 'Z'
-    merged_sbom['metadata']['component']['supplier'] = {"name": default_supplier}
-    
-    # Deduplicate and normalize components
-    component_map = {}
-    for sbom in sboms:
-        if 'components' in sbom:
-            for c in sbom['components']:
-                ref = c.get("bom-ref", c.get("purl", c.get("name")))
-                if ref and ref not in component_map:
-                    component_map[ref] = c
+            merged_sbom = sboms[0]  
+            merged_sbom['metadata']['timestamp'] = datetime.now().isoformat() + 'Z'
+            merged_sbom['metadata']['component']['supplier'] = {"name": default_supplier}    
+            # Deduplicate and normalize components
+            component_map = {}
+            for sbom in sboms:
+                if 'components' in sbom:
+                    for c in sbom['components']:
+                        ref = c.get("bom-ref", c.get("purl", c.get("name")))
+                        if ref and ref not in component_map:
+                            component_map[ref] = c
 
-    final_components = [normalize_component(c, default_supplier) for c in component_map.values()]
+            final_components = [normalize_component(c, default_supplier) for c in component_map.values()]
 
-    merged_sbom['components'] = final_components
-    
-    return merged_sbom
+            merged_sbom['components'] = final_components    
+            return merged_sbom
+        if __name__ == "__main__":
+            # Collect core and optional SBOMs
+            SBOM_FILES = ["syft-sbom.json", "trivy-fs.json"]    
+            cdxgen_file = os.environ.get("CDXGEN_FILE")
+            if cdxgen_file:
+                SBOM_FILES.append(cdxgen_file)       
+            conan_file = os.environ.get("CONAN_FILE")
+            if conan_file:
+                SBOM_FILES.append(conan_file)        
+            DEFAULT_SUPPLIER = os.environ.get("REPO_NAME")
 
-if __name__ == "__main__":
-    # Collect core and optional SBOMs
-    SBOM_FILES = ["syft-sbom.json", "trivy-fs.json"] 
-    
-    cdxgen_file = os.environ.get("CDXGEN_FILE")
-    if cdxgen_file:
-        SBOM_FILES.append(cdxgen_file)
+            merged_data = merge_and_enrich(SBOM_FILES, DEFAULT_SUPPLIER)
+
+            if merged_data:
+                with open('merged-sbom.json', 'w') as f:
+                    json.dump(merged_data, f, indent=2)
+                print("✅ Successfully generated merged-sbom.json")
+            else:
+                print("❌ Failed to generate merged SBOM. Exiting.")
+                exit(1)
         
-    conan_file = os.environ.get("CONAN_FILE")
-    if conan_file:
-        SBOM_FILES.append(conan_file)
-        
-    DEFAULT_SUPPLIER = os.environ.get("REPO_NAME")
-
-    merged_data = merge_and_enrich(SBOM_FILES, DEFAULT_SUPPLIER)
-
-    if merged_data:
-        with open('merged-sbom.json', 'w') as f:
-            json.dump(merged_data, f, indent=2)
-        print("✅ Successfully generated merged-sbom.json")
-    else:
-        print("❌ Failed to generate merged SBOM. Exiting.")
-        exit(1)
-        
-EOF
-    python merged_and_enrich.py
+        EOF
+            python merged_and_enrich.py
 
     # ----------------------------------------------------
     # 4. COMPLIANCE, SCORING, AND VULNERABILITY CHECKS (Trivy as Main Analyser)
