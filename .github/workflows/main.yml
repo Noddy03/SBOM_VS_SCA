@@ -120,82 +120,69 @@ jobs:
           CONAN_FILE: ${{ steps.conan_scan.outputs.sbom_file_exists && env.CONAN_OUTPUT_FILE || '' }}
         run: |
           cat << 'EOF' > merged_and_enrich.py
-import json
-import re
-import os
-from datetime import datetime
-
-def normalize_component(component, default_supplier):
-    # CRITICAL: Ensures NTIA compliance by setting a Supplier if missing
-    purl = component.get("purl", "")
-    supplier_name = ""
-    existing_supplier = component.get("supplier", {}).get("name", "")
-    
-    if not existing_supplier and purl:
-        purl_match = re.match(r"pkg:(\w+)/([\w\-\.]+)/?([^@\?#]*)", purl)
-        if purl_match:
-            pkg_type = purl_match.group(1)
-            namespace = purl_match.group(2)
+          import json
+          import re
+          import os
+          from datetime import datetime
+          def normalize_component(component, default_supplier):
+              # CRITICAL: Ensures NTIA compliance by setting a Supplier if missing
+              purl = component.get("purl", "")
+              supplier_name = ""
+              existing_supplier = component.get("supplier", {}).get("name", "")   
+              if not existing_supplier and purl:
+                  purl_match = re.match(r"pkg:(\w+)/([\w\-\.]+)/?([^@\?#]*)", purl)
+                  if purl_match:
+                      pkg_type = purl_match.group(1)
+                      namespace = purl_match.group(2)            
+                      supplier_map = {
+                          "maven": "Maven Central Repository",
+                          "pypi": "Python Software Foundation",
+                          "npm": "npm, Inc.",
+                      }
+                      supplier_name = supplier_map.get(pkg_type, namespace)
             
-            supplier_map = {
-                "maven": "Maven Central Repository",
-                "pypi": "Python Software Foundation",
-                "npm": "npm, Inc.",
-            }
-            supplier_name = supplier_map.get(pkg_type, namespace)
-            
-    if supplier_name:
-        component["supplier"] = {"name": supplier_name}
-    elif not component.get("supplier"):
-        component["supplier"] = {"name": default_supplier}
-        
-    return component
+              if supplier_name:
+                  component["supplier"] = {"name": supplier_name}
+              elif not component.get("supplier"):
+                  component["supplier"] = {"name": default_supplier}       
+              return component
 
-def merge_and_enrich(files, default_supplier):
-    sboms = []
-    for f in files:
-        if os.path.exists(f):
-            with open(f, 'r') as fp:
-                try:
-                    sboms.append(json.load(fp))
-                except:
-                    print(f"Warning: Failed to load {f}")
-    
-    if not sboms: return None
-    merged_sbom = sboms[0]
-    
-    merged_sbom['metadata']['timestamp'] = datetime.now().isoformat() + 'Z'
-    merged_sbom['metadata']['component']['supplier'] = {"name": default_supplier}
-    
-    component_map = {}
-    for sbom in sboms:
-        if 'components' in sbom:
-            for c in sbom['components']:
-                ref = c.get("purl", c.get("name") + c.get("version", ""))
-                if ref and ref not in component_map:
-                    component_map[ref] = c
-
-    final_components = [normalize_component(c, default_supplier) for c in component_map.values()]
-    merged_sbom['components'] = final_components
-    
-    return merged_sbom
-
-if __name__ == "__main__":
-    SBOM_FILES = ["syft-sbom.json"]
-    if os.environ.get("CDXGEN_FILE"): SBOM_FILES.append(os.environ["CDXGEN_FILE"])
-    if os.environ.get("CONAN_FILE"): SBOM_FILES.append(os.environ["CONAN_FILE"])
-        
-    merged_data = merge_and_enrich(SBOM_FILES, os.environ.get("REPO_NAME"))
-
-    if merged_data:
-        with open('merged-sbom.json', 'w') as f:
-            json.dump(merged_data, f, indent=2)
-        print("✅ Successfully generated merged-sbom.json")
-    else:
-        exit(1)
-        
-EOF
-        python merged_and_enrich.py
+          def merge_and_enrich(files, default_supplier):
+              sboms = []
+              for f in files:
+                  if os.path.exists(f):
+                      with open(f, 'r') as fp:
+                          try:
+                              sboms.append(json.load(fp))
+                          except:
+                              print(f"Warning: Failed to load {f}") 
+              if not sboms: return None
+              merged_sbom = sboms[0]   
+              merged_sbom['metadata']['timestamp'] = datetime.now().isoformat() + 'Z'
+              merged_sbom['metadata']['component']['supplier'] = {"name": default_supplier}    
+              component_map = {}
+              for sbom in sboms:
+                  if 'components' in sbom:
+                      for c in sbom['components']:
+                          ref = c.get("purl", c.get("name") + c.get("version", ""))
+                          if ref and ref not in component_map:
+                              component_map[ref] = c
+              final_components = [normalize_component(c, default_supplier) for c in component_map.values()]
+              merged_sbom['components'] = final_components    
+              return merged_sbom
+          if __name__ == "__main__":
+              SBOM_FILES = ["syft-sbom.json"]
+              if os.environ.get("CDXGEN_FILE"): SBOM_FILES.append(os.environ["CDXGEN_FILE"])
+              if os.environ.get("CONAN_FILE"): SBOM_FILES.append(os.environ["CONAN_FILE"]) 
+              merged_data = merge_and_enrich(SBOM_FILES, os.environ.get("REPO_NAME"))
+              if merged_data:
+                  with open('merged-sbom.json', 'w') as f:
+                      json.dump(merged_data, f, indent=2)
+                  print("✅ Successfully generated merged-sbom.json")
+              else:
+                  exit(1)        
+          EOF
+                  python merged_and_enrich.py
 
       # ----------------------------------------------------
       # 4. PRIMARY ANALYSER (Trivy)
