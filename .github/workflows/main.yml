@@ -1,4 +1,4 @@
-name: 🚀 Universal SBOM Pipeline (High Quality & Optimized)
+name:  Universal SBOM Pipeline (High Quality & Optimized)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ env:
 
 jobs:
   # ----------------------------------------------------
-  # JOB 0: DYNAMIC REPO FETCH (with Stability Fix)
+  # JOB 0: DYNAMIC REPO FETCH (Fix for Shell Syntax Error)
   # ----------------------------------------------------
   fetch_top_repos:
     runs-on: ubuntu-latest
@@ -44,41 +44,47 @@ jobs:
         run: |
           set -euo pipefail
           
-          # --- 1. Attempt dynamic search ---
+          REPO_LIST_FILE="repos.txt"
+          touch "$REPO_LIST_FILE"
+          
+          # --- 1. Attempt dynamic search (Primary) ---
+          # Use file redirection to avoid issues with multi-line shell variables
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
-          REPOS=$(gh api -X GET /search/repositories \
+          gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
               --raw-field sort=stars \
               --raw-field order=desc \
               --raw-field per_page=100 \
-              --jq '.items[].full_name' 2>/dev/null || true)
+              --jq '.items[].full_name' 2> >(grep -v 'api.github.com' >&2) > "$REPO_LIST_FILE" || true
           
-          # Fallback check
-          if [ -z "$REPOS" ]; then
+          # Check if the file is empty after the first search
+          if [ ! -s "$REPO_LIST_FILE" ]; then
             echo "Primary search failed or returned empty. Trying generic search."
             RAW_Q="language:$LANG fork:false archived:false"
-            REPOS=$(gh api -X GET /search/repositories \
+            # Secondary search
+            gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
               --raw-field sort=stars \
               --raw-field order=desc \
               --raw-field per_page=100 \
-              --jq '.items[].full_name' 2>/dev/null || true)
+              --jq '.items[].full_name' 2> >(grep -v 'api.github.com' >&2) > "$REPO_LIST_FILE" || true
           fi
 
-          # --- 2. Use Fallback if both searches fail ---
-          if [ -z "$REPOS" ]; then
+          # --- 2. Use Fallback if both searches fail/empty ---
+          if [ ! -s "$REPO_LIST_FILE" ]; then
             echo "Dynamic search failed. Using fixed fallback repositories."
-            REPOS=$(echo "$REPO_FALLBACK" | tr ',' '\n')
+            echo "$REPO_FALLBACK" | tr ',' '\n' > "$REPO_LIST_FILE"
           fi
 
-          # --- 3. Format result as JSON array ---
-          # Safe way to handle empty or newline-separated strings for jq
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          # --- 3. Format result as JSON array and set output ---
+          REPOS_CONTENT=$(cat "$REPO_LIST_FILE")
+          # Use printf and jq to guarantee a valid, single-line JSON array for the output variable
+          JSON_ARRAY=$(printf "%s\n" "$REPOS_CONTENT" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           
           echo "Discovered repositories: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-          <hr>
+<hr>
 
   # ----------------------------------------------------
   # JOB 1: SBOM SCAN (Parallel Matrix)
@@ -622,17 +628,19 @@ jobs:
               return vulns
 
           def analyze_sast_cppcheck(path):
-              if not os.path.exists(path): return 0, 0 # <--- FIX APPLIED HERE
+              # FIX: Always return a tuple for unpacking, even if the file is missing/error.
+              if not os.path.exists(path): return 0, 0 
               try:
                   with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                      # Quick count of unique error lines
                       content = f.read()
                       # Matches <error> tags in the XML
                       count = len(re.findall(r'<error\s+[^>]*\s+severity="[a-zA-Z]+"', content))
                       # A crude check for severe issues (e.g., 'error' or 'warning')
                       critical_count = len(re.findall(r'<error\s+[^>]*\s+severity="(error|warning)"', content))
                       return count, critical_count
-              except: return 0, 0
+              except: 
+                  # Catch all other parsing/IO errors and return a safe tuple
+                  return 0, 0
           
           # 1. Gather all vulnerabilities from Trivy scans
           fs = extract_vulns("project-src/vulnerabilities_fs.json","filesystem")
@@ -652,7 +660,7 @@ jobs:
           VULN_CRITICAL = severity_counts.get("CRITICAL", 0)
           VULN_HIGH = severity_counts.get("HIGH", 0)
           
-          # 3. SAST Check
+          # 3. SAST Check (This line previously caused the error if cppcheck_raw.xml was missing)
           cppcheck_total, cppcheck_critical = analyze_sast_cppcheck("project-src/cppcheck_raw.xml")
           sast_pass = "PASS" if cppcheck_total == 0 else "FAIL"
 
@@ -708,7 +716,8 @@ jobs:
             project-src/cppcheck_raw.xml
             project-src/flawfinder_raw.txt
           retention-days: 7
-            <hr>
+
+          <hr>
 
   # ----------------------------------------------------
   # JOB 2: AGGREGATE RESULTS
