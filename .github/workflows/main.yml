@@ -53,7 +53,7 @@ jobs:
         npm install -g @cyclonedx/cdxgen
 
     # CDXGen (Main Deep Scanner)
-    - name: ⚙️ Optional Deep Scan (CDXGen: ${{ github.event.inputs.language }})
+    - name: ⚙️ Optional Deep Scan (CDXGen ${{ github.event.inputs.language }})
       id: cdxgen_scan
       # Run if the input is a standard language (not C/C++ or none)
       if: |
