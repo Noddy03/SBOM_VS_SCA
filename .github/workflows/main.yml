@@ -1,4 +1,4 @@
-name:  Universal SBOM Pipeline (High Quality & Optimized)
+name: 🚀 Universal SBOM Pipeline (High Quality & Optimized)
 
 on:
   workflow_dispatch:
@@ -78,6 +78,8 @@ jobs:
           echo "Discovered repositories: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
+<hr>
+
   # ----------------------------------------------------
   # JOB 1: SBOM SCAN (Parallel Matrix)
   # ----------------------------------------------------
@@ -149,7 +151,6 @@ jobs:
       - name: Checkout target repository (reliable clone)
         run: |
           set -euo pipefail
-          # ... (rest of the clone script is unchanged, it was already robust) ...
           rm -rf project-src
           git clone --depth 1 https://github.com/${{ matrix.repo }}.git project-src || (echo "git clone failed" >&2; exit 1)
           if [ ! -d project-src ] || [ -z "$(ls -A project-src)" ]; then
@@ -159,7 +160,6 @@ jobs:
           ls -la project-src | sed -n '1,200p'
 
       - name: License metadata and determination
-        # ... (unchanged) ...
         env:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ github.token }}
@@ -175,7 +175,6 @@ jobs:
           echo "$FINAL" > project-src/final_license.txt
 
       - name: Best-effort package manager prep (Python/Java/Node/C++)
-        # ... (unchanged, preparing for scanners) ...
         run: |
           set +e
           cd project-src || exit 1
@@ -202,7 +201,6 @@ jobs:
           set -e
 
       - name: Build project (C/C++ best-effort)
-        # ... (unchanged) ...
         run: |
           set -euo pipefail
           cd project-src || exit 1
@@ -219,7 +217,6 @@ jobs:
           fi
 
       - name: Cdxgen SBOM (Primary Generator - Universal)
-        # ... (unchanged, kept robust npx/docker fallback) ...
         run: |
           set -euo pipefail
           if command -v npx >/dev/null 2>&1; then
@@ -238,21 +235,18 @@ jobs:
           fi
 
       - name: Trivy FS SBOM + Vulnerability Scan
-        # ... (unchanged, generates two JSON files) ...
         run: |
           set -euo pipefail
           trivy fs --format cyclonedx --cyclonedx-spec 1.5 -o project-src/trivy-fs.json project-src || echo '{"components":[]}' > project-src/trivy-fs.json
           trivy fs --format json --vuln-type library,os --security-checks vuln -o project-src/vulnerabilities_fs.json project-src || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
 
       - name: Syft FS SBOM (Enrichment Generator)
-        # ... (unchanged) ...
         run: |
           set -euo pipefail
           export PATH="$HOME/bin:$PATH"
           syft packages dir:project-src -o cyclonedx-json > project-src/syft-sbom.json || echo '{"components":[]}' > project-src/syft-sbom.json
 
       - name: Normalize SBOM arrays
-        # ... (unchanged) ...
         run: |
           for f in project-src/trivy-fs.json project-src/syft-sbom.json project-src/cdxgen-sbom.json; do
             if [ -f "$f" ]; then
@@ -263,7 +257,6 @@ jobs:
           done
 
       - name: Create & Run SBOM Merge Script (Supplier/Timestamp Fix) ⏰
-        # ... (unchanged, this is where the intelligent merge happens) ...
         run: |
           cat > project-src/merged_and_enrich.py <<'PY'
           import os, json, uuid, time, hashlib, datetime
@@ -374,7 +367,6 @@ jobs:
           python3 project-src/merged_and_enrich.py || true
 
       - name: Create and Run File Enrichment & Static Analysis Script (Now just adds files and runs SAST)
-        # The logic is simplified to focus on file collection and SAST execution.
         run: |
           cat > project-src/enrich_and_scan.py <<'PY'
           import sys, os, json, hashlib, uuid, time, subprocess
@@ -483,7 +475,6 @@ jobs:
           python3 project-src/enrich_and_scan.py || true
 
       - name: NTIA/BSI Metadata Enforcement
-        # ... (unchanged) ...
         run: |
           pip install cyclonedx-python-lib || true
           cat > project-src/enrich_ntia_bsi_hybrid.py <<'PY'
@@ -534,7 +525,6 @@ jobs:
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
       - name: Validate merged SBOM against CycloneDX Schema ✅ (Final Fix Robust Multi-Method)
-        # ... (unchanged, validation is critical) ...
         run: |
           pip3 install --upgrade cyclonedx-python-lib || true
           set -euo pipefail
@@ -580,7 +570,6 @@ jobs:
           PY
 
       - name: Filter SBOM for sbomqs Stability (Remove File Components) 🔪
-        # ... (unchanged, needed for sbomqs stability) ...
         run: |
           cat > project-src/filter_sbom.py <<'PY'
           import sys, os, json
@@ -612,13 +601,12 @@ jobs:
           python3 project-src/filter_sbom.py || true
 
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
-        # This scans the *filtered* SBOM (sbomqs-input.json is the clean component list)
         run: |
           set -euo pipefail
           trivy sbom --format json --vuln-type library,os --security-checks vuln -o project-src/vulnerabilities_sbom.json project-src/sbomqs-input.json || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
 
       - name: Create unified reports (json + csv)
-        # --- SAST/VULNERABILITY INTEGRATION & SUMMARY ---
+        # FIX APPLIED HERE: analyze_sast_cppcheck now returns (0, 0) instead of 0 in non-file case.
         run: |
           python3 <<'PY'
           import json, csv, os, re
@@ -634,7 +622,7 @@ jobs:
               return vulns
 
           def analyze_sast_cppcheck(path):
-              if not os.path.exists(path): return 0
+              if not os.path.exists(path): return 0, 0 # <--- FIX APPLIED HERE
               try:
                   with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                       # Quick count of unique error lines
@@ -720,6 +708,8 @@ jobs:
             project-src/cppcheck_raw.xml
             project-src/flawfinder_raw.txt
           retention-days: 7
+
+<hr>
 
   # ----------------------------------------------------
   # JOB 2: AGGREGATE RESULTS
