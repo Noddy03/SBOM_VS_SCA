@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
+
     steps:
       - name: Install jq & gh
         run: |
@@ -51,16 +52,22 @@ jobs:
               --jq '.items[].full_name' || true)
           fi
 
-          JSON_ARRAY=$(echo "$REPOS" | tr -d '"' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          JSON_ARRAY=$(echo "$REPOS" | tr -d '"' |
+            jq -R -s -c 'split("\n") | map(select(length > 0))')
+
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   snyk_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
       - name: Checkout repository into workspace
@@ -74,31 +81,47 @@ jobs:
           ARTIFACT_NAME="${ARTIFACT_NAME//\//_}"
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
 
-      - name: Set up Snyk CLI
+      # ---------------------------
+      # Correct setup + authentication
+      # ---------------------------
+      - name: Install Snyk CLI
         uses: snyk/actions/setup@v1
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Authenticate Snyk CLI
+        run: snyk auth "$SNYK_TOKEN"
+
+      - name: Create output directory
+        run: mkdir -p snyk_reports
 
       # ---------------------------
-      # FIXED — produce valid SARIF
+      # Snyk Code (SAST)
       # ---------------------------
       - name: Run Snyk Code (SAST) and generate SARIF
-        run: |
-          snyk code test --sarif-file-output=snyk-code.sarif || true
+        run: snyk code test --sarif-file-output=snyk_reports/snyk-code.sarif || true
 
       - name: Ensure SARIF is valid
         run: |
-          if [ ! -s snyk-code.sarif ]; then
+          FILE="snyk_reports/snyk-code.sarif"
+          if [ ! -s "$FILE" ]; then
             echo "SARIF empty — writing placeholder"
-            echo '{"version":"2.1.0","runs":[]}' > snyk-code.sarif
+            echo '{"version":"2.1.0","runs":[]}' > "$FILE"
           fi
 
+      # ---------------------------
+      # Snyk Open Source (SCA)
+      # ---------------------------
       - name: Run Snyk Open Source (SCA)
         run: snyk monitor --all-projects || true
 
+      # ---------------------------
+      # Snyk IaC
+      # ---------------------------
       - name: Run Snyk IaC test
-        run: snyk iac test --json-file-output=iac-results.json || true
+        run: snyk iac test --json-file-output=snyk_reports/iac-results.json || true
 
+      # ---------------------------
+      # Snyk Container Scan
+      # ---------------------------
       - name: Build Docker image (if Dockerfile exists)
         run: |
           if [ -f Dockerfile ]; then
@@ -111,22 +134,27 @@ jobs:
             snyk container monitor project-image --file=Dockerfile || true
           fi
 
+      # ---------------------------
+      # Upload SARIF to GitHub Security
+      # ---------------------------
       - name: Upload Snyk SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: snyk-code.sarif
+          sarif_file: snyk_reports/snyk-code.sarif
 
+      # ---------------------------
+      # Upload all repo-specific results
+      # ---------------------------
       - name: Upload scan artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}-scan-results
-          path: |
-            snyk-code.sarif
-            iac-results.json
+          path: snyk_reports
 
   aggregate_results:
     needs: snyk_scan
     runs-on: ubuntu-latest
+
     steps:
       - name: Create folder for all artifacts
         run: mkdir -p all_repos
