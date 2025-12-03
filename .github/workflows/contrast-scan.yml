@@ -27,6 +27,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh
+
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -50,7 +51,10 @@ jobs:
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
           fi
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'map(select(length > 0))')
+
+          # Convert REPOS to JSON array safely
+          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "Repos fetched: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   contrast_scan:
@@ -79,7 +83,6 @@ jobs:
       - name: Validate Contrast secrets
         id: validate_secrets
         run: |
-          # Fallback to dummy values to avoid failing workflow
           API_KEY="${{ secrets.CONTRAST_API_KEY || 'dummy_key' }}"
           ORG_ID="${{ secrets.CONTRAST_ORGANIZATION_ID || 'dummy_org' }}"
           AUTH_HEADER="${{ secrets.CONTRAST_AUTH_HEADER || 'dummy_auth' }}"
