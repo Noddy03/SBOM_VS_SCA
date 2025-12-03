@@ -1,4 +1,4 @@
-name: IoT Multi-Repo Snyk Scan
+name: IoT Multi-Repo Snyk Scan container
 
 on:
   workflow_dispatch:
