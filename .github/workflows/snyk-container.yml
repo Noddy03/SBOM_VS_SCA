@@ -90,8 +90,17 @@ jobs:
             snyk container monitor project-image --file=project-src/Dockerfile || true
           fi
 
+      - name: Check if SARIF exists
+        id: check_sarif
+        run: |
+          if [ -f project-src/snyk-code.sarif ]; then
+            echo "sarif_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "sarif_exists=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Upload Snyk Code SARIF results
-        if: ${{ always() && (steps.snyk_code.outcome != 'failure') && (  project-src/snyk-code.sarif ) }}
+        if: ${{ steps.check_sarif.outputs.sarif_exists == 'true' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: project-src/snyk-code.sarif
