@@ -26,7 +26,7 @@ jobs:
 
       - id: set_output
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LANG: ${{ github.event.inputs.language }}
         run: |
           echo "Fetching top IoT repositories for language: $LANG"
@@ -37,7 +37,6 @@ jobs:
             --raw-field order=desc \
             --raw-field per_page=10 \
             --jq '.items[].full_name' || true)
-
           if [ -z "$REPOS" ]; then
             echo "No topic:iot repos found, falling back to language search"
             REPOS=$(gh api -X GET /search/repositories \
@@ -48,9 +47,8 @@ jobs:
               --jq '.items[].full_name' || true)
           fi
 
-          # Ensure empty lines are removed
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | grep -v '^$' | jq -R -s -c 'split("\n")')
-          
+          # Convert to JSON array safely
+          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "Repos fetched: $JSON_ARRAY"
           echo "repos=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
@@ -116,4 +114,3 @@ jobs:
             find all_repos -maxdepth 1 -mindepth 1 -type d || echo "No artifacts found."
           else
             echo "No artifacts folder found."
-          fi
