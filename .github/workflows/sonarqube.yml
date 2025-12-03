@@ -17,17 +17,16 @@ jobs:
         id: collect
         run: |
           repos=$(cat <<EOF
-["apache/iotdb","eclipse/paho.mqtt.c","eclipse/paho.mqtt.java","eclipse/milo",
-"espressif/esp-idf","arduino/ArduinoCore-avr","zephyrproject-rtos/zephyr",
-"apache/nifi","eclipse/kura","openhab/openhab-core"]
-EOF
-          )
+          ["apache/iotdb","eclipse/paho.mqtt.c","eclipse/paho.mqtt.java","eclipse/milo",
+          "espressif/esp-idf","arduino/ArduinoCore-avr","zephyrproject-rtos/zephyr",
+          "apache/nifi","eclipse/kura","openhab/openhab-core"]
+           EOF )
           echo "repo_list=$repos" >> $GITHUB_OUTPUT
 
-  sonar_scan:
-    needs: fetch_repos
-    runs-on: ubuntu-latest
-    secrets: inherit  # REQUIRED so the matrix job receives secrets
+    sonar_scan:
+      needs: fetch_repos
+      runs-on: ubuntu-latest
+      secrets: inherit  # REQUIRED so the matrix job receives secrets
 
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -39,15 +38,15 @@ EOF
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repo_list) }}
 
-    steps:
-      - name: Checkout target repository
-        run: |
-          git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
-          ls -R project-src || true
+         steps:
+        - name: Checkout target repository
+          run: |
+              git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
+              ls -R project-src || true
 
-      - name: SonarQube Analysis
-        uses: SonarSource/sonarqube-scan-action@7295e71c9583053f5bf40e9d4068a0c974603ec8
-        with:
+        - name: SonarQube Analysis
+          uses: SonarSource/sonarqube-scan-action@7295e71c9583053f5bf40e9d4068a0c974603ec8
+          with:
           args: >
             -Dsonar.projectKey=${{ matrix.repo }}
             -Dsonar.projectName=${{ matrix.repo }}
@@ -55,5 +54,5 @@ EOF
             -Dsonar.projectBaseDir=project-src
             -Dsonar.language=java,js,ts,py,cpp
 
-      - name: Print Summary
-        run: echo "Completed scan of ${{ matrix.repo }}"
+        - name: Print Summary
+          run: echo "Completed scan of ${{ matrix.repo }}"
