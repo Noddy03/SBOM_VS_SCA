@@ -102,8 +102,14 @@ jobs:
         with:
           sarif_file: results.sarif
 
+      - name: Sanitize artifact name
+        id: sanitize_name
+        run: |
+          SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          echo "safe_name=$SAFE_NAME" >> $GITHUB_OUTPUT
+
       - name: Upload scanned repo as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo.replace('/', '-') }}-scan
+          name: ${{ steps.sanitize_name.outputs.safe_name }}-scan
           path: project-src/**
