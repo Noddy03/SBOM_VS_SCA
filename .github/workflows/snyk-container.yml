@@ -46,7 +46,8 @@ jobs:
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
           fi
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
+          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'map(select(length > 0))')
+          echo "Repos fetched: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   snyk_scan:
@@ -108,13 +109,16 @@ jobs:
       - name: Upload scanned repo as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo }}
+          name: ${{ matrix.repo }}-scan
           path: project-src/**
 
   aggregate_results:
     needs: snyk_scan
     runs-on: ubuntu-latest
     steps:
+      - name: Create folder for all artifacts
+        run: mkdir -p all_repos
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -123,4 +127,8 @@ jobs:
       - name: List scanned repositories
         run: |
           echo "Repositories scanned:"
-          find all_repos -maxdepth 1 -mindepth 1 -type d
+          if [ -d all_repos ]; then
+            find all_repos -maxdepth 1 -mindepth 1 -type d -printf "%f\n" || echo "No artifacts found."
+          else
+            echo "No artifacts folder found."
+          fi
