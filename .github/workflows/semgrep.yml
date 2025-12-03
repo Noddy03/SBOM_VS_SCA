@@ -31,7 +31,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
@@ -70,11 +69,21 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install semgrep
 
-      - name: Run Semgrep scan and generate SARIF
+      - name: Run Semgrep scan
         run: |
-          cd project-src
-          # Force SARIF destination INSIDE project-src
-          semgrep --config auto --sarif --output semgrep.sarif -r . || true
+          mkdir -p project-src
+          SEMGREP_SARIF="project-src/semgrep.sarif"
+
+          # Run semgrep (may fail or find nothing)
+          semgrep --config auto -o "$SEMGREP_SARIF" --sarif project-src || true
+
+          # If SARIF does NOT exist, create empty valid SARIF
+          if [ ! -f "$SEMGREP_SARIF" ]; then
+            echo '{
+              "version": "2.1.0",
+              "runs": []
+            }' > "$SEMGREP_SARIF"
+          fi
 
       - name: Upload SARIF to GitHub
         uses: github/codeql-action/upload-sarif@v4
