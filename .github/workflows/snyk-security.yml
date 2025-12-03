@@ -1,4 +1,4 @@
-name: IoT Multi-Repo Snyk Scan security
+name: IoT Multi-Repo Snyk Scan Security
 
 on:
   workflow_dispatch:
@@ -24,6 +24,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh git
+
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -62,8 +63,12 @@ jobs:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
+      # Checkout repo properly
       - name: Checkout repository
-        run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ matrix.repo }}
+          path: project-src
 
       - name: Set sanitized artifact name
         run: |
@@ -71,49 +76,43 @@ jobs:
           ARTIFACT_NAME="${ARTIFACT_NAME//\//_}"
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
 
+      # Install Snyk CLI
       - name: Install Snyk CLI
         uses: snyk/actions/setup@v1
         with:
           snyk-version: "latest"
 
+      # Create directory for SARIF/IaC reports
       - name: Create output directory
-        run: mkdir -p snyk_reports
+        run: mkdir -p project-src/snyk_reports
 
-      # ---------------------------
       # Snyk Code (SAST)
-      # ---------------------------
       - name: Run Snyk Code (SAST) and generate SARIF
-        run: snyk code test project-src --sarif-file-output=snyk_reports/snyk-code.sarif || true
+        run: snyk code test project-src --sarif-file-output=project-src/snyk_reports/snyk-code.sarif || true
 
       - name: Ensure SARIF is valid
         run: |
-          FILE="snyk_reports/snyk-code.sarif"
+          FILE="project-src/snyk_reports/snyk-code.sarif"
           if [ ! -s "$FILE" ]; then
             echo "SARIF empty — writing placeholder"
             echo '{"version":"2.1.0","runs":[]}' > "$FILE"
           fi
 
-      # ---------------------------
       # Snyk Open Source (SCA)
-      # ---------------------------
       - name: Run Snyk Open Source (SCA)
         run: snyk monitor project-src --all-projects || true
 
-      # ---------------------------
       # Snyk IaC
-      # ---------------------------
       - name: Run Snyk IaC test
-        run: snyk iac test project-src --json-file-output=snyk_reports/iac-results.json || true
+        run: snyk iac test project-src --json-file-output=project-src/snyk_reports/iac-results.json || true
 
-      # ---------------------------
-      # Snyk Container Scan
-      # ---------------------------
+      # Snyk Container Scan (if Dockerfile exists)
       - name: Build Docker image (if Dockerfile exists)
         run: |
           if [ -f project-src/Dockerfile ]; then
               docker build -t project-image project-src
           else
-              echo "Skipping Docker build: required files missing"
+              echo "Skipping Docker build: no Dockerfile"
           fi
 
       - name: Run Snyk Container scan
@@ -122,22 +121,18 @@ jobs:
               snyk container monitor project-image --file=project-src/Dockerfile || true
           fi
 
-      # ---------------------------
       # Upload SARIF to GitHub Security
-      # ---------------------------
       - name: Upload Snyk Code SARIF results
         uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: snyk_reports/snyk-code.sarif
+          sarif_file: project-src/snyk_reports/snyk-code.sarif
 
-      # ---------------------------
-      # Upload all repo-specific results
-      # ---------------------------
+      # Upload repo-specific results
       - name: Upload scan artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}-scan-results
-          path: snyk_reports
+          path: project-src/snyk_reports
 
   aggregate_results:
     needs: snyk_scan
