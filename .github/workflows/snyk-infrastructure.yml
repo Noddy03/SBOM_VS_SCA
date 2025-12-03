@@ -19,10 +19,10 @@ jobs:
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
     steps:
-      - name: Install jq & gh CLI
+      - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq gh
+          sudo apt-get install -y jq gh git
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -35,12 +35,50 @@ jobs:
             --raw-field q="$RAW_Q" \
             --raw-field sort=stars \
             --raw-field order=desc \
-            --raw-field per_page=100 \
+            --raw-field per_page=50 \
             --jq '.items[].full_name' || true)
+
           if [ -z "$REPOS" ]; then
+            # fallback if no IoT-specific repos found
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
               --raw-field sort=stars \
               --raw-field order=desc \
-              --raw-field per_page=10_
+              --raw-field per_page=10 \
+              --jq '.items[].full_name' || true)
+          fi
+
+          echo "repo_list=$REPOS" >> $GITHUB_OUTPUT
+
+  snyk_scan:
+    needs: fetch_top_repos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Snyk
+        run: |
+          npm install -g snyk
+      - name: Checkout and scan repos
+        run: |
+          mkdir snyk_reports
+          REPOS="${{ needs.fetch_top_repos.outputs.repo_list }}"
+          echo "Repos to scan: $REPOS"
+          for repo in $REPOS; do
+            # Remove quotes if gh api returned JSON strings
+            repo_name=$(echo $repo | tr -d '"')
+            echo "Cloning $repo_name..."
+            git clone --depth 1 https://github.com/$repo_name temp_repo
+            cd temp_repo || continue
+
+            # Run Snyk test and save JSON report
+            REPORT_NAME=$(echo $repo_name | tr '/' '_')-snyk.json
+            snyk test --json > ../snyk_reports/$REPORT_NAME || true
+
+            cd ..
+            rm -rf temp_repo
+          done
+      - name: Upload Snyk reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: snyk-reports
+          path: snyk_reports/
