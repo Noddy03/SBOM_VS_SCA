@@ -1,58 +1,44 @@
-name: Multi-Repo SonarQube Analysis
+name: Multi-Repo SonarQube
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
   pull-requests: read
+  contents: read
 
 jobs:
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
-      repo_list: ${{ steps.collect.outputs.repo_list }}
+      repos: ${{ steps.out.outputs.repos }}
     steps:
-      - name: Fetch top 10 IoT repos
-        id: collect
-        run: |
-          repos=$(cat <<EOF
-          ["apache/iotdb","eclipse/paho.mqtt.c","eclipse/paho.mqtt.java","eclipse/milo",
-          "espressif/esp-idf","arduino/ArduinoCore-avr","zephyrproject-rtos/zephyr",
-          "apache/nifi","eclipse/kura","openhab/openhab-core"]
-           EOF )
-          echo "repo_list=$repos" >> $GITHUB_OUTPUT
+      - id: out
+        run: echo 'repos=["apache/iotdb","eclipse/paho.mqtt.c"]' >> $GITHUB_OUTPUT
 
-    sonar_scan:
-      needs: fetch_repos
-      runs-on: ubuntu-latest
-      secrets: inherit  # REQUIRED so the matrix job receives secrets
-
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+  sonar_scan:
+    needs: fetch_repos
+    runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
-        repo: ${{ fromJSON(needs.fetch_repos.outputs.repo_list) }}
+        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
 
-         steps:
-        - name: Checkout target repository
-          run: |
-              git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
-              ls -R project-src || true
+    steps:
+      - name: Clone the repo
+        run: |
+          git clone https://github.com/${{ matrix.repo }} project
+          ls -la project
 
-        - name: SonarQube Analysis
-          uses: SonarSource/sonarqube-scan-action@7295e71c9583053f5bf40e9d4068a0c974603ec8
-          with:
+      - name: Run SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v1.1.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
           args: >
             -Dsonar.projectKey=${{ matrix.repo }}
-            -Dsonar.projectName=${{ matrix.repo }}
-            -Dsonar.sources=project-src
-            -Dsonar.projectBaseDir=project-src
-            -Dsonar.language=java,js,ts,py,cpp
-
-        - name: Print Summary
-          run: echo "Completed scan of ${{ matrix.repo }}"
+            -Dsonar.sources=project
+            -Dsonar.projectBaseDir=project
