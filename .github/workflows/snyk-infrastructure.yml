@@ -1,4 +1,4 @@
-name: IoT Snyk IaC Multi-Repo Scan
+name: IoT Multi-Repo Snyk Scan
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
     steps:
-      - name: Install jq & gh
+      - name: Install jq & gh CLI
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh
@@ -32,58 +32,15 @@ jobs:
           set -euo pipefail
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
-              --raw-field q="$RAW_Q" \
-              --raw-field sort=stars \
-              --raw-field order=desc \
-              --raw-field per_page=100 \
-              --jq '.items[].full_name' || true)
+            --raw-field q="$RAW_Q" \
+            --raw-field sort=stars \
+            --raw-field order=desc \
+            --raw-field per_page=100 \
+            --jq '.items[].full_name' || true)
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
               --raw-field sort=stars \
               --raw-field order=desc \
-              --raw-field per_page=100 \
-              --jq '.items[].full_name' || true)
-          fi
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
-          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
-  snyk_iac_scan:
-    needs: fetch_top_repos
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
-
-    steps:
-      - name: Checkout repository
-        run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
-
-      - name: Find IaC files
-        id: find_files
-        run: |
-          FILES=$(find project-src -type f \( -name "*.yaml" -o -name "*.yml" -o -name "*.tf" \))
-          echo "files=$FILES" >> $GITHUB_OUTPUT
-
-      - name: Run Snyk IaC scans
-        if: steps.find_files.outputs.files != ''
-        continue-on-error: true
-        uses: snyk/actions/iac@v1
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          file: ${{ steps.find_files.outputs.files }}
-
-      - name: Upload SARIF results to GitHub Code Scanning
-        if: steps.find_files.outputs.files != ''
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: snyk.sarif
-
-      - name: Upload scanned repo as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.repo }}
-          path: project-src/**
+              --raw-field per_page=10_
