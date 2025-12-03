@@ -14,6 +14,7 @@ permissions:
   actions: read
 
 jobs:
+
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -30,6 +31,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
+          # Fetch top IoT repositories
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
             --raw-field q="$RAW_Q" \
@@ -38,8 +41,8 @@ jobs:
             --raw-field per_page=50 \
             --jq '.items[].full_name' || true)
 
+          # Fallback if none found
           if [ -z "$REPOS" ]; then
-            # fallback if no IoT-specific repos found
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
@@ -49,36 +52,77 @@ jobs:
               --jq '.items[].full_name' || true)
           fi
 
-          echo "repo_list=$REPOS" >> $GITHUB_OUTPUT
+          # Convert to JSON array for safe output
+          JSON_ARRAY=$(echo "$REPOS" | tr -d '"' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "Repos fetched: $JSON_ARRAY"
+          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   snyk_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
     steps:
-      - name: Install Snyk
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Create reports folder
+        run: mkdir snyk_reports
+
+      - name: Clone and scan repositories
         run: |
-          npm install -g snyk
-      - name: Checkout and scan repos
-        run: |
-          mkdir snyk_reports
-          REPOS="${{ needs.fetch_top_repos.outputs.repo_list }}"
+          REPOS='${{ needs.fetch_top_repos.outputs.repo_list }}'
           echo "Repos to scan: $REPOS"
-          for repo in $REPOS; do
-            # Remove quotes if gh api returned JSON strings
-            repo_name=$(echo $repo | tr -d '"')
-            echo "Cloning $repo_name..."
-            git clone --depth 1 https://github.com/$repo_name temp_repo
+
+          for repo in $(echo $REPOS | jq -r '.[]'); do
+            echo "Cloning $repo..."
+            git clone --depth 1 https://github.com/$repo temp_repo
             cd temp_repo || continue
 
-            # Run Snyk test and save JSON report
-            REPORT_NAME=$(echo $repo_name | tr '/' '_')-snyk.json
-            snyk test --json > ../snyk_reports/$REPORT_NAME || true
+            # Sanitize repo name for filenames
+            SAFE_NAME=$(echo $repo | tr '/' '_')
+
+            # Run Snyk Code (SAST) and save SARIF/JSON
+            snyk test --json > ../snyk_reports/${SAFE_NAME}-snyk.json || true
+            jq '{version: "2.1.0", runs: [.sarif[]?]}' ../snyk_reports/${SAFE_NAME}-snyk.json > ../snyk_reports/${SAFE_NAME}-snyk.sarif || true
+
+            # Run Snyk Open Source (SCA)
+            snyk monitor --all-projects || true
+
+            # Run Snyk IaC test
+            snyk iac test --json-file-output=../snyk_reports/${SAFE_NAME}-iac.json || true
+
+            # Build Docker image if Dockerfile exists
+            if [ -f Dockerfile ]; then
+              docker build -t ${SAFE_NAME}-image .
+              snyk container monitor ${SAFE_NAME}-image --file=Dockerfile || true
+            fi
 
             cd ..
             rm -rf temp_repo
           done
-      - name: Upload Snyk reports
-        uses: actions/upload-artifact@v3
+
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: snyk-reports
-          path: snyk_reports/
+          name: snyk-scan-results
+          path: snyk_reports/**
+
+  aggregate_results:
+    needs: snyk_scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create folder for all artifacts
+        run: mkdir -p all_repos
+
+      - name: Download all repo artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_repos
+
+      - name: List scanned repositories
+        run: |
+          echo "Repositories scanned:"
+          if [ -d all_repos ]; then
+            find all_repos -maxdepth 1 -mindepth 1 -type f -printf "%f\n" || echo "No artifacts found."
+          else
+            echo "No artifacts folder found."
+          fi
