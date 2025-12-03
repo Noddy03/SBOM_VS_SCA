@@ -23,7 +23,6 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh
-
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -47,7 +46,6 @@ jobs:
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
           fi
-
           # Convert REPOS to JSON array safely
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "Repos fetched: $JSON_ARRAY"
@@ -72,12 +70,13 @@ jobs:
 
       - name: Run Semgrep scan and generate SARIF
         run: |
-          semgrep --config auto --json --sarif --output semgrep.sarif -r project-src || true
+          cd project-src
+          semgrep --config auto --json --sarif --output semgrep.sarif -r . || true
 
       - name: Upload SARIF file to GitHub
         uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: semgrep.sarif
+          sarif_file: project-src/semgrep.sarif
 
       - name: Upload scanned repo as artifact
         uses: actions/upload-artifact@v4
@@ -85,7 +84,7 @@ jobs:
           name: ${{ matrix.repo }}-scan
           path: |
             project-src/**
-            semgrep.sarif
+            project-src/semgrep.sarif
 
   aggregate_results:
     needs: semgrep_scan
@@ -106,4 +105,3 @@ jobs:
             find all_repos -maxdepth 1 -mindepth 1 -type d -printf "%f\n" || echo "No artifacts found."
           else
             echo "No artifacts folder found."
-          fi
