@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Primary CodeQL language to scan (e.g., python, cpp, javascript-typescript)"
+        description: "Primary CodeQL language (e.g., python, cpp). Used only for build step."
         required: true
         default: "python"
 
@@ -24,6 +24,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh git
+
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -31,6 +32,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
             --raw-field q="$RAW_Q" \
@@ -38,6 +40,7 @@ jobs:
             --raw-field order=desc \
             --raw-field per_page=50 \
             --jq '.items[].full_name' || true)
+
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
@@ -47,6 +50,7 @@ jobs:
               --raw-field per_page=10 \
               --jq '.items[].full_name' || true)
           fi
+
           JSON_ARRAY=$(echo "$REPOS" | tr -d '"' | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
@@ -65,20 +69,20 @@ jobs:
           repository: ${{ matrix.repo }}
           path: project-src
 
-      - name: Initialize CodeQL
+      - name: Initialize CodeQL (auto-detect languages)
         uses: github/codeql-action/init@v4
         with:
-          languages: ${{ github.event.inputs.language }}
+          languages: auto  # FIX: prevents Java/Kotlin detection errors
 
-      - name: Build C/C++ project (if applicable)
+      - name: Build C/C++ project (when selected)
         if: ${{ github.event.inputs.language == 'cpp' }}
         run: |
           cd project-src
           mkdir -p build && cd build
-          cmake .. || echo "Skipping build"
-          make || echo "Skipping build"
+          cmake .. || echo "No cmake project; skipping build"
+          make || echo "Build failed; skipping"
 
-      - name: Run CodeQL Analysis
+      - name: Analyze with CodeQL
         uses: github/codeql-action/analyze@v4
 
       - name: Set sanitized artifact name
@@ -87,7 +91,7 @@ jobs:
           ARTIFACT_NAME="${ARTIFACT_NAME//\//_}"
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
 
-      - name: Upload scanned repo as artifact
+      - name: Upload scanned repository artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
