@@ -1,4 +1,4 @@
-name: IoT Snyk Container Multi-Repo Scan
+name: IoT Multi-Repo Snyk Scan
 
 on:
   workflow_dispatch:
@@ -49,7 +49,7 @@ jobs:
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  snyk_container_scan:
+  snyk_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
     strategy:
@@ -61,6 +61,23 @@ jobs:
       - name: Checkout repository
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
+      - name: Set up Snyk CLI
+        uses: snyk/actions/setup@v1
+        with:
+          version: "latest"
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Run Snyk Code (SAST)
+        id: snyk_code
+        run: snyk code test project-src --sarif > project-src/snyk-code.sarif || true
+
+      - name: Run Snyk Open Source (SCA)
+        run: snyk monitor project-src --all-projects || true
+
+      - name: Run Snyk IaC scans
+        run: snyk iac test project-src --report || true
+
       - name: Build Docker image (if Dockerfile exists)
         run: |
           if [ -f project-src/Dockerfile ]; then
@@ -68,20 +85,16 @@ jobs:
           fi
 
       - name: Run Snyk Container scan
-        if: success() && github.event_name == 'workflow_dispatch'
-        continue-on-error: true
-        uses: snyk/actions/docker@v1
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          image: project-image
-          args: --file=project-src/Dockerfile
+        run: |
+          if docker image inspect project-image > /dev/null 2>&1; then
+            snyk container monitor project-image --file=project-src/Dockerfile || true
+          fi
 
-      - name: Upload Snyk SARIF results
-        if: success() && github.event_name == 'workflow_dispatch'
-        uses: github/codeql-action/upload-sarif@v3
+      - name: Upload Snyk Code SARIF results
+        if: ${{ always() && (steps.snyk_code.outcome != 'failure') && ( -f project-src/snyk-code.sarif ) }}
+        uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: snyk.sarif
+          sarif_file: project-src/snyk-code.sarif
 
       - name: Upload scanned repo as artifact
         uses: actions/upload-artifact@v4
@@ -90,7 +103,7 @@ jobs:
           path: project-src/**
 
   aggregate_results:
-    needs: snyk_container_scan
+    needs: snyk_scan
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
