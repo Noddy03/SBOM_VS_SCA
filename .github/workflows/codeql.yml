@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: "CodeQL language to scan (e.g., python, javascript-typescript, c-cpp)"
+        description: "Primary CodeQL language to scan (e.g., python, javascript-typescript, cpp)"
         required: true
         default: "python"
 
@@ -20,10 +20,11 @@ jobs:
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
     steps:
-      - name: Install jq & gh
+      - name: Install dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh git
+
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -31,6 +32,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           # Search top IoT repos
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
@@ -52,7 +54,7 @@ jobs:
           fi
 
           # Convert to JSON array for matrix
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
+          JSON_ARRAY=$(echo "$REPOS" | tr -d '"' | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   codeql_scan:
@@ -70,11 +72,13 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
-          languages: ${{ github.event.inputs.language }}
+          # Scan multiple languages safely
+          languages: "cpp,python,javascript-typescript"
 
       - name: Run CodeQL Analysis
         uses: github/codeql-action/analyze@v4
         with:
+          # Optional: categorize per primary language
           category: "/language:${{ github.event.inputs.language }}"
 
       - name: Set sanitized artifact name
