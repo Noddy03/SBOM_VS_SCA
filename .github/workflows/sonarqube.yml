@@ -23,9 +23,12 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh
+
       - id: set_output
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LANG: ${{ github.event.inputs.language }}
         run: |
-          LANG=${{ github.event.inputs.language }}
           echo "Fetching top IoT repositories for language: $LANG"
           
           REPOS=$(gh api -X GET /search/repositories \
@@ -45,8 +48,8 @@ jobs:
               --jq '.items[].full_name' || true)
           fi
 
-          # Convert to JSON array, filter out empty lines
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'map(select(length > 0))')
+          # Ensure empty lines are removed
+          JSON_ARRAY=$(printf "%s\n" "$REPOS" | grep -v '^$' | jq -R -s -c 'split("\n")')
           
           echo "Repos fetched: $JSON_ARRAY"
           echo "repos=$JSON_ARRAY" >> $GITHUB_OUTPUT
