@@ -17,27 +17,29 @@ jobs:
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
-      repos: ${{ steps.out.outputs.repos }}
+      repos: ${{ steps.set_output.outputs.repos }}
     steps:
       - name: Install jq & gh
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh
-      - id: out
+      - id: set_output
         run: |
           LANG=${{ github.event.inputs.language }}
+          echo "Fetching top IoT repositories for language: $LANG"
           REPOS=$(gh api -X GET /search/repositories \
             --raw-field q="topic:iot language:$LANG fork:false archived:false" \
             --raw-field sort=stars \
             --raw-field order=desc \
-            --raw-field per_page=100 \
+            --raw-field per_page=10 \
             --jq '.items[].full_name' || true)
           if [ -z "$REPOS" ]; then
+            echo "No topic:iot repos found, falling back to language search"
             REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="language:$LANG fork:false archived:false" \
               --raw-field sort=stars \
               --raw-field order=desc \
-              --raw-field per_page=100 \
+              --raw-field per_page=10 \
               --jq '.items[].full_name' || true)
           fi
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
@@ -54,10 +56,21 @@ jobs:
     steps:
       - name: Clone the repository
         run: |
-          git clone --depth 1 https://github.com/${{ matrix.repo }} project
-          ls -la project
+          echo "Cloning repo: ${{ matrix.repo }}"
+          git clone --depth 1 https://github.com/${{ matrix.repo }} project || true
+        continue-on-error: true
+
+      - name: List files in project folder
+        run: |
+          if [ -d project ]; then
+            ls -la project
+          else
+            echo "Repo ${{ matrix.repo }} failed to clone, skipping..."
+            exit 0
+          fi
 
       - name: Run SonarQube Scan
+        if: ${{ always() && (steps.clone.outcome != 'failure') && (fromJSON(needs.fetch_repos.outputs.repos) != '[]') && ( -d 'project') }}
         uses: SonarSource/sonarqube-scan-action@v1.1.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -70,6 +83,7 @@ jobs:
             -Dsonar.projectBaseDir=project
 
       - name: Upload scanned repo as artifact
+        if: ${{ always() && ( -d 'project') }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.repo }}
