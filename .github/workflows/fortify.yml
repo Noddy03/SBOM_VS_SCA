@@ -1,16 +1,15 @@
-name: IoT Fortify Multi-Repo Scan with SSC summary
+name: IoT Fortify Multi-Repo Local Scan
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Language filter (e.g. C++, Python, Java)"
+        description: "Language filter (e.g., C++, Python, Java)"
         required: true
-        default: "C++"
+        default: "Java"
 
 permissions:
   contents: read
-  security-events: write
   actions: read
 
 jobs:
@@ -49,75 +48,37 @@ jobs:
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  fortify_scan:
+  fortify_local_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
-    env:
-      FOD_CLIENT_ID: ${{ secrets.FOD_CLIENT_ID }}
-      FOD_CLIENT_SECRET: ${{ secrets.FOD_CLIENT_SECRET }}
-      FOD_TENANT: ${{ secrets.FOD_TENANT }}
-      SSC_URL: ${{ vars.SSC_URL }}
-      SSC_PAT: ${{ secrets.SSC_PAT }}
-      SC_SAST_TOKEN: ${{ secrets.SC_CLIENT_AUTH_TOKEN }}
-      SC_SAST_SENSOR_VERSION: 24.4.0
-
     steps:
       - name: Checkout repo
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
-      - name: Run Fortify SAST scan
+      - name: Run Fortify SAST scan locally
         uses: fortify/github-action@v1
         with:
           sast-scan: true
 
-      - name: Install fcli (Fortify CLI)
+      - name: Generate per-repo summary.csv from SARIF
         run: |
-          OS_NAME=$(uname -s | tr '[:upper:]' '[:lower:]')
-          if [ "$OS_NAME" = "linux" ]; then
-            FCLI_URL="https://github.com/fortify/fcli/releases/latest/download/fcli-linux.tgz"
-          elif [ "$OS_NAME" = "darwin" ]; then
-            FCLI_URL="https://github.com/fortify/fcli/releases/latest/download/fcli-mac.tgz"
+          OUT="project-src/summary.csv"
+          SARIF=$(find project-src/.fortify -type f -name "*.sarif" | head -n 1 || true)
+          echo "repo,vuln_fs_total,vuln_high,vuln_critical" > "$OUT"
+          if [ -n "$SARIF" ] && [ -s "$SARIF" ]; then
+            VULN_FS_TOTAL=$(jq '[.runs[].results[]] | length' "$SARIF")
+            VULN_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SARIF")
+            VULN_CRITICAL=$(jq '[.runs[].results[] | select(.level=="fatal")] | length' "$SARIF")
           else
-            echo "Unsupported OS: $OS_NAME"
-            exit 1
+            VULN_FS_TOTAL=0
+            VULN_HIGH=0
+            VULN_CRITICAL=0
           fi
-          echo "Downloading fcli from $FCLI_URL"
-          curl -L "$FCLI_URL" | tar xz
-          chmod +x fcli
-          ./fcli --version
-
-      - name: Fetch Fortify SSC findings
-        run: |
-          # Map GitHub repo to SSC AppVersion name
-          APP_NAME=$(echo "${{ matrix.repo }}" | tr '/' '_')
-          APPVER="$APP_NAME:main"
-
-          # Login using SSC Personal Access Token
-          ./fcli ssc session login --url "$SSC_URL" --token "$SSC_PAT"
-
-          # Check if AppVersion exists; if not, create it
-          EXISTS=$(./fcli ssc appversion list --app "$APP_NAME" --format json | jq -r ".[] | select(.versionName==\"main\") | .id" || echo "")
-          if [ -z "$EXISTS" ]; then
-            echo "AppVersion $APPVER does not exist, creating..."
-            ./fcli ssc app create --name "$APP_NAME"
-            ./fcli ssc appversion create --app "$APP_NAME" --name "main"
-          fi
-
-          # Fetch issue counts
-          OUT_JSON=$(./fcli ssc issue count --appversion "$APPVER" -o json)
-          TOTAL=$(echo "$OUT_JSON" | jq '.total' 2>/dev/null || echo 0)
-          HIGH=$(echo "$OUT_JSON" | jq '.high' 2>/dev/null || echo 0)
-          CRITICAL=$(echo "$OUT_JSON" | jq '.critical' 2>/dev/null || echo 0)
-
-          ./fcli ssc session logout || true
-
-          # Generate per-repo summary.csv
-          echo "repo,vuln_fs_total,vuln_high,vuln_critical" > project-src/summary.csv
-          echo "${{ matrix.repo }},$TOTAL,$HIGH,$CRITICAL" >> project-src/summary.csv
+          echo "${{ matrix.repo }},$VULN_FS_TOTAL,$VULN_HIGH,$VULN_CRITICAL" >> "$OUT"
 
       - name: Sanitize artifact name
         run: |
@@ -132,7 +93,7 @@ jobs:
           path: project-src/**
 
   aggregate_summaries:
-    needs: fortify_scan
+    needs: fortify_local_scan
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
