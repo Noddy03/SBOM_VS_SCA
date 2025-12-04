@@ -152,21 +152,33 @@ jobs:
           name: ${{ env.ARTIFACT_NAME }}
           path: project-src/**
 
-  aggregate_results:
+  aggregate_summaries:
+    name: Aggregate all summary.csv files
     needs: codeql_scan
     runs-on: ubuntu-latest
-
     steps:
-      - name: Download all artifacts
+      - name: Download all repo artifacts
         uses: actions/download-artifact@v4
         with:
-          path: all_repos
+          path: all_summaries
 
-      - name: List scanned repositories
+      - name: Combine all summary.csv files into master_summary.csv
         run: |
-          echo "Repositories scanned:"
-          if [ -d all_repos ]; then
-            find all_repos -maxdepth 1 -mindepth 1 -type d -printf "%f\n"
-          else
-            echo "No artifacts found."
+          echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > master_summary.csv
+          found=0
+          for f in $(find all_summaries -name "summary.csv"); do
+            tail -n +2 "$f" >> master_summary.csv
+            found=$((found+1))
+          done
+          echo "Appended $found per-repo summaries"
+          if [ $found -eq 0 ]; then
+            echo "WARNING: No per-repo summary.csv files found" >&2
           fi
+          
+      - name: Upload Master Summary Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: master_summary
+          path: master_summary.csv
+
+  
