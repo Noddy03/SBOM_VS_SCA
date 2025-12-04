@@ -77,22 +77,22 @@ jobs:
           mkdir -p project-src
           snyk code test project-src --sarif-file=project-src/snyk-code.sarif || {
             cat <<EOF > project-src/snyk-code.sarif
-{
-  "version": "2.1.0",
-  "runs": []
-}
-EOF
+          {
+          "version": "2.1.0",
+          "runs": []
+          }
+          EOF
           }
 
       - name: Ensure SARIF exists and is valid
         run: |
           if [ ! -s project-src/snyk-code.sarif ]; then
             cat <<EOF > project-src/snyk-code.sarif
-{
-  "version": "2.1.0",
-  "runs": []
-}
-EOF
+          {
+            "version": "2.1.0",
+              "runs": []
+          }
+          EOF
           fi
 
       - name: Run Snyk Open Source (SCA)
