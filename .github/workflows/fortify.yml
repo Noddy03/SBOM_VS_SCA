@@ -14,20 +14,15 @@ permissions:
   actions: read
 
 jobs:
-  # ------------------------------------------------------
-  # Fetch Repositories
-  # ------------------------------------------------------
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
-
     steps:
       - name: Install jq & gh
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh git
-
       - name: Fetch IoT repositories
         id: fetch
         env:
@@ -42,8 +37,6 @@ jobs:
               --raw-field order=desc \
               --raw-field per_page=50 \
               --jq '.items[].full_name' || true)
-
-          # fallback query if nothing is found
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
@@ -53,13 +46,9 @@ jobs:
                 --raw-field per_page=10 \
                 --jq '.items[].full_name' || true)
           fi
-
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  # ------------------------------------------------------
-  # Fortify Scan + Per-repo summary.csv
-  # ------------------------------------------------------
   fortify_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
@@ -72,7 +61,7 @@ jobs:
       - name: Checkout repo
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
-      - name: Run Fortify SAST + Debricked scans
+      - name: Run Fortify SAST + Debricked SCA scans
         uses: fortify/github-action@v1
         with:
           sast-scan: true
@@ -82,72 +71,67 @@ jobs:
           FOD_CLIENT_ID: ${{ secrets.FOD_CLIENT_ID }}
           FOD_CLIENT_SECRET: ${{ secrets.FOD_CLIENT_SECRET }}
           FOD_TENANT: ${{ secrets.FOD_TENANT }}
-
           SSC_URL: ${{ vars.SSC_URL }}
           SSC_TOKEN: ${{ secrets.SSC_TOKEN }}
-
           SC_SAST_TOKEN: ${{ secrets.SC_CLIENT_AUTH_TOKEN }}
           DEBRICKED_TOKEN: ${{ secrets.DEBRICKED_TOKEN }}
           SC_SAST_SENSOR_VERSION: 24.4.0
 
-      # ------------------------------------------------------
-      # Bulletproof Per-repo summary.csv
-      # ------------------------------------------------------
       - name: Generate summary.csv
         run: |
           OUT="project-src/summary.csv"
-          SARIF="project-src/.fortify/scan.sarif"
 
           # CSV header
           echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > "$OUT"
 
-          # ----- Fortify SAST -----
-          if [ -f "$SARIF" ]; then
-            TOTAL=$(jq '.runs[].results | length' "$SARIF")
-            HIGH=$(jq '[.runs[].results[].level | select(.=="error")] | length' "$SARIF")
-            CRITICAL=$(jq '[.runs[].results[].level | select(.=="fatal")] | length' "$SARIF")
+          # Find Fortify SARIF
+          SARIF=$(find project-src/.fortify -type f -name "*.sarif" | head -n 1 || true)
+          if [ -n "$SARIF" ]; then
+            VULN_FS_TOTAL=$(jq '[.runs[].results[]] | length' "$SARIF")
+            VULN_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SARIF")
+            VULN_CRITICAL=$(jq '[.runs[].results[] | select(.level=="fatal")] | length' "$SARIF")
           else
-            TOTAL=0; HIGH=0; CRITICAL=0
+            VULN_FS_TOTAL=0
+            VULN_HIGH=0
+            VULN_CRITICAL=0
           fi
 
-          # ----- Debricked SCA Auto-detection -----
+          # Find Debricked SCA JSON
           SCA_JSON=$(find project-src/.fortify -type f -name "*.json" | head -n 1 || true)
-
           if [ -n "$SCA_JSON" ]; then
-            COMPONENTS=$(jq '.dependencies | length' "$SCA_JSON" 2>/dev/null || echo 0)
-            SBOM_VULNS=$(jq '.vulnerabilities | length' "$SCA_JSON" 2>/dev/null || echo 0)
-            LICENSE=$(jq -r '.repo.license // "unknown"' "$SCA_JSON" 2>/dev/null || echo "unknown")
+            COMPONENT_COUNT=$(jq '.dependencies | length' "$SCA_JSON" 2>/dev/null || echo 0)
+            VULN_SBOM=$(jq '.vulnerabilities | length' "$SCA_JSON" 2>/dev/null || echo 0)
+            REPO_LICENSE=$(jq -r '.repo.license // "unknown"' "$SCA_JSON" 2>/dev/null || echo "unknown")
           else
-            COMPONENTS=0
-            SBOM_VULNS=0
-            LICENSE="unknown"
+            COMPONENT_COUNT=0
+            VULN_SBOM=0
+            REPO_LICENSE="unknown"
           fi
 
-          # final CSV entry
-          echo "${{ matrix.repo }},$LICENSE,$COMPONENTS,$TOTAL,$SBOM_VULNS,$((TOTAL+SBOM_VULNS)),$HIGH,$CRITICAL,0,false,false" >> "$OUT"
+          VULN_TOTAL=$((VULN_FS_TOTAL + VULN_SBOM))
 
-      # ------------------------------------------------------
-      # Upload repo artifact
-      # ------------------------------------------------------
-      - name: Set artifact name
+          # score_value, ntia_pass, bsi_pass placeholders
+          SCORE_VALUE=0
+          NTIA_PASS=false
+          BSI_PASS=false
+
+          echo "${{ matrix.repo }},$REPO_LICENSE,$COMPONENT_COUNT,$VULN_FS_TOTAL,$VULN_SBOM,$VULN_TOTAL,$VULN_HIGH,$VULN_CRITICAL,$SCORE_VALUE,$NTIA_PASS,$BSI_PASS" >> "$OUT"
+
+      - name: Sanitize artifact name
         run: |
           SAFE="${{ matrix.repo }}"
           SAFE="${SAFE//\//_}"
           echo "ARTIFACT_NAME=$SAFE" >> $GITHUB_ENV
 
-      - name: Upload artifacts
+      - name: Upload repo artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}-scan
           path: project-src/**
 
-  # ------------------------------------------------------
-  # Aggregate all per-repo summary.csv into master_summary.csv
-  # ------------------------------------------------------
   aggregate_summaries:
     needs: fortify_scan
     runs-on: ubuntu-latest
-
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -157,7 +141,6 @@ jobs:
       - name: Create master_summary.csv
         run: |
           echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > master_summary.csv
-          
           FOUND=0
           for f in $(find all_summaries -name summary.csv || true); do
             if [ -s "$f" ]; then
@@ -165,7 +148,6 @@ jobs:
               FOUND=$((FOUND+1))
             fi
           done
-
           echo "Collected $FOUND summary files"
 
       - name: Upload master summary
