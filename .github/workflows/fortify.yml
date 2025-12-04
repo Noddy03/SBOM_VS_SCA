@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Language filter (e.g., C++, Java, Python)"
+        description: "Language filter (e.g., Java, C++, Python)"
         required: true
         default: "Java"
 
@@ -22,7 +22,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh git
-      - name: Fetch IoT repositories
+      - name: Fetch top IoT repositories
         id: fetch
         env:
           LANG: ${{ github.event.inputs.language }}
@@ -60,18 +60,21 @@ jobs:
       - name: Checkout repository
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
-      - name: Run Fortify SAST using FCLI
+      - name: Download and extract Fortify FCLI
         run: |
-          # Download FCLI
-          curl -L https://github.com/fortify/fcli/releases/latest/download/fcli_$(uname -s)_x64.tar.gz | tar xz
+          # Set the version you want to use
+          FCLI_VERSION="24.4.0"
+          # Download to a local file
+          curl -L -o fcli.tar.gz "https://github.com/fortify/fcli/releases/download/$FCLI_VERSION/fcli_Linux_x64.tar.gz"
+          tar -xzf fcli.tar.gz
           chmod +x fcli
-          
+
+      - name: Run Fortify SAST scan
+        run: |
           mkdir -p scan-output
-          
-          # Run scan locally without SSC
+          # Create a scan locally
           ./fcli scan create-scan --source project-src --output scan-output/scan.fpr
-          
-          # Export SARIF from FPR
+          # Export SARIF
           ./fcli scan export --scan scan-output/scan.fpr --format sarif --output scan-output/scan.sarif
 
       - name: Generate per-repo summary.csv
@@ -98,7 +101,7 @@ jobs:
           SAFE="${SAFE//\//_}"
           echo "ARTIFACT_NAME=$SAFE" >> $GITHUB_ENV
 
-      - name: Upload repo artifacts
+      - name: Upload per-repo artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}-scan
@@ -108,7 +111,7 @@ jobs:
     needs: fortify_scan_fcli
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download all repo artifacts
         uses: actions/download-artifact@v4
         with:
           path: all_summaries
