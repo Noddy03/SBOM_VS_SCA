@@ -23,6 +23,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh
+
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -37,6 +38,7 @@ jobs:
               --raw-field order=desc \
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
+
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
@@ -46,6 +48,7 @@ jobs:
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
           fi
+
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "Repos fetched: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
@@ -59,6 +62,7 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
     env:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
     steps:
       - name: Checkout repository
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
@@ -71,7 +75,25 @@ jobs:
       - name: Run Snyk Code (SAST) and generate SARIF
         run: |
           mkdir -p project-src
-          snyk code test project-src --sarif-file=project-src/snyk-code.sarif || echo "{}" > project-src/snyk-code.sarif
+          snyk code test project-src --sarif-file=project-src/snyk-code.sarif || {
+            cat <<EOF > project-src/snyk-code.sarif
+{
+  "version": "2.1.0",
+  "runs": []
+}
+EOF
+          }
+
+      - name: Ensure SARIF exists and is valid
+        run: |
+          if [ ! -s project-src/snyk-code.sarif ]; then
+            cat <<EOF > project-src/snyk-code.sarif
+{
+  "version": "2.1.0",
+  "runs": []
+}
+EOF
+          fi
 
       - name: Run Snyk Open Source (SCA)
         run: snyk monitor project-src --all-projects || echo "SCA skipped"
@@ -89,12 +111,6 @@ jobs:
         run: |
           if docker image inspect project-image > /dev/null 2>&1; then
             snyk container monitor project-image --file=project-src/Dockerfile || echo "Container scan skipped"
-          fi
-
-      - name: Upload Snyk Code SARIF safely
-        run: |
-          if [ ! -f project-src/snyk-code.sarif ]; then
-            echo "{}" > project-src/snyk-code.sarif
           fi
 
       - name: Sanitize repo name
@@ -117,6 +133,7 @@ jobs:
   aggregate_results:
     needs: snyk_scan
     runs-on: ubuntu-latest
+
     steps:
       - name: Create folder for all artifacts
         run: mkdir -p all_repos
