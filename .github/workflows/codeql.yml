@@ -85,23 +85,11 @@ jobs:
           LANG="${{ github.event.inputs.language }}"
           cd project-src
           case "$LANG" in
-            python)
-              PATTERN="-name '*.py'"
-              ;;
-            cpp)
-              PATTERN="-name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.c'"
-              ;;
-            java)
-              PATTERN="-name '*.java' -o -name '*.kt'"
-              ;;
-            javascript)
-              PATTERN="-name '*.js' -o -name '*.ts'"
-              ;;
-            *)
-              echo "Unsupported language"
-              echo "has_lang=false" >> $GITHUB_OUTPUT
-              exit 0
-              ;;
+            python) PATTERN="-name '*.py'" ;;
+            cpp) PATTERN="-name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.c'" ;;
+            java) PATTERN="-name '*.java' -o -name '*.kt'" ;;
+            javascript) PATTERN="-name '*.js' -o -name '*.ts'" ;;
+            *) echo "Unsupported language"; echo "has_lang=false" >> $GITHUB_OUTPUT; exit 0 ;;
           esac
           FILE_COUNT=$(find . -type f \( $PATTERN \) | wc -l)
           if [ "$FILE_COUNT" -eq 0 ]; then
@@ -152,8 +140,6 @@ jobs:
             echo "No Java build system found; skipping."
           fi
 
-      # Python and JavaScript have no build step
-
       # ----------------------------
       # Analyze with CodeQL
       # ----------------------------
@@ -178,26 +164,35 @@ jobs:
         if: steps.detect_lang.outputs.has_lang == 'true'
         run: |
           mkdir -p project-src/semgrep_reports
-          semgrep --config=auto --json project-src > project-src/semgrep_reports/semgrep.json || true
+          semgrep --config=auto --json project-src > project-src/semgrep_reports/semgrep.json || echo '{"results":[]}' > project-src/semgrep_reports/semgrep.json
 
       # ----------------------------
-      # Generate per-repo summary.csv
+      # Generate per-repo summary.csv safely
       # ----------------------------
       - name: Generate summary.csv
         if: steps.detect_lang.outputs.has_lang == 'true'
         run: |
           SUMMARY_DIR="project-src/scan_summary"
-          mkdir -p $SUMMARY_DIR
+          mkdir -p "$SUMMARY_DIR"
           CSV_FILE="$SUMMARY_DIR/summary.csv"
-          echo "repo,language,codeql_issues,semgrep_issues" > $CSV_FILE
+          echo "repo,language,codeql_issues,semgrep_issues" > "$CSV_FILE"
 
-          # Count CodeQL SARIF results
-          CODEQL_ISSUES=$(find project-src -name "*.sarif" | xargs -r jq '.runs[].results | length' | awk '{s+=$1} END{print s+0}')
+          # Count CodeQL issues safely
+          CODEQL_ISSUES=0
+          for SARIF in $(find project-src -name "*.sarif" || true); do
+            COUNT=$(jq '[.runs[].results[]] | length' "$SARIF" 2>/dev/null || echo 0)
+            CODEQL_ISSUES=$((CODEQL_ISSUES + COUNT))
+          done
 
-          # Count Semgrep issues
-          SEMGREP_ISSUES=$(jq '[.results[]] | length' project-src/semgrep_reports/semgrep.json || echo 0)
+          # Count Semgrep issues safely
+          SEMGREP_FILE="project-src/semgrep_reports/semgrep.json"
+          if [ -s "$SEMGREP_FILE" ]; then
+            SEMGREP_ISSUES=$(jq '[.results[]] | length' "$SEMGREP_FILE" 2>/dev/null || echo 0)
+          else
+            SEMGREP_ISSUES=0
+          fi
 
-          echo "${{ matrix.repo }},${{ github.event.inputs.language }},$CODEQL_ISSUES,$SEMGREP_ISSUES" >> $CSV_FILE
+          echo "${{ matrix.repo }},${{ github.event.inputs.language }},$CODEQL_ISSUES,$SEMGREP_ISSUES" >> "$CSV_FILE"
 
       # ----------------------------
       # Upload repo artifacts
