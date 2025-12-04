@@ -74,10 +74,21 @@ jobs:
         with:
           sast-scan: true
 
-      - name: Install fcli
+      - name: Install fcli (Fortify CLI)
         run: |
-          curl -L https://github.com/fortify/fcli/releases/latest/download/fcli_$(uname -s)_x64.tar.gz | tar xz
+          OS_NAME=$(uname -s | tr '[:upper:]' '[:lower:]')
+          if [ "$OS_NAME" = "linux" ]; then
+            FCLI_URL="https://github.com/fortify/fcli/releases/latest/download/fcli-linux.tgz"
+          elif [ "$OS_NAME" = "darwin" ]; then
+            FCLI_URL="https://github.com/fortify/fcli/releases/latest/download/fcli-mac.tgz"
+          else
+            echo "Unsupported OS: $OS_NAME"
+            exit 1
+          fi
+          echo "Downloading fcli from $FCLI_URL"
+          curl -L "$FCLI_URL" | tar xz
           chmod +x fcli
+          ./fcli --version
 
       - name: Fetch Fortify SSC findings
         run: |
@@ -88,6 +99,7 @@ jobs:
           HIGH=$(echo "$OUT_JSON" | jq '.high' 2>/dev/null || echo 0)
           CRITICAL=$(echo "$OUT_JSON" | jq '.critical' 2>/dev/null || echo 0)
           ./fcli ssc session logout || true
+          # Generate per-repo summary.csv
           echo "repo,vuln_fs_total,vuln_high,vuln_critical" > project-src/summary.csv
           echo "${{ matrix.repo }},$TOTAL,$HIGH,$CRITICAL" >> project-src/summary.csv
 
