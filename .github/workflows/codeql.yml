@@ -15,6 +15,7 @@ permissions:
   packages: read
 
 jobs:
+
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -24,6 +25,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh git
+
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -31,6 +33,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
             --raw-field q="$RAW_Q" \
@@ -38,6 +41,7 @@ jobs:
             --raw-field order=desc \
             --raw-field per_page=50 \
             --jq '.items[].full_name' || true)
+
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
@@ -47,62 +51,122 @@ jobs:
               --raw-field per_page=10 \
               --jq '.items[].full_name' || true)
           fi
-          JSON_ARRAY=$(echo "$REPOS" | tr -d '"' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   codeql_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+
     steps:
+
+      # ----------------------------
+      # CHECKOUT REPO
+      # ----------------------------
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
           repository: ${{ matrix.repo }}
           path: project-src
 
+      # ----------------------------
+      # DETECT REPO LANGUAGE
+      # ----------------------------
+      - name: Detect if repository contains selected language
+        id: detect_lang
+        run: |
+          LANG="${{ github.event.inputs.language }}"
+          cd project-src
+
+          case "$LANG" in
+            python)
+              PATTERN="-name '*.py'"
+              ;;
+            cpp)
+              PATTERN="-name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.c'"
+              ;;
+            java)
+              PATTERN="-name '*.java' -o -name '*.kt'"
+              ;;
+            *)
+              echo "Unsupported language"
+              echo "has_lang=false" >> $GITHUB_OUTPUT
+              exit 0
+              ;;
+          esac
+
+          FILE_COUNT=$(find . -type f \( $PATTERN \) | wc -l)
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "No matching language files found"
+            echo "has_lang=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_lang=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Skip message
+        if: steps.detect_lang.outputs.has_lang == 'false'
+        run: echo "Skipping CodeQL: repo does not contain selected language."
+
+      # ----------------------------
+      # INIT CODEQL
+      # ----------------------------
       - name: Initialize CodeQL
+        if: steps.detect_lang.outputs.has_lang == 'true'
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ github.event.inputs.language }}
 
-      # --------------------------
-      # Language-specific builds
-      # --------------------------
+      # ----------------------------
+      # LANGUAGE-SPECIFIC BUILDS
+      # ----------------------------
+
       - name: Build C/C++ project
-        if: ${{ github.event.inputs.language == 'cpp' }}
+        if: steps.detect_lang.outputs.has_lang == 'true' && github.event.inputs.language == 'cpp'
         run: |
           cd project-src
           if [ -f CMakeLists.txt ]; then
             mkdir -p build && cd build
-            cmake .. || echo "CMake failed; skipping"
-            make || echo "Make failed; skipping"
+            cmake .. || true
+            make || true
           elif [ -f Makefile ]; then
-            make || echo "Make failed; skipping"
+            make || true
           else
-            echo "No C/C++ build system found; skipping"
+            echo "No C/C++ build system found; skipping build."
           fi
 
       - name: Build Java project
-        if: ${{ github.event.inputs.language == 'java' }}
+        if: steps.detect_lang.outputs.has_lang == 'true' && github.event.inputs.language == 'java'
         run: |
           cd project-src
           if [ -f pom.xml ]; then
-            mvn -B package || echo "Maven build failed; skipping"
+            mvn -B package || true
           elif [ -f build.gradle ]; then
-            ./gradlew build || echo "Gradle build failed; skipping"
+            ./gradlew build || true
           else
-            echo "No Java build system found; skipping"
+            echo "No Java build system found; skipping."
           fi
 
-      # Python projects usually don't need a build
+      # Python has no build step
 
+      # ----------------------------
+      # ANALYZE WITH CODEQL
+      # ----------------------------
       - name: Analyze with CodeQL
+        if: steps.detect_lang.outputs.has_lang == 'true'
         uses: github/codeql-action/analyze@v4
+        continue-on-error: true
 
+      # ----------------------------
+      # UPLOAD ARTIFACTS
+      # ----------------------------
       - name: Set sanitized artifact name
         run: |
           ARTIFACT_NAME="${{ matrix.repo }}"
@@ -115,9 +179,13 @@ jobs:
           name: ${{ env.ARTIFACT_NAME }}
           path: project-src/**
 
+  # ----------------------------
+  # AGGREGATE RESULTS
+  # ----------------------------
   aggregate_results:
     needs: codeql_scan
     runs-on: ubuntu-latest
+
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
