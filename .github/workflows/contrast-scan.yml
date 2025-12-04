@@ -10,7 +10,7 @@ on:
       language:
         description: "Language of the project (java, javascript, dotnet)"
         required: true
-        default: "java"
+        default: "Java"
 
 permissions:
   contents: read
@@ -18,16 +18,13 @@ permissions:
   actions: read
 
 jobs:
-  # ------------------------------------------------------
-  # Fetch top repositories
-  # ------------------------------------------------------
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
 
     steps:
-      - name: Install jq & gh
+      - name: Install dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh git
@@ -40,31 +37,26 @@ jobs:
         run: |
           set -euo pipefail
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
-
           REPOS=$(gh api -X GET /search/repositories \
-              --raw-field q="$RAW_Q" \
-              --raw-field sort=stars \
-              --raw-field order=desc \
-              --raw-field per_page=100 \
-              --jq '.items[].full_name' || true)
+            --raw-field q="$RAW_Q" \
+            --raw-field sort=stars \
+            --raw-field order=desc \
+            --raw-field per_page=50 \
+            --jq '.items[].full_name' || true)
 
-          # Fallback if no IoT topic
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
-                --raw-field q="$RAW_Q" \
-                --raw-field sort=stars \
-                --raw-field order=desc \
-                --raw-field per_page=100 \
-                --jq '.items[].full_name' || true)
+              --raw-field q="$RAW_Q" \
+              --raw-field sort=stars \
+              --raw-field order=desc \
+              --raw-field per_page=50 \
+              --jq '.items[].full_name' || true)
           fi
 
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          JSON_ARRAY=$(printf "%s" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length>0))')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  # ------------------------------------------------------
-  # Run Contrast scan on each repo
-  # ------------------------------------------------------
   contrast_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
@@ -76,9 +68,10 @@ jobs:
     steps:
       - name: Checkout repository
         run: |
-          git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
+          git clone --depth 1 "https://github.com/${{ matrix.repo }}" project-src
 
       - name: Build Artifact
+        shell: bash
         run: |
           cd project-src
           if [ "${{ github.event.inputs.language }}" = "java" ]; then
@@ -92,16 +85,20 @@ jobs:
       - name: Validate Contrast secrets
         id: validate_secrets
         run: |
-          API_KEY="${{ secrets.CONTRAST_API_KEY || 'dummy_key' }}"
-          ORG_ID="${{ secrets.CONTRAST_ORGANIZATION_ID || 'dummy_org' }}"
-          AUTH_HEADER="${{ secrets.CONTRAST_AUTH_HEADER || 'dummy_auth' }}"
+          API_KEY="${{ secrets.CONTRAST_API_KEY || '' }}"
+          ORG_ID="${{ secrets.CONTRAST_ORGANIZATION_ID || '' }}"
+          AUTH_HEADER="${{ secrets.CONTRAST_AUTH_HEADER || '' }}"
+          if [ -z "$API_KEY" ] || [ -z "$ORG_ID" ] || [ -z "$AUTH_HEADER" ]; then
+            echo "missing_secrets=true" >> $GITHUB_OUTPUT
+          else
+            echo "missing_secrets=false" >> $GITHUB_OUTPUT
+            echo "api_key=$API_KEY" >> $GITHUB_OUTPUT
+            echo "org_id=$ORG_ID" >> $GITHUB_OUTPUT
+            echo "auth_header=$AUTH_HEADER" >> $GITHUB_OUTPUT
+          fi
 
-          echo "api_key=$API_KEY" >> $GITHUB_OUTPUT
-          echo "org_id=$ORG_ID" >> $GITHUB_OUTPUT
-          echo "auth_header=$AUTH_HEADER" >> $GITHUB_OUTPUT
-
-      - name: Run Contrast Scan
-        if: ${{ steps.validate_secrets.outputs.api_key != 'dummy_key' && steps.validate_secrets.outputs.org_id != 'dummy_org' }}
+      - name: Run Contrast Scan (if secrets valid)
+        if: ${{ steps.validate_secrets.outputs.missing_secrets == 'false' }}
         uses: Contrast-Security-OSS/contrastscan-action@7352a45d9678ec8a434cf061b07ffb51c1e351a1
         with:
           artifact: project-src/${{ github.event.inputs.artifact_path }}
@@ -109,41 +106,36 @@ jobs:
           orgId: ${{ steps.validate_secrets.outputs.org_id }}
           authHeader: ${{ steps.validate_secrets.outputs.auth_header }}
 
-      - name: Upload SARIF results
-        if: ${{ steps.validate_secrets.outputs.api_key != 'dummy_key' && steps.validate_secrets.outputs.org_id != 'dummy_org' }}
+      - name: Upload SARIF results (if produced)
+        if: ${{ steps.validate_secrets.outputs.missing_secrets == 'false' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results.sarif
 
-      # ------------------------------------------------------
-      # Generate summary.csv (bulletproof Contrast version)
-      # ------------------------------------------------------
       - name: Generate summary.csv
         run: |
           OUT="project-src/summary.csv"
-          SARIF="results.sarif"
-
           echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > "$OUT"
 
+          SARIF="results.sarif"
           if [ ! -f "$SARIF" ]; then
-            echo "${{ matrix.repo }},unknown,0,0,0,0,0,0,0,false,false" >> "$OUT"
+            echo "\"${{ matrix.repo }}\",unknown,0,0,0,0,0,0,0,false,false" >> "$OUT"
             exit 0
           fi
 
           TOTAL=$(jq '.runs[0].results | length' "$SARIF" 2>/dev/null || echo 0)
-          HIGH=$(jq '[.runs[0].results[].level | select(.=="error")] | length' "$SARIF" 2>/dev/null || echo 0)
-          CRITICAL=$(jq '[.runs[0].results[].level | select(.=="fatal")] | length' "$SARIF" 2>/dev/null || echo 0)
-
+          HIGH=$(jq '[.runs[0].results[] | select(.level=="error")] | length' "$SARIF" 2>/dev/null || echo 0)
+          CRITICAL=$(jq '[.runs[0].results[] | select(.level=="fatal")] | length' "$SARIF" 2>/dev/null || echo 0)
           SBOM=0
           COMPONENTS=0
           LICENSE="unknown"
 
-          echo "${{ matrix.repo }},$LICENSE,$COMPONENTS,$TOTAL,$SBOM,$TOTAL,$HIGH,$CRITICAL,0,false,false" >> "$OUT"
+          echo "\"${{ matrix.repo }}\",$LICENSE,$COMPONENTS,$TOTAL,$SBOM,$TOTAL,$HIGH,$CRITICAL,0,false,false" >> "$OUT"
 
       - name: Sanitize artifact name
         id: sanitize_name
         run: |
-          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          SAFE=$(echo "${{ matrix.repo }}" | sed 's/[^A-Za-z0-9._-]/_/g')
           echo "safe_name=$SAFE" >> $GITHUB_OUTPUT
 
       - name: Upload scanned repo artifact
@@ -152,13 +144,9 @@ jobs:
           name: ${{ steps.sanitize_name.outputs.safe_name }}-scan
           path: project-src/**
 
-  # ------------------------------------------------------
-  # Aggregate summaries
-  # ------------------------------------------------------
   aggregate_summaries:
     needs: contrast_scan
     runs-on: ubuntu-latest
-
     steps:
       - name: Download all repo artifacts
         uses: actions/download-artifact@v4
@@ -167,16 +155,15 @@ jobs:
 
       - name: Build master_summary.csv
         run: |
-          echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > master_summary.csv
+          HEADER="repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass"
+          echo "$HEADER" > master_summary.csv
           found=0
-
-          for f in $(find all_summaries -name "summary.csv" || true); do
-            if [ -s "$f" ]; then
-              tail -n +2 "$f" >> master_summary.csv
-              found=$((found + 1))
-            fi
-          done
-
+          while IFS= read -r f; do
+            # skip empty or non-summary files
+            [ -s "$f" ] || continue
+            tail -n +2 "$f" >> master_summary.csv
+            found=$((found + 1))
+          done < <(find all_summaries -type f -name "summary.csv")
           echo "Appended $found summaries"
           if [ $found -eq 0 ]; then
             echo "WARNING: No summary.csv files found" >&2
