@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   # ------------------------------------------------------
-  # Fetch top IoT repositories based on the language input
+  # Fetch Repositories
   # ------------------------------------------------------
   fetch_top_repos:
     runs-on: ubuntu-latest
@@ -36,7 +36,6 @@ jobs:
         run: |
           set -euo pipefail
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
-
           REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
               --raw-field sort=stars \
@@ -44,6 +43,7 @@ jobs:
               --raw-field per_page=50 \
               --jq '.items[].full_name' || true)
 
+          # fallback query if nothing is found
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
@@ -55,12 +55,10 @@ jobs:
           fi
 
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-
-          echo "Repos fetched: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   # ------------------------------------------------------
-  # Run Fortify scan for each repository
+  # Fortify Scan + Per-repo summary.csv
   # ------------------------------------------------------
   fortify_scan:
     needs: fetch_top_repos
@@ -71,10 +69,10 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
-      - name: Run Fortify SAST + Debricked SCA + export SARIF
+      - name: Run Fortify SAST + Debricked scans
         uses: fortify/github-action@v1
         with:
           sast-scan: true
@@ -93,50 +91,65 @@ jobs:
           SC_SAST_SENSOR_VERSION: 24.4.0
 
       # ------------------------------------------------------
-      # Generate summary.csv using SARIF results
+      # Bulletproof Per-repo summary.csv
       # ------------------------------------------------------
       - name: Generate summary.csv
         run: |
-          SARIF="project-src/.fortify/scan.sarif"
           OUT="project-src/summary.csv"
+          SARIF="project-src/.fortify/scan.sarif"
 
+          # CSV header
           echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > "$OUT"
 
-          if [ ! -f "$SARIF" ]; then
-            echo "${{ matrix.repo }},N/A,0,0,0,0,0,0,0,false,false" >> "$OUT"
-            exit 0
+          # ----- Fortify SAST -----
+          if [ -f "$SARIF" ]; then
+            TOTAL=$(jq '.runs[].results | length' "$SARIF")
+            HIGH=$(jq '[.runs[].results[].level | select(.=="error")] | length' "$SARIF")
+            CRITICAL=$(jq '[.runs[].results[].level | select(.=="fatal")] | length' "$SARIF")
+          else
+            TOTAL=0; HIGH=0; CRITICAL=0
           fi
 
-          TOTAL=$(jq '.runs[].results | length' "$SARIF")
-          HIGH=$(jq '[.runs[].results[].level | select(.=="error")] | length' "$SARIF")
-          CRITICAL=$(jq '[.runs[].results[].level | select(.=="fatal")] | length' "$SARIF")
+          # ----- Debricked SCA Auto-detection -----
+          SCA_JSON=$(find project-src/.fortify -type f -name "*.json" | head -n 1 || true)
 
-          echo "${{ matrix.repo }},unknown,0,$TOTAL,0,$TOTAL,$HIGH,$CRITICAL,0,false,false" >> "$OUT"
+          if [ -n "$SCA_JSON" ]; then
+            COMPONENTS=$(jq '.dependencies | length' "$SCA_JSON" 2>/dev/null || echo 0)
+            SBOM_VULNS=$(jq '.vulnerabilities | length' "$SCA_JSON" 2>/dev/null || echo 0)
+            LICENSE=$(jq -r '.repo.license // "unknown"' "$SCA_JSON" 2>/dev/null || echo "unknown")
+          else
+            COMPONENTS=0
+            SBOM_VULNS=0
+            LICENSE="unknown"
+          fi
+
+          # final CSV entry
+          echo "${{ matrix.repo }},$LICENSE,$COMPONENTS,$TOTAL,$SBOM_VULNS,$((TOTAL+SBOM_VULNS)),$HIGH,$CRITICAL,0,false,false" >> "$OUT"
 
       # ------------------------------------------------------
-      # Upload scanned repo and generated summary.csv
+      # Upload repo artifact
       # ------------------------------------------------------
-      - name: Set sanitized artifact name
+      - name: Set artifact name
         run: |
           SAFE="${{ matrix.repo }}"
           SAFE="${SAFE//\//_}"
           echo "ARTIFACT_NAME=$SAFE" >> $GITHUB_ENV
 
-      - name: Upload repo artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}-scan
           path: project-src/**
 
   # ------------------------------------------------------
-  # Aggregate all summary.csv files into master_summary.csv
+  # Aggregate all per-repo summary.csv into master_summary.csv
   # ------------------------------------------------------
   aggregate_summaries:
     needs: fortify_scan
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download all repo artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: all_summaries
@@ -144,19 +157,16 @@ jobs:
       - name: Create master_summary.csv
         run: |
           echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > master_summary.csv
-
-          found=0
-          for f in $(find all_summaries -name "summary.csv" || true); do
+          
+          FOUND=0
+          for f in $(find all_summaries -name summary.csv || true); do
             if [ -s "$f" ]; then
               tail -n +2 "$f" >> master_summary.csv
-              found=$((found+1))
+              FOUND=$((FOUND+1))
             fi
           done
 
-          echo "Appended $found summary files"
-          if [ $found -eq 0 ]; then
-            echo "WARNING: No summary.csv found" >&2
-          fi
+          echo "Collected $FOUND summary files"
 
       - name: Upload master summary
         uses: actions/upload-artifact@v4
