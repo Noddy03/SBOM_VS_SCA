@@ -61,7 +61,7 @@ jobs:
       FOD_CLIENT_SECRET: ${{ secrets.FOD_CLIENT_SECRET }}
       FOD_TENANT: ${{ secrets.FOD_TENANT }}
       SSC_URL: ${{ vars.SSC_URL }}
-      SSC_TOKEN: ${{ secrets.SSC_TOKEN }}
+      SSC_PAT: ${{ secrets.SSC_PAT }}
       SC_SAST_TOKEN: ${{ secrets.SC_CLIENT_AUTH_TOKEN }}
       SC_SAST_SENSOR_VERSION: 24.4.0
 
@@ -92,13 +92,29 @@ jobs:
 
       - name: Fetch Fortify SSC findings
         run: |
-          APPVER="${{ matrix.repo }}:main"
-          ./fcli ssc session login --url "$SSC_URL" --token "$SSC_TOKEN"
+          # Map GitHub repo to SSC AppVersion name
+          APP_NAME=$(echo "${{ matrix.repo }}" | tr '/' '_')
+          APPVER="$APP_NAME:main"
+
+          # Login using SSC Personal Access Token
+          ./fcli ssc session login --url "$SSC_URL" --token "$SSC_PAT"
+
+          # Check if AppVersion exists; if not, create it
+          EXISTS=$(./fcli ssc appversion list --app "$APP_NAME" --format json | jq -r ".[] | select(.versionName==\"main\") | .id" || echo "")
+          if [ -z "$EXISTS" ]; then
+            echo "AppVersion $APPVER does not exist, creating..."
+            ./fcli ssc app create --name "$APP_NAME"
+            ./fcli ssc appversion create --app "$APP_NAME" --name "main"
+          fi
+
+          # Fetch issue counts
           OUT_JSON=$(./fcli ssc issue count --appversion "$APPVER" -o json)
           TOTAL=$(echo "$OUT_JSON" | jq '.total' 2>/dev/null || echo 0)
           HIGH=$(echo "$OUT_JSON" | jq '.high' 2>/dev/null || echo 0)
           CRITICAL=$(echo "$OUT_JSON" | jq '.critical' 2>/dev/null || echo 0)
+
           ./fcli ssc session logout || true
+
           # Generate per-repo summary.csv
           echo "repo,vuln_fs_total,vuln_high,vuln_critical" > project-src/summary.csv
           echo "${{ matrix.repo }},$TOTAL,$HIGH,$CRITICAL" >> project-src/summary.csv
