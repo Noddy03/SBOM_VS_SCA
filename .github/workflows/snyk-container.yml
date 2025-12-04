@@ -125,10 +125,7 @@ jobs:
           name: ${{ steps.sanitize.outputs.safe_repo }}-scan
           path: project-src/**
 
-      - name: Upload SARIF to GitHub
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: project-src/snyk-code.sarif
+     
 
   aggregate_results:
     needs: snyk_scan
