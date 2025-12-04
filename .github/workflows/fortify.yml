@@ -14,19 +14,21 @@ permissions:
   actions: read
 
 jobs:
-  # ----------------------------
-  # Fetch top IoT repositories
-  # ----------------------------
+  # ------------------------------------------------------
+  # Fetch top IoT repositories based on the language input
+  # ------------------------------------------------------
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
+
     steps:
       - name: Install jq & gh
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh git
-      - name: Fetch repositories
+
+      - name: Fetch IoT repositories
         id: fetch
         env:
           LANG: ${{ github.event.inputs.language }}
@@ -34,29 +36,32 @@ jobs:
         run: |
           set -euo pipefail
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
+
           REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
               --raw-field sort=stars \
               --raw-field order=desc \
               --raw-field per_page=50 \
               --jq '.items[].full_name' || true)
+
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
-              --raw-field q="$RAW_Q" \
-              --raw-field sort=stars \
-              --raw-field order=desc \
-              --raw-field per_page=10 \
-              --jq '.items[].full_name' || true)
+                --raw-field q="$RAW_Q" \
+                --raw-field sort=stars \
+                --raw-field order=desc \
+                --raw-field per_page=10 \
+                --jq '.items[].full_name' || true)
           fi
-          # Convert to JSON array
-          JSON_ARRAY=$(echo "$REPOS" | tr -d '"' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
           echo "Repos fetched: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  # ----------------------------
-  # Fortify scan per repo
-  # ----------------------------
+  # ------------------------------------------------------
+  # Run Fortify scan for each repository
+  # ------------------------------------------------------
   fortify_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
@@ -69,48 +74,77 @@ jobs:
       - name: Checkout repository
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
-      - name: Setup Fortify Environment and Scan
+      - name: Run Fortify SAST + Debricked SCA + export SARIF
         uses: fortify/github-action@v1
         with:
           sast-scan: true
           debricked-sca-scan: true
+          export-sarif: true
         env:
           FOD_CLIENT_ID: ${{ secrets.FOD_CLIENT_ID }}
           FOD_CLIENT_SECRET: ${{ secrets.FOD_CLIENT_SECRET }}
           FOD_TENANT: ${{ secrets.FOD_TENANT }}
+
           SSC_URL: ${{ vars.SSC_URL }}
           SSC_TOKEN: ${{ secrets.SSC_TOKEN }}
+
           SC_SAST_TOKEN: ${{ secrets.SC_CLIENT_AUTH_TOKEN }}
           DEBRICKED_TOKEN: ${{ secrets.DEBRICKED_TOKEN }}
           SC_SAST_SENSOR_VERSION: 24.4.0
 
+      # ------------------------------------------------------
+      # Generate summary.csv using SARIF results
+      # ------------------------------------------------------
+      - name: Generate summary.csv
+        run: |
+          SARIF="project-src/.fortify/scan.sarif"
+          OUT="project-src/summary.csv"
+
+          echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > "$OUT"
+
+          if [ ! -f "$SARIF" ]; then
+            echo "${{ matrix.repo }},N/A,0,0,0,0,0,0,0,false,false" >> "$OUT"
+            exit 0
+          fi
+
+          TOTAL=$(jq '.runs[].results | length' "$SARIF")
+          HIGH=$(jq '[.runs[].results[].level | select(.=="error")] | length' "$SARIF")
+          CRITICAL=$(jq '[.runs[].results[].level | select(.=="fatal")] | length' "$SARIF")
+
+          echo "${{ matrix.repo }},unknown,0,$TOTAL,0,$TOTAL,$HIGH,$CRITICAL,0,false,false" >> "$OUT"
+
+      # ------------------------------------------------------
+      # Upload scanned repo and generated summary.csv
+      # ------------------------------------------------------
       - name: Set sanitized artifact name
         run: |
-          ARTIFACT_NAME="${{ matrix.repo }}"
-          ARTIFACT_NAME="${ARTIFACT_NAME//\//_}"   # Replace '/' with '_'
-          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
+          SAFE="${{ matrix.repo }}"
+          SAFE="${SAFE//\//_}"
+          echo "ARTIFACT_NAME=$SAFE" >> $GITHUB_ENV
 
-      - name: Upload scanned repository as artifact
+      - name: Upload repo artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}-scan
           path: project-src/**
 
-  # ----------------------------
-  # Aggregate all summary.csv files
-  # ----------------------------
+  # ------------------------------------------------------
+  # Aggregate all summary.csv files into master_summary.csv
+  # ------------------------------------------------------
   aggregate_summaries:
     needs: fortify_scan
     runs-on: ubuntu-latest
+
     steps:
       - name: Download all repo artifacts
         uses: actions/download-artifact@v4
         with:
           path: all_summaries
 
-      - name: Combine all summary.csv files into master_summary.csv
+      - name: Create master_summary.csv
         run: |
           echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > master_summary.csv
+
           found=0
           for f in $(find all_summaries -name "summary.csv" || true); do
             if [ -s "$f" ]; then
@@ -118,12 +152,13 @@ jobs:
               found=$((found+1))
             fi
           done
-          echo "Appended $found per-repo summaries"
+
+          echo "Appended $found summary files"
           if [ $found -eq 0 ]; then
-            echo "WARNING: No per-repo summary.csv files found" >&2
+            echo "WARNING: No summary.csv found" >&2
           fi
 
-      - name: Upload Master Summary Report
+      - name: Upload master summary
         uses: actions/upload-artifact@v4
         with:
           name: master_summary
