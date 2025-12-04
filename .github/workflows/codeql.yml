@@ -16,10 +16,14 @@ permissions:
 
 jobs:
 
+  # ----------------------------------------------------
+  # Fetch repositories
+  # ----------------------------------------------------
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
+
     steps:
       - name: Install dependencies
         run: |
@@ -32,30 +36,37 @@ jobs:
           LANG: ${{ github.event.inputs.language }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -e
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
-          REPOS=$(gh api -X GET /search/repositories \
-            --raw-field q="$RAW_Q" \
-            --raw-field sort=stars \
-            --raw-field order=desc \
-            --raw-field per_page=50 \
-            --jq '.items[].full_name' || true)
 
-          if [ -z "$REPOS" ]; then
-            RAW_Q="language:$LANG fork:false archived:false"
-            REPOS=$(gh api -X GET /search/repositories \
+          REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
               --raw-field sort=stars \
               --raw-field order=desc \
-              --raw-field per_page=10 \
+              --raw-field per_page=50 \
               --jq '.items[].full_name' || true)
+
+          # fallback when IoT topic not found
+          if [ -z "$REPOS" ]; then
+            RAW_Q="language:$LANG fork:false archived:false"
+            REPOS=$(gh api -X GET /search/repositories \
+                --raw-field q="$RAW_Q" \
+                --raw-field sort=stars \
+                --raw-field order=desc \
+                --raw-field per_page=50 \
+                --jq '.items[].full_name' || true)
           fi
 
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length>0))')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
+  # ----------------------------------------------------
+  # CodeQL + Semgrep scanning job
+  # ----------------------------------------------------
   multi_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
@@ -69,6 +80,9 @@ jobs:
           repository: ${{ matrix.repo }}
           path: project-src
 
+      # ----------------------------------------------------
+      # Language detection
+      # ----------------------------------------------------
       - name: Detect language files
         id: detect_lang
         run: |
@@ -92,8 +106,11 @@ jobs:
 
       - name: Skip repo if language not found
         if: steps.detect_lang.outputs.has_lang == 'false'
-        run: echo "Skipping repo"
+        run: echo "Skipping repo due to no matching language files"
 
+      # ----------------------------------------------------
+      # CodeQL
+      # ----------------------------------------------------
       - name: Initialize CodeQL
         if: steps.detect_lang.outputs.has_lang == 'true'
         uses: github/codeql-action/init@v4
@@ -105,6 +122,9 @@ jobs:
         uses: github/codeql-action/analyze@v4
         continue-on-error: true
 
+      # ----------------------------------------------------
+      # Semgrep
+      # ----------------------------------------------------
       - name: Install Semgrep
         if: steps.detect_lang.outputs.has_lang == 'true'
         run: |
@@ -119,35 +139,65 @@ jobs:
             echo '{"results":[]}' > project-src/semgrep_reports/semgrep.json
           fi
 
+      # ----------------------------------------------------
+      # Bulletproof summary.csv
+      # ----------------------------------------------------
       - name: Generate summary.csv
-        if: steps.detect_lang.outputs.has_lang == 'true'
         run: |
           SUMMARY_DIR="project-src/scan_summary"
           mkdir -p "$SUMMARY_DIR"
-          CSV_FILE="$SUMMARY_DIR/summary.csv"
 
-          echo "repo,language,codeql_issues,semgrep_issues" > "$CSV_FILE"
+          CSV="$SUMMARY_DIR/summary.csv"
+          echo "repo,language,codeql_issues,semgrep_issues" > "$CSV"
 
+          LANG="${{ github.event.inputs.language }}"
+          REPO="${{ matrix.repo }}"
+
+          # If language not detected, still produce summary entry
+          if [ "${{ steps.detect_lang.outputs.has_lang }}" = "false" ]; then
+            echo "$REPO,$LANG,0,0" >> "$CSV"
+            exit 0
+          fi
+
+          # ---- CodeQL result counting (bulletproof) ----
           CODEQL_ISSUES=0
-          for SARIF in $(find project-src -name "*.sarif" || true); do
+          for SARIF in $(find project-src -name "*.sarif" 2>/dev/null || true); do
             COUNT=$(jq '[.runs[].results[]] | length' "$SARIF" 2>/dev/null || echo 0)
             CODEQL_ISSUES=$((CODEQL_ISSUES + COUNT))
           done
 
-          SEMGREP_FILE="project-src/semgrep_reports/semgrep.json"
-          SEMGREP_ISSUES=$(jq '.results | length' "$SEMGREP_FILE" 2>/dev/null || echo 0)
+          # ---- Semgrep result counting (bulletproof) ----
+          SEMFILE="project-src/semgrep_reports/semgrep.json"
+          if [ ! -f "$SEMFILE" ]; then
+            SEMGREP_ISSUES=0
+          else
+            SEMGREP_ISSUES=$(jq '.results | length' "$SEMFILE" 2>/dev/null || echo 0)
+          fi
 
-          echo "${{ matrix.repo }},${{ github.event.inputs.language }},$CODEQL_ISSUES,$SEMGREP_ISSUES" >> "$CSV_FILE"
+          echo "$REPO,$LANG,$CODEQL_ISSUES,$SEMGREP_ISSUES" >> "$CSV"
 
-      - name: Upload artifact (summary only)
+      # ----------------------------------------------------
+      # Sanitize artifact name
+      # ----------------------------------------------------
+      - name: Sanitize artifact name
+        id: sanitize_name
+        run: |
+          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          echo "safe_name=$SAFE" >> $GITHUB_OUTPUT
+
+      - name: Upload summary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo }}-summary
+          name: ${{ steps.sanitize_name.outputs.safe_name }}-summary
           path: project-src/scan_summary/summary.csv
 
+  # ----------------------------------------------------
+  # Aggregate all summaries
+  # ----------------------------------------------------
   aggregate_summaries:
     needs: multi_scan
     runs-on: ubuntu-latest
+
     steps:
       - name: Download all summary artifacts
         uses: actions/download-artifact@v4
@@ -157,13 +207,11 @@ jobs:
       - name: Combine summaries
         run: |
           echo "repo,language,codeql_issues,semgrep_issues" > master_summary.csv
-
           found=0
-          for f in $(find all_summaries -name "summary.csv"); do
+          for f in $(find all_summaries -name "summary.csv" 2>/dev/null); do
             tail -n +2 "$f" >> master_summary.csv
-            found=$((found+1))
+            found=$((found + 1))
           done
-
           echo "Summaries found: $found"
 
       - name: Upload master summary
