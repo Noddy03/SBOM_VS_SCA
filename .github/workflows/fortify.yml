@@ -6,7 +6,7 @@ on:
       language:
         description: "Language filter (e.g., C++, Python, Java)"
         required: true
-        default: "Java"
+        default: "C++"
 
 permissions:
   contents: read
@@ -55,21 +55,24 @@ jobs:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
-      - name: Run Fortify SAST scan locally
+      - name: Run Fortify SAST scan and export SARIF
         uses: fortify/github-action@v1
         with:
           sast-scan: true
+          export-sarif: project-src/fortify.sarif
 
       - name: Generate per-repo summary.csv from SARIF
         run: |
           OUT="project-src/summary.csv"
-          SARIF=$(find project-src/.fortify -type f -name "*.sarif" | head -n 1 || true)
+          SARIF="project-src/fortify.sarif"
           echo "repo,vuln_fs_total,vuln_high,vuln_critical" > "$OUT"
-          if [ -n "$SARIF" ] && [ -s "$SARIF" ]; then
+
+          if [ -f "$SARIF" ] && [ -s "$SARIF" ]; then
             VULN_FS_TOTAL=$(jq '[.runs[].results[]] | length' "$SARIF")
             VULN_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SARIF")
             VULN_CRITICAL=$(jq '[.runs[].results[] | select(.level=="fatal")] | length' "$SARIF")
@@ -78,6 +81,7 @@ jobs:
             VULN_HIGH=0
             VULN_CRITICAL=0
           fi
+
           echo "${{ matrix.repo }},$VULN_FS_TOTAL,$VULN_HIGH,$VULN_CRITICAL" >> "$OUT"
 
       - name: Sanitize artifact name
