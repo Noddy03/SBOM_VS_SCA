@@ -31,6 +31,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
@@ -38,6 +39,8 @@ jobs:
               --raw-field order=desc \
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
+
+          # Fallback if IoT topic yields nothing
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
@@ -47,12 +50,20 @@ jobs:
                 --raw-field per_page=100 \
                 --jq '.items[].full_name' || true)
           fi
+
+          # Ensure JSON array is always valid
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          if [ -z "$JSON_ARRAY" ] || [ "$JSON_ARRAY" = "[]" ]; then
+            JSON_ARRAY="[]"
+          fi
+
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   snyk_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -63,6 +74,7 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        continue-on-error: true
         with:
           repository: ${{ matrix.repo }}
           path: project-src
@@ -81,7 +93,7 @@ jobs:
       - name: Create output directory
         run: mkdir -p project-src/snyk_reports
 
-      - name: Run Snyk Code (SAST) and generate SARIF
+      - name: Run Snyk Code (SAST)
         run: snyk code test project-src --sarif-file-output=project-src/snyk_reports/snyk-code.sarif || true
 
       - name: Ensure SARIF is valid
@@ -100,7 +112,7 @@ jobs:
       - name: Build Docker image (if Dockerfile exists)
         run: |
           if [ -f project-src/Dockerfile ]; then
-            docker build -t project-image project-src
+            docker build -t project-image project-src || true
           else
             echo "Skipping Docker build: no Dockerfile"
           fi
@@ -118,7 +130,7 @@ jobs:
           path: project-src/snyk_reports
 
   aggregate_results:
-    needs: snyk_scan
+    needs: [fetch_top_repos, snyk_scan]
     runs-on: ubuntu-latest
     steps:
       - name: Create folder for all artifacts
