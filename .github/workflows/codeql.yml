@@ -1,221 +1,78 @@
-name: IoT CodeQL + Semgrep Multi-Repo Scan
+name: IoT Repos SBOM + Dual SCA with Timeout
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Primary language to scan (e.g., python, cpp, java, javascript)"
+        description: 'Programming language to filter IoT repos'
         required: true
-        default: "python"
-
-permissions:
-  contents: read
-  security-events: write
-  actions: read
-  packages: read
+        default: 'Python'
 
 jobs:
-
-  # ----------------------------------------------------
-  # Fetch repositories
-  # ----------------------------------------------------
-  fetch_top_repos:
+  fetch-and-scan:
     runs-on: ubuntu-latest
-    outputs:
-      repo_list: ${{ steps.fetch.outputs.repo_list }}
-
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MAX_REPOS: 100
     steps:
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq gh git
+          sudo apt-get update
+          sudo apt-get install -y jq curl git coreutils
 
-      - name: Fetch top IoT repositories
-        id: fetch
-        env:
-          LANG: ${{ github.event.inputs.language }}
-          GH_TOKEN: ${{ github.token }}
+      - name: Install Syft & Grype
         run: |
-          set -e
-          RAW_Q="topic:iot language:$LANG fork:false archived:false"
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
-          REPOS=$(gh api -X GET /search/repositories \
-              --raw-field q="$RAW_Q" \
-              --raw-field sort=stars \
-              --raw-field order=desc \
-              --raw-field per_page=50 \
-              --jq '.items[].full_name' || true)
+      - name: Search Top IoT Repos
+        id: fetch_repos
+        run: |
+          LANGUAGE="${{ github.event.inputs.language }}"
+          curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=100" \
+          | jq -r '.items[].clone_url' > repos.txt
+          echo "Fetched $(wc -l < repos.txt) repos."
 
-          # fallback when IoT topic not found
-          if [ -z "$REPOS" ]; then
-            RAW_Q="language:$LANG fork:false archived:false"
-            REPOS=$(gh api -X GET /search/repositories \
-                --raw-field q="$RAW_Q" \
-                --raw-field sort=stars \
-                --raw-field order=desc \
-                --raw-field per_page=50 \
-                --jq '.items[].full_name' || true)
-          fi
+      - name: Loop over Repos and Generate SBOM + Dual SCA
+        run: |
+          mkdir -p output
+          while read repo; do
+            echo "Processing $repo"
+            name=$(basename $repo .git)
 
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length>0))')
-          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
+            # Clone repository (timeout 20 min)
+            if ! timeout 1200 git clone --depth 1 $repo $name; then
+              echo "Timeout cloning $repo. Skipping..."
+              continue
+            fi
 
-  # ----------------------------------------------------
-  # CodeQL + Semgrep scanning job
-  # ----------------------------------------------------
-  multi_scan:
-    needs: fetch_top_repos
-    runs-on: ubuntu-latest
+            cd $name
 
-    strategy:
-      fail-fast: false
-      matrix:
-        repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+            # Generate SBOM (timeout 20 min)
+            if ! timeout 1200 syft . -o cyclonedx-json > ../output/${name}_sbom.json; then
+              echo "Timeout generating SBOM for $repo. Skipping..."
+              cd ..
+              rm -rf $name
+              continue
+            fi
 
-    steps:
+            # Run SCA directly on repo (timeout 20 min)
+            if ! timeout 1200 grype . -o json > ../output/${name}_sca_direct.json; then
+              echo "Timeout SCA direct scan for $repo. Skipping..."
+            fi
 
-      - name: Checkout repository
-        uses: actions/checkout@v3
+            # Run SCA using SBOM only (timeout 20 min)
+            if ! timeout 1200 grype sbom:../output/${name}_sbom.json -o json > ../output/${name}_sca_from_sbom.json; then
+              echo "Timeout SCA from SBOM for $repo. Skipping..."
+            fi
+
+            cd ..
+            rm -rf $name
+          done < repos.txt
+          
+      - name: Upload SBOM + SCA artifacts
+        uses: actions/upload-artifact@v3
         with:
-          repository: ${{ matrix.repo }}
-          path: project-src
-
-      # ----------------------------------------------------
-      # Language detection
-      # ----------------------------------------------------
-      - name: Detect language files
-        id: detect_lang
-        run: |
-          LANG="${{ github.event.inputs.language }}"
-          cd project-src
-
-          case "$LANG" in
-            python) PATTERN="-name '*.py'" ;;
-            cpp) PATTERN="-name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.c'" ;;
-            java) PATTERN="-name '*.java' -o -name '*.kt'" ;;
-            javascript) PATTERN="-name '*.js' -o -name '*.ts'" ;;
-            *) echo "has_lang=false" >> $GITHUB_OUTPUT; exit 0 ;;
-          esac
-
-          FILE_COUNT=$(find . -type f \( $PATTERN \) | wc -l)
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "has_lang=false" >> $GITHUB_OUTPUT
-          else
-            echo "has_lang=true" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Skip repo if language not found
-        if: steps.detect_lang.outputs.has_lang == 'false'
-        run: echo "Skipping repo due to no matching language files"
-
-      # ----------------------------------------------------
-      # CodeQL
-      # ----------------------------------------------------
-      - name: Initialize CodeQL
-        if: steps.detect_lang.outputs.has_lang == 'true'
-        uses: github/codeql-action/init@v4
-        with:
-          languages: ${{ github.event.inputs.language }}
-
-      - name: Analyze with CodeQL
-        if: steps.detect_lang.outputs.has_lang == 'true'
-        uses: github/codeql-action/analyze@v4
-        continue-on-error: true
-
-      # ----------------------------------------------------
-      # Semgrep
-      # ----------------------------------------------------
-      - name: Install Semgrep
-        if: steps.detect_lang.outputs.has_lang == 'true'
-        run: |
-          python3 -m pip install --upgrade pip
-          pip install semgrep
-
-      - name: Run Semgrep
-        if: steps.detect_lang.outputs.has_lang == 'true'
-        run: |
-          mkdir -p project-src/semgrep_reports
-          if ! semgrep --config=auto --json project-src > project-src/semgrep_reports/semgrep.json 2>/dev/null; then
-            echo '{"results":[]}' > project-src/semgrep_reports/semgrep.json
-          fi
-
-      # ----------------------------------------------------
-      # Bulletproof summary.csv
-      # ----------------------------------------------------
-      - name: Generate summary.csv
-        run: |
-          SUMMARY_DIR="project-src/scan_summary"
-          mkdir -p "$SUMMARY_DIR"
-
-          CSV="$SUMMARY_DIR/summary.csv"
-          echo "repo,language,codeql_issues,semgrep_issues" > "$CSV"
-
-          LANG="${{ github.event.inputs.language }}"
-          REPO="${{ matrix.repo }}"
-
-          # If language not detected, still produce summary entry
-          if [ "${{ steps.detect_lang.outputs.has_lang }}" = "false" ]; then
-            echo "$REPO,$LANG,0,0" >> "$CSV"
-            exit 0
-          fi
-
-          # ---- CodeQL result counting (bulletproof) ----
-          CODEQL_ISSUES=0
-          for SARIF in $(find project-src -name "*.sarif" 2>/dev/null || true); do
-            COUNT=$(jq '[.runs[].results[]] | length' "$SARIF" 2>/dev/null || echo 0)
-            CODEQL_ISSUES=$((CODEQL_ISSUES + COUNT))
-          done
-
-          # ---- Semgrep result counting (bulletproof) ----
-          SEMFILE="project-src/semgrep_reports/semgrep.json"
-          if [ ! -f "$SEMFILE" ]; then
-            SEMGREP_ISSUES=0
-          else
-            SEMGREP_ISSUES=$(jq '.results | length' "$SEMFILE" 2>/dev/null || echo 0)
-          fi
-
-          echo "$REPO,$LANG,$CODEQL_ISSUES,$SEMGREP_ISSUES" >> "$CSV"
-
-      # ----------------------------------------------------
-      # Sanitize artifact name
-      # ----------------------------------------------------
-      - name: Sanitize artifact name
-        id: sanitize_name
-        run: |
-          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          echo "safe_name=$SAFE" >> $GITHUB_OUTPUT
-
-      - name: Upload summary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.sanitize_name.outputs.safe_name }}-summary
-          path: project-src/scan_summary/summary.csv
-
-  # ----------------------------------------------------
-  # Aggregate all summaries
-  # ----------------------------------------------------
-  aggregate_summaries:
-    needs: multi_scan
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download all summary artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: all_summaries
-
-      - name: Combine summaries
-        run: |
-          echo "repo,language,codeql_issues,semgrep_issues" > master_summary.csv
-          found=0
-          for f in $(find all_summaries -name "summary.csv" 2>/dev/null); do
-            tail -n +2 "$f" >> master_summary.csv
-            found=$((found + 1))
-          done
-          echo "Summaries found: $found"
-
-      - name: Upload master summary
-        uses: actions/upload-artifact@v4
-        with:
-          name: master_summary
-          path: master_summary.csv
+          name: iot-sbom-sca
+          path: output/
