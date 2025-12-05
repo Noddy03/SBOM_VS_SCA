@@ -59,20 +59,20 @@ jobs:
 
             # Run SCA directly on repo (timeout 20 min)
             if ! timeout 1200 grype . -o json > ../output/${name}_sca_direct.json; then
-              echo "Timeout SCA direct scan for $repo. Skipping..."
+              echo "Timeout SCA direct scan for $repo. Skipping direct scan."
             fi
 
             # Run SCA using SBOM only (timeout 20 min)
             if ! timeout 1200 grype sbom:../output/${name}_sbom.json -o json > ../output/${name}_sca_from_sbom.json; then
-              echo "Timeout SCA from SBOM for $repo. Skipping..."
+              echo "Timeout SCA from SBOM for $repo. Skipping SBOM‑based scan."
             fi
 
             cd ..
             rm -rf $name
           done < repos.txt
-          
+
       - name: Upload SBOM + SCA artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: iot-sbom-sca
           path: output/
