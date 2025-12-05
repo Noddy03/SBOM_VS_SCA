@@ -52,7 +52,7 @@ jobs:
           fi
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
+  
   sbom_scan:
     name: ${{ matrix.repo }}
     needs: fetch_top_repos
@@ -71,20 +71,17 @@ jobs:
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder
           pip3 install --upgrade pip
           pip3 install cyclonedx-bom cyclonedx-python-lib pandas sbomqs || true
-
       - name: Ensure Docker usable (best-effort)
         run: |
           sudo groupadd docker || true
           sudo usermod -aG docker $USER || true
           sudo systemctl restart docker || true
           sudo docker --version || true
-
       - name: Install Syft (local)
         run: |
           mkdir -p $HOME/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b $HOME/bin || true
           echo "$HOME/bin" >> $GITHUB_PATH || true
-
       - name: Install Trivy (deb)
         run: |
           set -euo pipefail
@@ -95,36 +92,18 @@ jobs:
           sudo apt-get update -y || true
           sudo apt-get install -y trivy || true
           sudo trivy --download-db-only || true
-
-      - name: Checkout target repository and check for original SBOM
-        id: checkout
+      - name: Checkout target repository (reliable clone)
         run: |
           set -euo pipefail
           rm -rf project-src
           git clone --depth 1 https://github.com/${{ matrix.repo }}.git project-src || (echo "git clone failed" >&2; exit 1)
-          
           if [ ! -d project-src ] || [ -z "$(ls -A project-src)" ]; then
             echo "ERROR: project-src is empty after clone" >&2
-            echo "SKIP_REPO=true" >> $GITHUB_OUTPUT
-            exit 0
+            exit 1
           fi
-          
-          # Look for existing SBOM files
-          SBOM_FILE=$(find project-src -maxdepth 5 -type f -iname "bom*.json" -o -iname "cyclonedx*.json" | head -1 || true)
-          
-          if [ -z "$SBOM_FILE" ]; then
-            echo "No original SBOM found, skipping this repository."
-            echo "SKIP_REPO=true" >> $GITHUB_OUTPUT
-            exit 0
-          else
-            echo "Original SBOM found: $SBOM_FILE"
-            mkdir -p project-src/original_sbom_repo
-            cp "$SBOM_FILE" project-src/original_sbom_repo/
-            echo "SKIP_REPO=false" >> $GITHUB_OUTPUT
-          fi
-
+          ls -la project-src | sed -n '1,200p'
+      
       - name: License metadata and determination
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         env:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ github.token }}
@@ -138,9 +117,8 @@ jobs:
           FINAL="${GH:-$FILE}"
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
-
+          
       - name: Best-effort package manager prep (npm/pip/conan)
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           set -euo pipefail
           if [ -f project-src/package-lock.json ] || [ -f project-src/pnpm-lock.yaml ] || [ -f project-src/yarn.lock ]; then
@@ -153,9 +131,8 @@ jobs:
           if ls project-src/conanfile.* >/dev/null 2>&1 || [ -f project-src/conanfile.txt ] 2>/dev/null; then
             (cd project-src && conan profile detect --force || true; conan install . --build=missing) || true
           fi
-
+          
       - name: Build project (C/C++ best-effort)
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           set -euo pipefail
           cd project-src || exit 1
@@ -172,7 +149,6 @@ jobs:
           fi
           
       - name: Cdxgen SBOM (Primary Generator)
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           set -euo pipefail
           if command -v npx >/dev/null 2>&1; then
@@ -190,21 +166,18 @@ jobs:
           JSON
           fi
       - name: Trivy FS SBOM + Vulnerability Scan
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           set -euo pipefail
           trivy fs --format cyclonedx --cyclonedx-spec 1.5 -o project-src/trivy-fs.json project-src || echo '{"components":[]}' > project-src/trivy-fs.json
           trivy fs --format json --vuln-type library,os --security-checks vuln -o project-src/vulnerabilities_fs.json project-src || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
           
       - name: Syft FS SBOM (Enrichment Generator)
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           set -euo pipefail
           export PATH="$HOME/bin:$PATH"
           syft packages dir:project-src -o cyclonedx-json > project-src/syft-sbom.json || echo '{"components":[]}' > project-src/syft-sbom.json
           
       - name: Normalize SBOM arrays
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           for f in project-src/trivy-fs.json project-src/syft-sbom.json project-src/cdxgen-sbom.json; do
             if [ -f "$f" ]; then
@@ -213,8 +186,7 @@ jobs:
               echo '{"components":[]}' > "$f"
             fi
           done
-      - name: Create & Run SBOM Merge Script (Timestamp Fix) 
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
+      - name: Create & Run SBOM Merge Script (Timestamp Fix) ⏰
         run: |
           cat > project-src/merged_and_enrich.py <<'PY'
           import os, json, uuid, time, hashlib, datetime
@@ -305,7 +277,6 @@ jobs:
           PY
           python3 project-src/merged_and_enrich.py || true
       - name: Create and Run File Enrichment & Static Analysis Script
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           cat > project-src/enrich_and_scan.py <<'PY'
           import sys, os, json, hashlib, uuid, time, subprocess
@@ -473,7 +444,6 @@ jobs:
           PY
           python3 project-src/enrich_and_scan.py || true
       - name: NTIA/BSI Metadata Enforcement
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           pip install cyclonedx-python-lib || true
           cat > project-src/enrich_ntia_bsi_hybrid.py <<'PY'
@@ -518,7 +488,6 @@ jobs:
           PY
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
       - name: Validate merged SBOM against CycloneDX Schema ✅ (Final Fix Robust Multi-Method)
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           pip3 install --upgrade cyclonedx-python-lib || true
           
@@ -571,8 +540,7 @@ jobs:
               print(f"FATAL VALIDATION ERROR (Catch-all): {e}", file=sys.stderr)
               sys.exit(1)
           PY
-      - name: Filter SBOM for sbomqs Stability (Remove File Components) 
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
+      - name: Filter SBOM for sbomqs Stability (Remove File Components) 🔪
         run: |
           cat > project-src/filter_sbom.py <<'PY'
           import sys, os, json
@@ -614,13 +582,11 @@ jobs:
           PY
           python3 project-src/filter_sbom.py || true
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           set -euo pipefail
           trivy sbom --format json --vuln-type library,os --security-checks vuln -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
           
       - name: Create unified reports (json + csv)
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           python3 <<'PY'
           import json, csv
@@ -654,8 +620,7 @@ jobs:
               for l in libs:
                   w.writerow([l.get("name"), l.get("version"), l.get("purl"), l.get("supplier")])
           PY
-      - name: NTIA/BSI Compliance Checks (Final Fix Flags) 
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
+      - name: NTIA/BSI Compliance Checks (Final Fix Flags) 🛠️
         run: |
           set +e 
           INPUT_SBOM="project-src/sbomqs-input.json"
@@ -681,7 +646,6 @@ jobs:
               fi
           done
       - name: Create per-repo summary.csv
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           python3 <<'PY'
           import json, csv, os
@@ -732,8 +696,7 @@ jobs:
               w.writerow([repo,repo_license,comp_count,vfs_count,vsb_count,vfs_count+vsb_count,high,critical,score,ntia_pass,bsi_pass])
           PY
           
-      - name: Cleanup Intermediate Files 
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
+      - name: Cleanup Intermediate Files 🧹
         run: |
           set -euo pipefail
           rm -f project-src/cdxgen-sbom.json
@@ -746,7 +709,6 @@ jobs:
           rm -f project-src/cppcheck_raw.xml
           
       - name: Sanitize artifact name
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         id: sanitize
         run: |
           SAFE="${{ matrix.repo }}"
@@ -754,7 +716,6 @@ jobs:
           echo "name=$SAFE" >> $GITHUB_OUTPUT
           
       - name: Upload project-src as artifact (preserve structure)
-        if: steps.checkout.outputs.SKIP_REPO == 'false'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.sanitize.outputs.name }}
@@ -789,4 +750,3 @@ jobs:
         with:
           name: master_summary
           path: master_summary.csv
-    
