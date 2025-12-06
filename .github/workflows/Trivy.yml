@@ -38,14 +38,16 @@ jobs:
           MATRIX_REPOS=$(echo "$REPOS" | jq -R -s -c 'split("\n")')
           echo "matrix=$MATRIX_REPOS" >> $GITHUB_OUTPUT
 
+ 
   scan:
     needs: fetch-and-scan
-    if: ${{ fromJSON(needs.fetch-and-scan.outputs.matrix) != [] }}
+    if: ${{ fromJSON(needs.fetch-and-scan.outputs.matrix) && fromJSON(needs.fetch-and-scan.outputs.matrix) | length > 0 }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
         repo: ${{ fromJSON(needs.fetch-and-scan.outputs.matrix) }}
       fail-fast: false
+
     steps:
       - name: Install Trivy
         uses: aquasecurity/trivy-action@master
