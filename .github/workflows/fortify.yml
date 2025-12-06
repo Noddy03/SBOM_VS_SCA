@@ -1,159 +1,111 @@
-name: IoT SBOM + SCA scan (Trivy)
+name: IoT SBOM + Dual SCA Scan
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: 'Programming language (e.g., Python, Java, C++)'
+        description: 'Programming language (e.g., Java, Python)'
         required: true
         default: 'Python'
       max_repos:
         description: 'Number of top-starred IoT repos to scan'
         required: true
-        default: '20'
+        default: $20
 
 jobs:
   fetch-repos:
     runs-on: ubuntu-latest
     outputs:
-      repo_list: ${{ steps.fetch.outputs.repo_list }}
-
+      repo_list: ${{ steps.set_output.outputs.repo_list }}
     steps:
       - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: sudo apt-get update && sudo apt-get install -y jq curl git
 
       - name: Fetch Top IoT Repositories
-        id: fetch
+        id: set_output
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
           MAX="${{ github.event.inputs.max_repos }}"
-
-          RESPONSE=$(curl -s \
-            -H "Authorization: Bearer ${{ github.token }}" \
+          RESPONSE=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=$MAX")
 
-          if echo "$RESPONSE" | jq -e 'has("items")' >/dev/null; then
-            echo "$RESPONSE" | jq -r '.items | .[]?.clone_url' > repos.txt
-          else
-            echo "⚠️ GitHub API returned no .items; check rate limit or query:"
-            echo "$RESPONSE"
-            exit 1
-          fi
-
+          echo "$RESPONSE" | jq -r '.items[].clone_url' > repos.txt
           jq -R -s -c 'split("\n")[:-1]' repos.txt > repos.json
-          echo "::set-output name=repo_list::$(cat repos.json)"
+
+          # Use environment file instead of set-output
+          echo "repo_list=$(cat repos.json)" >> $GITHUB_OUTPUT
           echo "Fetched $(wc -l < repos.txt) repos."
 
-  scan:
+  scan-and-generate:
     needs: fetch-repos
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        repo: ${{ fromJson(needs.fetch-repos.outputs.repo_list) }}
-      fail-fast: false
-    timeout-minutes: 40  # increase for large repos
-
+    timeout-minutes: 180
     steps:
-      - name: Install Trivy
+      - name: Install tools
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sudo sh -s -- -b /usr/local/bin
+          sudo apt-get update && sudo apt-get install -y jq git curl
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
-      - name: Clone repository
+      - name: Prepare output folder
+        run: mkdir -p output
+
+      - name: Loop over repos and generate SBOM + dual SCA
         run: |
-          REPO="${{ matrix.repo }}"
-          NAME=$(basename "$REPO" .git)
-          echo "Cloning $REPO"
-          if ! timeout 1800 git clone --depth 1 "$REPO" "$NAME"; then
-            echo "clone_timeout" > clone_error.txt
-            exit 0
-          fi
+          SUMMARY_FILE=output/summary.csv
+          echo "repo,dependencies,sca_direct,sca_from_sbom,status" > "$SUMMARY_FILE"
 
-      - name: Set sanitized & unique artifact name
-        id: artifact_name
-        run: |
-          REPO_NAME=$(basename "${{ matrix.repo }}" .git)
-          SAFE_NAME=${REPO_NAME//[^a-zA-Z0-9_-]/_}
-          # Add timestamp for uniqueness
-          TIMESTAMP=$(date +%s%N)
-          UNIQUE_NAME="${SAFE_NAME}-${TIMESTAMP}"
-          echo "::set-output name=name::$UNIQUE_NAME"
+          for repo in $(echo '${{ needs.fetch-repos.outputs.repo_list }}' | jq -r '.[]'); do
+            echo "Processing $repo"
+            name=$(basename "$repo" .git)
 
-      - name: Generate SBOM + SCA scans
-        run: |
-          NAME=$(basename "${{ matrix.repo }}" .git)
-          SAFE_NAME=${{ steps.artifact_name.outputs.name }}
-          mkdir -p output
-          cd "$NAME"
+            # Clone repo (20 min timeout)
+            if ! timeout 1200 git clone --depth 1 "$repo" "$name"; then
+              echo "Timeout cloning $repo. Skipping..."
+              echo "$name,0,0,0,clone_timeout" >> "$SUMMARY_FILE"
+              continue
+            fi
 
-          # -------------------------
-          # 1️⃣ Generate SBOM (robust)
-          # -------------------------
-          echo "Generating SBOM..."
-          if timeout 1200 trivy sbom --scanners vuln --format cyclonedx --output ../output/"${SAFE_NAME}_sbom.json" .; then
-            SBOM_OK=1
-          else
-            echo "⚠️ SBOM scan failed for $NAME"
-            SBOM_OK=0
-            echo '{}' > ../output/"${SAFE_NAME}_sbom.json"
-          fi
+            cd "$name"
 
-          # -------------------------
-          # 2️⃣ Direct SCA (robust)
-          # -------------------------
-          echo "Running SCA (direct)..."
-          timeout 1800 trivy fs --scanners vuln --format json --output ../output/"${SAFE_NAME}_sca_direct.json" . || echo "⚠️ Direct SCA failed for $NAME"
+            # Generate SBOM (20 min timeout)
+            if ! timeout 1200 syft . -o cyclonedx-json > ../output/${name}_sbom.json; then
+              echo "Timeout SBOM for $repo"
+              echo "$name,0,0,0,sbom_timeout" >> ../output/summary.csv
+              cd ..
+              rm -rf "$name"
+              continue
+            fi
 
-          # -------------------------
-          # 3️⃣ SCA from SBOM (only if SBOM succeeded)
-          # -------------------------
-          if [ "$SBOM_OK" -eq 1 ]; then
-            echo "Running SCA (from SBOM)..."
-            timeout 1200 trivy sbom --input ../output/"${SAFE_NAME}_sbom.json" --format json --output ../output/"${SAFE_NAME}_sca_from_sbom.json" || echo "⚠️ SCA from SBOM failed for $NAME"
-          else
-            echo '{}' > ../output/"${SAFE_NAME}_sca_from_sbom.json"
-          fi
+            # Count dependencies from SBOM
+            deps=$(jq '.artifacts | length' ../output/${name}_sbom.json 2>/dev/null || echo 0)
 
-          # -------------------------
-          # 4️⃣ Generate summary CSV
-          # -------------------------
-          sbom_count=0
-          if [ "$SBOM_OK" -eq 1 ]; then
-            sbom_count=$(jq '.components | length' ../output/"${SAFE_NAME}_sbom.json" 2>/dev/null || echo 0)
-          fi
-          direct_vuln=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/"${SAFE_NAME}_sca_direct.json" 2>/dev/null || echo 0)
-          sbom_vuln=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/"${SAFE_NAME}_sca_from_sbom.json" 2>/dev/null || echo 0)
+            # Direct SCA (20 min timeout)
+            if timeout 1200 grype . -o json > ../output/${name}_sca_direct.json; then
+              direct=$(jq '.matches | length' ../output/${name}_sca_direct.json 2>/dev/null || echo 0)
+            else
+              echo "Timeout direct SCA for $repo"
+              direct=0
+            fi
 
-          echo "$SAFE_NAME,$sbom_count,$direct_vuln,$sbom_vuln" > ../output/"${SAFE_NAME}_summary.csv"
+            # SCA from SBOM (20 min timeout)
+            if timeout 1200 grype sbom:../output/${name}_sbom.json -o json > ../output/${name}_sca_from_sbom.json; then
+              from_sbom=$(jq '.matches | length' ../output/${name}_sca_from_sbom.json 2>/dev/null || echo 0)
+            else
+              echo "Timeout SCA from SBOM for $repo"
+              from_sbom=0
+            fi
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.artifact_name.outputs.name }}-sbom-sca
-          path: output/
+            # Append to summary
+            echo "$name,$deps,$direct,$from_sbom,success" >> ../output/summary.csv
 
-  aggregate-summary:
-    needs: scan
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all per-repo artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: all_outputs
-
-      - name: Combine summaries into master_summary.csv
-        run: |
-          mkdir -p master
-          echo "repo,sbom_components,direct_vulnerabilities,sbom_vulnerabilities" > master/master_summary.csv
-
-          # Append all per-repo CSVs (skip headers)
-          for f in $(find all_outputs -name "*_summary.csv"); do
-            tail -n +2 "$f" >> master/master_summary.csv
+            cd ..
+            rm -rf "$name"
           done
 
-      - name: Upload master_summary.csv
+      - name: Upload SBOM + SCA artifacts and summary
         uses: actions/upload-artifact@v4
         with:
-          name: master_summary
-          path: master/master_summary.csv
+          name: iot-sbom-sca
+          path: output/
