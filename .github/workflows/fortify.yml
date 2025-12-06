@@ -22,24 +22,14 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Fetch IoT repositories
-        id: fetch
+      - name: Search Top IoT Repos
+        id: fetch_repos
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
-          MAX="${{ github.event.inputs.max_repos }}"
-
-          # Fetch clone URLs
           curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=$MAX" \
-            | jq -r '.items[].clone_url' > repos.txt
-
-          # Convert newline list into JSON array
-          jq -R -s -c 'split("\n")[:-1]' repos.txt > repos.json
-
-          echo "Repositories fetched:"
-          cat repos.json
-
-          echo "::set-output name=repo_list::$(cat repos.json)"
+          "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=100" \
+          | jq -r '.items[].clone_url' > repos.txt
+          echo "Fetched $(wc -l < repos.txt) repos."
 
   scan:
     needs: fetch-repos
