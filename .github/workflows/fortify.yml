@@ -70,12 +70,15 @@ jobs:
             exit 0
           fi
 
-      - name: Set sanitized artifact name
+      - name: Set sanitized & unique artifact name
         id: artifact_name
         run: |
           REPO_NAME=$(basename "${{ matrix.repo }}" .git)
           SAFE_NAME=${REPO_NAME//[^a-zA-Z0-9_-]/_}
-          echo "::set-output name=name::$SAFE_NAME"
+          # Add timestamp for uniqueness
+          TIMESTAMP=$(date +%s%N)
+          UNIQUE_NAME="${SAFE_NAME}-${TIMESTAMP}"
+          echo "::set-output name=name::$UNIQUE_NAME"
 
       - name: Generate SBOM + SCA scans
         run: |
