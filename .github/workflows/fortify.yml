@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: 'Programming language (e.g., Python, C, C++, Go)'
+        description: 'Programming language (e.g., Python, C, Go)'
         required: true
         default: 'Python'
       max_repos:
-        description: 'Number of top-starred IoT repos to scan'
+        description: 'Top-starred IoT repos to scan'
         required: true
         default: '20'
 
@@ -16,30 +16,37 @@ jobs:
   fetch-repos:
     runs-on: ubuntu-latest
     outputs:
-      list: ${{ steps.fetch.outputs.list }}
+      repo_list: ${{ steps.fetch.outputs.repo_list }}
 
     steps:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Fetch top IoT repos
+      - name: Fetch IoT repositories
         id: fetch
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
           MAX="${{ github.event.inputs.max_repos }}"
 
+          # Fetch clone URLs
           curl -s -H "Authorization: token $GITHUB_TOKEN" \
             "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=$MAX" \
             | jq -r '.items[].clone_url' > repos.txt
 
-          echo "::set-output name=list::$(paste -sd ',' repos.txt)"
+          # Convert newline list into JSON array
+          jq -R -s -c 'split("\n")[:-1]' repos.txt > repos.json
+
+          echo "Repositories fetched:"
+          cat repos.json
+
+          echo "::set-output name=repo_list::$(cat repos.json)"
 
   scan:
     needs: fetch-repos
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        repo: ${{ fromJson('["' + needs.fetch-repos.outputs.list + '"]') }}
+        repo: ${{ fromJson(needs.fetch-repos.outputs.repo_list) }}
       fail-fast: false
     timeout-minutes: 30
 
@@ -52,11 +59,9 @@ jobs:
       - name: Clone repository
         run: |
           REPO="${{ matrix.repo }}"
-          NAME=$(basename $REPO .git)
+          NAME=$(basename "$REPO" .git)
 
           echo "Cloning $REPO"
-
-          # 20-minute timeout for clone
           if ! timeout 1200 git clone --depth 1 "$REPO" "$NAME"; then
             echo "clone_timeout" > clone_error.txt
             exit 0
@@ -73,7 +78,7 @@ jobs:
             --format cyclonedx-json \
             --output ../output/"${NAME}_sbom.json" .
 
-          echo "Running SCA (direct scan)..."
+          echo "Running SCA (direct)..."
           timeout 1200 trivy fs \
             --security-checks vuln \
             --format json \
@@ -85,7 +90,6 @@ jobs:
             --format json \
             --output ../output/"${NAME}_sca_from_sbom.json"
 
-          # Summary counts
           sbom_count=$(jq '.components | length' ../output/"${NAME}_sbom.json" 2>/dev/null || echo 0)
           direct_vuln=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/"${NAME}_sca_direct.json" 2>/dev/null || echo 0)
           sbom_vuln=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/"${NAME}_sca_from_sbom.json" 2>/dev/null || echo 0)
