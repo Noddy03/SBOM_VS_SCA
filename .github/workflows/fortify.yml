@@ -73,6 +73,7 @@ jobs:
       - name: Generate SBOM + SCA scans
         run: |
           NAME=$(basename "${{ matrix.repo }}" .git)
+          SAFE_NAME=${NAME//[^a-zA-Z0-9_-]/_}
           mkdir -p output
           cd "$NAME"
 
@@ -80,28 +81,29 @@ jobs:
           # 1️⃣ Generate SBOM (robust)
           # -------------------------
           echo "Generating SBOM..."
-          if timeout 1200 trivy sbom --scanners vuln --format cyclonedx --output ../output/"${NAME}_sbom.json" .; then
+          if timeout 1200 trivy sbom --scanners vuln --format cyclonedx --output ../output/"${SAFE_NAME}_sbom.json" .; then
             SBOM_OK=1
           else
             echo "⚠️ SBOM scan failed for $NAME"
             SBOM_OK=0
+            echo '{}' > ../output/"${SAFE_NAME}_sbom.json"
           fi
 
           # -------------------------
           # 2️⃣ Direct SCA (always runs)
           # -------------------------
           echo "Running SCA (direct)..."
-          timeout 1200 trivy fs --security-checks vuln --format json --output ../output/"${NAME}_sca_direct.json" .
+          timeout 1200 trivy fs --security-checks vuln --format json --output ../output/"${SAFE_NAME}_sca_direct.json" .
 
           # -------------------------
           # 3️⃣ SCA from SBOM (only if SBOM succeeded)
           # -------------------------
           if [ "$SBOM_OK" -eq 1 ]; then
             echo "Running SCA (from SBOM)..."
-            timeout 1200 trivy sbom --input ../output/"${NAME}_sbom.json" --format json --output ../output/"${NAME}_sca_from_sbom.json"
+            timeout 1200 trivy sbom --input ../output/"${SAFE_NAME}_sbom.json" --format json --output ../output/"${SAFE_NAME}_sca_from_sbom.json"
           else
             echo "Skipping SCA from SBOM for $NAME"
-            echo '{}' > ../output/"${NAME}_sca_from_sbom.json"
+            echo '{}' > ../output/"${SAFE_NAME}_sca_from_sbom.json"
           fi
 
           # -------------------------
@@ -109,18 +111,27 @@ jobs:
           # -------------------------
           sbom_count=0
           if [ "$SBOM_OK" -eq 1 ]; then
-            sbom_count=$(jq '.components | length' ../output/"${NAME}_sbom.json" 2>/dev/null || echo 0)
+            sbom_count=$(jq '.components | length' ../output/"${SAFE_NAME}_sbom.json" 2>/dev/null || echo 0)
           fi
-          direct_vuln=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/"${NAME}_sca_direct.json" 2>/dev/null || echo 0)
-          sbom_vuln=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/"${NAME}_sca_from_sbom.json" 2>/dev/null || echo 0)
+          direct_vuln=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/"${SAFE_NAME}_sca_direct.json" 2>/dev/null || echo 0)
+          sbom_vuln=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/"${SAFE_NAME}_sca_from_sbom.json" 2>/dev/null || echo 0)
 
-          echo "$NAME,$sbom_count,$direct_vuln,$sbom_vuln" > ../output/"${NAME}_summary.csv"
+          echo "$SAFE_NAME,$sbom_count,$direct_vuln,$sbom_vuln" > ../output/"${SAFE_NAME}_summary.csv"
+
+      - name: Set sanitized artifact name
+        id: artifact_name
+        run: |
+            REPO_NAME=$(basename "${{ matrix.repo }}" .git)
+            SAFE_NAME=${REPO_NAME//[^a-zA-Z0-9_-]/_}
+            echo "SAFE_NAME=$SAFE_NAME"
+            echo "::set-output name=name::$SAFE_NAME"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo }}-sbom-sca
-          path: output/
+            name: ${{ steps.artifact_name.outputs.name }}-sbom-sca
+            path: output/
+
 
   aggregate-summary:
     needs: scan
