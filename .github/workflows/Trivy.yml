@@ -10,7 +10,7 @@ on:
       max_repos:
         description: 'Number of repos to fetch'
         required: false
-        default: 100
+        default: '100'
 
 jobs:
   fetch-and-scan:
@@ -41,7 +41,7 @@ jobs:
     needs: fetch-and-scan
     runs-on: ubuntu-latest
     strategy:
-      matrix: ${{fromJSON(needs.fetch-and-scan.outputs.matrix).include}}
+      matrix: ${{ fromJSON(needs.fetch-and-scan.outputs.matrix).include }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
@@ -58,10 +58,13 @@ jobs:
       - name: Run Trivy scan
         working-directory: repo
         run: |
-          trivy fs --scanners vuln,secret --timeout 30m -f json -o ../output_${{ matrix.repo//\//_ }}.json .
+          # Replace '/' with '_' for filename
+          FILE_NAME=${{ matrix.repo }}
+          FILE_NAME=${FILE_NAME//\//_}
+          trivy fs --scanners vuln,secret --timeout 30m -f json -o ../output_${FILE_NAME}.json .
 
       - name: Upload Trivy JSON
         uses: actions/upload-artifact@v3
         with:
-          name: trivy-report-${{ matrix.repo//\//_ }}
-          path: ../output_${{ matrix.repo//\//_ }}.json
+          name: trivy-report-${{ matrix.repo }}
+          path: ../output_${{ matrix.repo }}.json
