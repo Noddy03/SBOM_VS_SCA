@@ -1,4 +1,4 @@
-name: IoT Repos SBOM + SCA with Trivy (Fast Mode)
+name: IoT Repos SBOM + SCA (Stable Fast Mode)
 
 on:
   workflow_dispatch:
@@ -21,73 +21,74 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq curl git coreutils
 
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sh -s -- -b /usr/local/bin
 
       - name: Fetch top IoT repositories
-        id: fetch_repos
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
-
           curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=$MAX_REPOS" \
+            "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=${MAX_REPOS}" \
             | jq -r '.items[].clone_url' > repos.txt
-
           echo "Fetched $(wc -l < repos.txt) repos"
 
-      - name: Scan repositories with fast SBOM + SCA
+      - name: Scan repositories
         run: |
           mkdir -p output
-          echo "repo,dependencies,vulnerabilities,status" > output/summary.csv
+          echo "repo,dependencies,vulns_direct,vulns_sbom,status" > output/summary.csv
 
           while IFS= read -r repo; do
             echo "=== Processing $repo ==="
             name=$(basename "$repo" .git)
 
-            # Clone with 5 min timeout (fast)
+            # clone fast
             if ! timeout 300 git clone --depth 1 "$repo" "$name"; then
-              echo "$name,0,0,clone_timeout" >> output/summary.csv
+              echo "$name,0,0,0,clone_timeout" >> output/summary.csv
               continue
             fi
 
             cd "$name"
 
-            # Fast SBOM: file-system only (no dependency resolving!)
-            if timeout 300 trivy fs \
-                --format cyclonedx-json \
-                --dependency-tree \
-                . > "../output/${name}_sbom.json"; then
-
+            # FAST & RELIABLE SBOM using Syft
+            if syft . -o cyclonedx-json > "../output/${name}_sbom.json"; then
               deps=$(jq '.components | length' "../output/${name}_sbom.json" 2>/dev/null || echo 0)
             else
-              echo "$name,0,0,sbom_timeout" >> ../output/summary.csv
+              echo "$name,0,0,0,sbom_error" >> ../output/summary.csv
               cd ..
               rm -rf "$name"
               continue
             fi
 
-            # Fast vulnerability scan (no SBOM use)
-            if timeout 300 trivy fs \
-                --scanners vuln \
-                --format json \
-                -o "../output/${name}_vuln.json" \
-                .; then
-
-              vulns=$(jq '[.Results[].Vulnerabilities[]?] | length' "../output/${name}_vuln.json" 2>/dev/null || echo 0)
+            # FAST Trivy vuln scan
+            if trivy fs --scanners vuln --format json -o "../output/${name}_sca_direct.json" .; then
+              vd=$(jq '[.Results[].Vulnerabilities[]?] | length' "../output/${name}_sca_direct.json" 2>/dev/null || echo 0)
             else
-              vulns=0
+              vd=0
             fi
 
-            echo "$name,$deps,$vulns,success" >> ../output/summary.csv
+            # SCA-from-SBOM (very fast)
+            if trivy sbom --input "../output/${name}_sbom.json" --format json -o "../output/${name}_sca_sbom.json"; then
+              vs=$(jq '[.Results[].Vulnerabilities[]?] | length' "../output/${name}_sca_sbom.json" 2>/dev/null || echo 0)
+            else
+              vs=0
+            fi
+
+            echo "$name,$deps,$vd,$vs,success" >> ../output/summary.csv
 
             cd ..
             rm -rf "$name"
+
           done < repos.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: iot-fast-scans
+          name: iot-sbom-sca-fast
           path: output/
