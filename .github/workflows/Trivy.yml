@@ -1,135 +1,89 @@
-name: IOT_SBOM_SCA_Trivy
+name: Top IoT Repos Trivy Scan
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Language (e.g., Java, Python, C, C++, JS)"
+        description: 'Programming language to filter (e.g., Java, Python, JavaScript)'
         required: true
-        default: "Java"
+        type: string
 
 jobs:
-  scan:
+  fetch-and-scan:
     runs-on: ubuntu-latest
-
     steps:
-      ############################################################
-      # Cache Trivy DB (HUGE speed boost)
-      ############################################################
-      - name: Cache Trivy DB
-        uses: actions/cache@v3
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq git curl
+
+      - name: Fetch top 100 IoT repos
+        id: fetch_repos
+        run: |
+          LANGUAGE="${{ github.event.inputs.language }}"
+          echo "Fetching top 100 IoT repos in $LANGUAGE..."
+          REPOS=$(curl -s "https://api.github.com/search/repositories?q=iot+language:$LANGUAGE&sort=stars&order=desc&per_page=100" \
+            | jq -r '.items[].clone_url')
+          # Convert to JSON array
+          MATRIX_REPOS=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
+          echo "Repos to scan: $MATRIX_REPOS"
+          echo "::set-output name=matrix::$MATRIX_REPOS"
+
+  scan:
+    needs: fetch-and-scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo: ${{fromJSON(needs.fetch-and-scan.outputs.matrix)}}
+      fail-fast: false
+    steps:
+      - name: Checkout Trivy
+        uses: aquasecurity/trivy-action@master
         with:
-          path: ~/.cache/trivy
-          key: trivy-db-cache
+          version: 1.5.2
 
-      ############################################################
-      # Fetch IoT repos
-      ############################################################
-      - name: Fetch IoT Repos
-        env:
-          LANGUAGE: ${{ github.event.inputs.language }}
+      - name: Clone repository
         run: |
-          curl -s \
-            "https://api.github.com/search/repositories?q=topic:iot+language:${LANGUAGE}&sort=stars&order=desc&per_page=100" \
-            | jq -r '.items[].clone_url' > repos.txt
-          echo "Found $(wc -l < repos.txt) repos."
+          REPO_NAME=$(basename ${{ matrix.repo }} .git)
+          git clone --depth 1 ${{ matrix.repo }} $REPO_NAME
 
-      ############################################################
-      # Install Trivy
-      ############################################################
-      - name: Install Trivy
+      - name: Scan repository
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sudo sh -s -- -b /usr/local/bin
+          REPO_NAME=$(basename ${{ matrix.repo }} .git)
+          cd $REPO_NAME
 
-      ############################################################
-      # Prepare output
-      ############################################################
-      - name: Prepare Output
-        run: |
-          mkdir -p output
-          echo "repo,sbom_components,sca_direct,sca_from_sbom,status" > output/summary.csv
+          # Java project
+          if [ -f "pom.xml" ]; then
+            echo "Java project detected"
+            trivy fs . \
+              --scanners vuln \
+              --timeout 20m \
+              --file-patterns '**/pom.xml' \
+              --format json \
+              -o ../output/${REPO_NAME}_java.json
 
-      ############################################################
-      # Process Each Repo
-      ############################################################
-      - name: Process Each Repo
-        shell: bash
-        run: |
-          while IFS= read -r repo; do
-            echo "========== Processing $repo =========="
-            name=$(basename "$repo" .git)
-            safe=$(echo "$name" | tr -cd 'A-Za-z0-9._-')
+          # Python project
+          elif [ -f "requirements.txt" ] || [ -d "venv" ]; then
+            echo "Python project detected"
+            trivy fs . \
+              --scanners vuln \
+              --timeout 20m \
+              --file-patterns '**/requirements.txt' \
+              --format json \
+              -o ../output/${REPO_NAME}_python.json
 
-            ############################################################
-            # Clone repo
-            ############################################################
-            if ! timeout 1200 git clone --depth 1 "$repo" "$safe"; then
-              echo "$safe,0,0,0,clone_failed" >> output/summary.csv
-              continue
-            fi
-            cd "$safe"
+          # Node.js project
+          elif [ -f "package.json" ]; then
+            echo "Node.js project detected"
+            trivy fs . \
+              --scanners vuln \
+              --timeout 20m \
+              --file-patterns '**/package.json' \
+              --format json \
+              -o ../output/${REPO_NAME}_node.json
 
-            ############################################################
-            # SBOM generation (CycloneDX)
-            ############################################################
-            sbom_file="../output/${safe}_sbom.json"
-            if timeout 1200 trivy sbom --format cyclonedx --output "$sbom_file" . ; then
-              sbom_components=$(jq '.components | length // 0' "$sbom_file")
-            else
-              sbom_components=0
-            fi
+          else
+            echo "Unknown language. Skipping repository."
 
-            ############################################################
-            # Direct SCA scan (skip heavy dirs)
-            ############################################################
-            sca_file="../output/${safe}_sca_direct.json"
-            if timeout 1200 trivy fs \
-                  --skip-dirs node_modules \
-                  --skip-dirs vendor \
-                  --skip-dirs build \
-                  --skip-dirs dist \
-                  --skip-dirs target \
-                  --skip-dirs .git \
-                  --scanners vuln \
-                  --format json \
-                  --output "$sca_file" . ; then
-              sca_direct=$(jq '[.Results[].Vulnerabilities // [] | length] | add // 0' "$sca_file")
-            else
-              sca_direct=0
-            fi
-
-            ############################################################
-            # SCA using SBOM only
-            ############################################################
-            sbom_sca_file="../output/${safe}_sca_from_sbom.json"
-            if [ -f "$sbom_file" ]; then
-              if timeout 1200 trivy sbom \
-                    --input "$sbom_file" \
-                    --format json \
-                    --output "$sbom_sca_file" ; then
-                sca_from_sbom=$(jq '[.Results[].Vulnerabilities // [] | length] | add // 0' "$sbom_sca_file")
-              else
-                sca_from_sbom=0
-              fi
-            else
-              sca_from_sbom=0
-            fi
-
-            ############################################################
-            # Write summary entry
-            ############################################################
-            echo "$safe,$sbom_components,$sca_direct,$sca_from_sbom,success" >> ../output/summary.csv
-
-            cd ..
-            rm -rf "$safe"
-          done < repos.txt
-
-      ############################################################
-      # Upload results
-      ############################################################
-      - name: Upload Results
-        uses: actions/upload-artifact@v4
-        with:
-          name: iot_sbom_sca_results
-          path: output/
+      - name: Move output
+        run: mkdir -p ../output
