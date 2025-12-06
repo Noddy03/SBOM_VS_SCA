@@ -10,7 +10,7 @@ on:
       max_repos:
         description: 'Number of top-starred IoT repos to scan'
         required: true
-        default: $20
+        default: '20'
 
 jobs:
   fetch-repos:
