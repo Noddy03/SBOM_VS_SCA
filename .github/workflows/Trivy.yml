@@ -18,16 +18,16 @@ jobs:
       ############################################################
       - name: Fetch IoT Repos
         id: fetch
+        env:
+          LANGUAGE: ${{ github.event.inputs.language }}
         run: |
-          LANGUAGE="${{ github.event.inputs.language }}"
           curl -s \
-            "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=100" \
+            "https://api.github.com/search/repositories?q=topic:iot+language:${LANGUAGE}&sort=stars&order=desc&per_page=100" \
             | jq -r '.items[].clone_url' > repos.txt
-
           echo "Found $(wc -l < repos.txt) repos."
 
       ############################################################
-      # Install Trivy (SBOM + SCA)
+      # Install Trivy
       ############################################################
       - name: Install Trivy
         run: |
@@ -35,7 +35,7 @@ jobs:
             | sudo sh -s -- -b /usr/local/bin
 
       ############################################################
-      # Prepare output
+      # Prepare output directories
       ############################################################
       - name: Prepare output directories
         run: |
@@ -43,19 +43,18 @@ jobs:
           echo "repo,sbom_components,sca_direct,sca_from_sbom,status" > output/summary.csv
 
       ############################################################
-      # Main loop: clone, SBOM, SCA direct, SCA-from-SBOM
+      # Main processing loop
       ############################################################
       - name: Process Each Repo
+        shell: bash
         run: |
-          while read repo; do
+          while IFS= read -r repo; do
             echo "========== Processing $repo =========="
 
             name=$(basename "$repo" .git)
-
-            # safe artifact name
             safe=$(echo "$name" | tr -cd 'A-Za-z0-9._-')
 
-            # clone repository
+            # Clone
             if ! timeout 1200 git clone --depth 1 "$repo" "$safe"; then
               echo "$safe,0,0,0,clone_failed" >> output/summary.csv
               continue
@@ -63,34 +62,27 @@ jobs:
 
             cd "$safe"
 
-            ############################################################
-            # SBOM (CycloneDX) — does not crash workflow on failure
-            ############################################################
+            # SBOM generation
             sbom_file="../output/${safe}_sbom.json"
-            if timeout 1200 trivy sbom --format cyclonedx --output "$sbom_file" . ; then
-              sbom_components=$(jq '.components | length' "$sbom_file" 2>/dev/null || echo 0)
+            if timeout 1200 trivy sbom --format cyclonedx --output "$sbom_file" .; then
+              sbom_components=$(jq '.components | length // 0' "$sbom_file")
             else
-              echo "SBOM failed for $repo"
               sbom_components=0
             fi
 
-            ############################################################
-            # SCA Scans Direct from Source
-            ############################################################
+            # Direct SCA
             sca_file="../output/${safe}_sca_direct.json"
-            if timeout 1200 trivy fs --format json --output "$sca_file" . ; then
-              sca_direct=$(jq '[.Results[].Vulnerabilities | length] | add' "$sca_file" 2>/dev/null || echo 0)
+            if timeout 1200 trivy fs --format json --output "$sca_file" .; then
+              sca_direct=$(jq '[.Results[].Vulnerabilities | length // 0] | add // 0' "$sca_file")
             else
               sca_direct=0
             fi
 
-            ############################################################
-            # SCA Using Only SBOM
-            ############################################################
+            # SBOM-based SCA
             sbom_sca_file="../output/${safe}_sca_from_sbom.json"
             if [ -f "$sbom_file" ]; then
               if timeout 1200 trivy sbom --input "$sbom_file" --format json --output "$sbom_sca_file"; then
-                sca_from_sbom=$(jq '[.Results[].Vulnerabilities | length] | add' "$sbom_sca_file" 2>/dev/null || echo 0)
+                sca_from_sbom=$(jq '[.Results[].Vulnerabilities | length // 0] | add // 0' "$sbom_sca_file")
               else
                 sca_from_sbom=0
               fi
@@ -102,11 +94,10 @@ jobs:
 
             cd ..
             rm -rf "$safe"
-
           done < repos.txt
 
       ############################################################
-      # Upload output artifacts
+      # Upload artifacts
       ############################################################
       - name: Upload Results
         uses: actions/upload-artifact@v4
