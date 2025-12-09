@@ -1,4 +1,4 @@
-name: IoT Single-Repo Snyk Scan (Container + SAST + SCA)
+name: Single-Repo Snyk Full Scan (SCA + SAST w/ Severity)
 
 on:
   workflow_dispatch:
@@ -6,10 +6,6 @@ on:
       repo_name:
         description: "GitHub repository to scan (e.g., owner/repo)"
         required: true
-      language:
-        description: "Language hint (unused by Snyk, optional)"
-        required: false
-        default: "Java"
 
 permissions:
   contents: read
@@ -24,7 +20,7 @@ jobs:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      - name: Checkout specified repository
+      - name: Checkout repository
         run: |
           git clone --depth 1 "https://github.com/${{ github.event.inputs.repo_name }}" project-src
 
@@ -33,47 +29,57 @@ jobs:
         with:
           snyk-version: "latest"
 
-      - name: Run Snyk Code (SAST)
-        run: |
-          mkdir -p project-src
-          if ! snyk code test project-src --sarif-file=project-src/snyk-code.sarif; then
-            echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
-          fi
-
+      ############################################
+      # Snyk SCA (Open Source) - ALL MODULES
+      ############################################
       - name: Run Snyk Open Source (SCA)
         run: |
-          snyk test project-src --json > project-src/snyk-sca.json || \
+          snyk test project-src \
+            --all-projects \
+            --json > project-src/snyk-sca.json || \
             echo '{"vulnerabilities":[]}' > project-src/snyk-sca.json
 
-      - name: Run Snyk Container scan
+      ############################################
+      # Snyk Code (SAST) - ALL PROJECTS
+      ############################################
+      - name: Run Snyk Code (SAST)
         run: |
-          if [ -f project-src/Dockerfile ]; then
-            docker build -t project-image project-src || true
-            snyk container test project-image --json > project-src/snyk-container.json || \
-              echo '{"vulnerabilities":[]}' > project-src/snyk-container.json
-          else
-            echo '{"vulnerabilities":[]}' > project-src/snyk-container.json
-          fi
+          snyk code test project-src \
+            --all-projects \
+            --sarif-file=project-src/snyk-code.sarif || \
+            echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
 
+      ############################################
+      # Summary CSV with severity levels
+      ############################################
       - name: Generate summary.csv
         run: |
-          SAST_TOTAL=$(jq '[.runs[].results[]] | length' project-src/snyk-code.sarif 2>/dev/null || echo 0)
-          SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR" or .level=="WARNING")] | length' project-src/snyk-code.sarif 2>/dev/null || echo 0)
-          SCA_VULNS=$(jq '.vulnerabilities | length' project-src/snyk-sca.json 2>/dev/null || echo 0)
-          CONTAINER_VULNS=$(jq '.vulnerabilities | length' project-src/snyk-container.json 2>/dev/null || echo 0)
+          # SCA severity counts
+          SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' project-src/snyk-sca.json 2>/dev/null || echo 0)
+          SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' project-src/snyk-sca.json 2>/dev/null || echo 0)
+          SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' project-src/snyk-sca.json 2>/dev/null || echo 0)
+          SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' project-src/snyk-sca.json 2>/dev/null || echo 0)
 
-          echo "repo,sast_total,sast_high,sca_vulns,container_vulns" > project-src/summary.csv
-          echo "\"${{ github.event.inputs.repo_name }}\",$SAST_TOTAL,$SAST_HIGH,$SCA_VULNS,$CONTAINER_VULNS" \
+          # SAST severity counts
+          SAST_ERROR=$(jq '[.runs[].results[] | select(.level=="error")] | length' project-src/snyk-code.sarif 2>/dev/null || echo 0)
+          SAST_WARNING=$(jq '[.runs[].results[] | select(.level=="warning")] | length' project-src/snyk-code.sarif 2>/dev/null || echo 0)
+          SAST_NOTE=$(jq '[.runs[].results[] | select(.level=="note")] | length' project-src/snyk-code.sarif 2>/dev/null || echo 0)
+
+          echo "repo,sca_critical,sca_high,sca_medium,sca_low,sast_error,sast_warning,sast_note" > project-src/summary.csv
+          echo "\"${{ github.event.inputs.repo_name }}\",$SCA_CRITICAL,$SCA_HIGH,$SCA_MEDIUM,$SCA_LOW,$SAST_ERROR,$SAST_WARNING,$SAST_NOTE" \
             >> project-src/summary.csv
 
+      ############################################
+      # Upload results
+      ############################################
       - name: Sanitize artifact name
         id: sanitize
         run: |
           SAFE_NAME=$(echo "${{ github.event.inputs.repo_name }}" | sed 's/[^A-Za-z0-9._-]/_/g')
           echo "safe_repo=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Upload all Snyk scan artifacts
+      - name: Upload scan results
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.sanitize.outputs.safe_repo }}-snyk-scan
+          name: ${{ steps.sanitize.outputs.safe_repo }}-snyk-results
           path: project-src
