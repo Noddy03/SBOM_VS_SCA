@@ -24,55 +24,38 @@ jobs:
         run: |
           git clone --depth 1 "https://github.com/${{ github.event.inputs.repo_name }}" project-src
 
-      # 2️⃣ Install dependencies (auto-detect by language)
-      - name: Install dependencies
+      # 2️⃣ Set up JDK 21
+      - name: Set up JDK 21
+        uses: actions/setup-java@v3
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # 3️⃣ Build Java project (resolve dependencies)
+      - name: Build Java project
         run: |
           cd project-src
-          # Python
-          if [ -f requirements.txt ]; then
-            python3 -m pip install --upgrade pip
-            pip install -r requirements.txt
-          fi
-          # Node.js
-          if [ -f package.json ]; then
-            npm install
-          fi
-          # Java (Maven)
-          if [ -f pom.xml ]; then
-            mvn clean install -DskipTests
-          fi
-          # Go
-          if [ -f go.mod ]; then
-            go mod download
-          fi
-          # Ruby
-          if [ -f Gemfile ]; then
-            bundle install --jobs=4 || true
-          fi
+          mvn clean install -DskipTests
 
-      # 3️⃣ Setup Snyk CLI
+      # 4️⃣ Install Snyk CLI
       - name: Setup Snyk CLI
         uses: snyk/actions/setup@v1
         with:
           snyk-version: "latest"
 
-      # 4️⃣ Run Snyk SCA (vulnerabilities + licenses)
-      - name: Run Snyk Open Source (SCA + License)
+      # 5️⃣ Run Snyk Open Source (SCA + license)
+      - name: Run Snyk Open Source
         run: |
-          snyk test project-src \
-            --all-projects \
-            --json > project-src/snyk-sca.json || \
-            echo '{"vulnerabilities":[]}' > project-src/snyk-sca.json
+          snyk test project-src --all-projects --json > project-src/snyk-sca.json || \
+          echo '{"vulnerabilities":[]}' > project-src/snyk-sca.json
 
-      # 5️⃣ Run Snyk Code (SAST)
-      - name: Run Snyk Code (SAST)
+      # 6️⃣ Run Snyk Code (SAST)
+      - name: Run Snyk Code
         run: |
-          snyk code test project-src \
-            --all-projects \
-            --sarif-file=project-src/snyk-code.sarif || \
-            echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
+          snyk code test project-src --all-projects --sarif-file=project-src/snyk-code.sarif || \
+          echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
 
-      # 6️⃣ Generate summary CSV
+      # 7️⃣ Generate summary CSV
       - name: Generate summary.csv
         run: |
           SUMMARY="project-src/summary.csv"
@@ -91,21 +74,20 @@ jobs:
           SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' project-src/snyk-code.sarif || echo 0)
           SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' project-src/snyk-code.sarif || echo 0)
           SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' project-src/snyk-code.sarif || echo 0)
-          # Optional: classify specific Snyk Code rules as critical
           SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' project-src/snyk-code.sarif || echo 0)
 
           TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+LICENSES+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL))
 
           echo "\"${{ github.event.inputs.repo_name }}\",$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$LICENSES,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$TOTAL" >> "$SUMMARY"
 
-      # 7️⃣ Sanitize artifact name
+      # 8️⃣ Sanitize artifact name
       - name: Sanitize artifact name
         id: sanitize
         run: |
           SAFE_NAME=$(echo "${{ github.event.inputs.repo_name }}" | sed 's/[^A-Za-z0-9._-]/_/g')
           echo "safe_repo=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      # 8️⃣ Upload SARIF + CSV artifacts
+      # 9️⃣ Upload artifacts
       - name: Upload scan results
         uses: actions/upload-artifact@v4
         with:
