@@ -42,12 +42,18 @@ jobs:
           language = os.environ["LANGUAGE"]
           top_n = int(os.environ.get("TOP_N", "20"))
 
-          # Correct query with parentheses
-          query = f'language:{language} (filename:sbom OR filename:cyclonedx.json OR filename:bom.xml)'
+          # Expanded SBOM search query (Option A)
+          query = (
+              f'language:{language} '
+              f'(filename:sbom.json OR filename:sbom.xml OR filename:sbom '
+              f'OR filename:cyclonedx.json OR filename:cyclonedx.xml OR filename:cyclonedx '
+              f'OR filename:bom.json OR filename:bom.xml OR filename:bom)'
+          )
+
           encoded_query = urllib.parse.quote(query)
           url = f"https://api.github.com/search/repositories?q={encoded_query}&sort=stars&order=desc&per_page={top_n}"
 
-          headers = {"Authorization": f"token {os.environ['GITHUB_TOKEN']}"}
+          headers = {"Authorization": f"token {os.environ["GITHUB_TOKEN"]}"}
           resp = requests.get(url, headers=headers)
           resp.raise_for_status()
 
@@ -57,11 +63,12 @@ jobs:
           print("DEBUG: URL =", url)
           print("DEBUG: Found repos =", repos)
 
+          # Export output
           if repos:
               with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
                   fh.write(f"repos={','.join(repos)}\n")
           else:
-              print("DEBUG: No repositories matched the query.")
+              print("DEBUG: No repositories matched the expanded SBOM query.")
           EOF
 
       - name: Prepare summary.csv
@@ -71,11 +78,12 @@ jobs:
       - name: Scan repositories
         run: |
           if [ -z "${{ steps.fetch_repos.outputs.repos }}" ]; then
-              echo "No repositories found. Skipping scan."
+              echo "No repositories found — skipping scan."
               exit 0
           fi
 
           IFS=',' read -ra REPO_LIST <<< "${{ steps.fetch_repos.outputs.repos }}"
+
           for repo in "${REPO_LIST[@]}"; do
               echo "=============================="
               echo "Scanning $repo"
@@ -87,14 +95,14 @@ jobs:
               # Detect package manager
               if [ -f pom.xml ]; then
                 echo "Using Maven"
-                mvn -B dependency:go-offline
+                mvn -B dependency:go-offline || true
               elif [ -f package.json ]; then
                 echo "Using Node.js"
-                npm ci || npm install
+                npm ci || npm install || true
               elif [ -f requirements.txt ]; then
                 echo "Using Python"
                 python3 -m pip install --upgrade pip
-                pip install -r requirements.txt
+                pip install -r requirements.txt || true
               else
                 echo "No recognized dependency file found"
               fi
