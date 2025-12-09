@@ -1,16 +1,16 @@
-name: Top-Starred Repos Security Scan
+name: Multi-Repo Security Scan with SBOM
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Programming language to filter repos (e.g., java, python)"
+        description: "Programming language (e.g., java, python)"
         required: true
-        default: 'Java'
+        default: 'java'
       top_n:
-        description: "Number of top-starred repos to scan"
+        description: "Number of top repos to scan"
         required: true
-        default: '20'
+        default: '5'
 
 permissions:
   contents: read
@@ -18,34 +18,37 @@ permissions:
   actions: read
 
 jobs:
-  full_scan:
+  multi_repo_scan:
     runs-on: ubuntu-latest
     env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python for Semgrep
-        uses: actions/setup-python@v4
-        with:
-          python-version: 3.11
-
-      - name: Install dependencies
+      # 1️⃣ Setup Python & Snyk CLI
+      - name: Setup environment
         run: |
-          python -m pip install --upgrade pip
+          python3 -m pip install --upgrade pip
           pip install semgrep jq requests
 
-      - name: Fetch top repositories with SBOM
+      - name: Setup Snyk CLI
+        uses: snyk/actions/setup@v1
+        with:
+          snyk-version: latest
+
+      # 2️⃣ Fetch top repos with SBOM
+      - name: Fetch top repositories
         id: fetch_repos
+        env:
+          LANGUAGE: ${{ github.event.inputs.language }}
+          TOP_N: ${{ github.event.inputs.top_n }}
         run: |
-          echo "Fetching top ${{ github.event.inputs.top_n }} repositories for language ${{ github.event.inputs.language }} with SBOM..."
+          echo "Fetching top $TOP_N repositories for language $LANGUAGE with SBOM..."
           REPOS=$(python3 - << 'EOF'
           import os, requests
-          lang = os.environ['LANGUAGE']
-          n = int(os.environ['TOP_N'])
+
+          lang = os.environ.get('LANGUAGE', 'java')
+          n = int(os.environ.get('TOP_N', 5))
+
           repos = []
           page = 1
           while len(repos) < n:
@@ -57,74 +60,54 @@ jobs:
                   break
               repos.extend([i['full_name'] for i in items])
               page += 1
+
           print(",".join(repos[:n]))
           EOF
-              )
+          )
           echo "repos=$REPOS" >> $GITHUB_OUTPUT
-          env:
-              LANGUAGE: ${{ github.event.inputs.language }}
-              TOP_N: ${{ github.event.inputs.top_n }}
 
-
-      - name: Scan each repository
+      # 3️⃣ Scan each repo
+      - name: Scan repositories
         run: |
-          IFS=',' read -ra REPO_LIST <<< "${{ steps.fetch_repos.outputs.repos }}"
-          mkdir -p artifacts
-          echo "repo,total,low,medium,high,critical" > artifacts/summary.csv
+          mkdir -p results
+          echo "repo,low,medium,high,critical,total" > results/summary.csv
+          IFS=',' read -r -a REPO_LIST <<< "${{ steps.fetch_repos.outputs.repos }}"
+          for repo in "${REPO_LIST[@]}"; do
+            echo "Scanning $repo ..."
+            rm -rf project-src
+            git clone --depth 1 "https://github.com/$repo" project-src || continue
 
-          for REPO in "${REPO_LIST[@]}"; do
-            echo "Scanning $REPO..."
-            SAFE_NAME=$(echo "$REPO" | sed 's/[^A-Za-z0-9._-]/_/g')
-            PROJECT_DIR="project-src-$SAFE_NAME"
-            rm -rf "$PROJECT_DIR"
+            # Snyk SCA
+            SCA_JSON="project-src/snyk-sca.json"
+            snyk test project-src --all-projects --json > $SCA_JSON || echo '{"vulnerabilities":[]}' > $SCA_JSON
 
-            git clone --depth 1 "https://github.com/$REPO" "$PROJECT_DIR"
+            # Snyk Code (SAST)
+            SAST_SARIF="project-src/snyk-code.sarif"
+            snyk code test project-src --all-projects --sarif-file=$SAST_SARIF || echo '{"version":"2.1.0","runs":[]}' > $SAST_SARIF
 
-            # --- Snyk ---
-            snyk test "$PROJECT_DIR" --all-projects --json > "$PROJECT_DIR/snyk-sca.json" || echo '{"vulnerabilities":[]}' > "$PROJECT_DIR/snyk-sca.json"
-            snyk code test "$PROJECT_DIR" --all-projects --sarif-file="$PROJECT_DIR/snyk-code.sarif" || echo '{"version":"2.1.0","runs":[]}' > "$PROJECT_DIR/snyk-code.sarif"
+            # Semgrep
+            SEMGREP_SARIF="project-src/semgrep.sarif"
+            semgrep scan --config p/security-audit --lang ${{ github.event.inputs.language }} --sarif -o $SEMGREP_SARIF project-src || echo '{"version":"2.1.0","runs":[]}' > $SEMGREP_SARIF
 
-            # --- Semgrep ---
-            SEMGREP_SARIF="$PROJECT_DIR/semgrep.sarif"
-            semgrep --config "p/security-audit" --lang java --sarif -o "$SEMGREP_SARIF" "$PROJECT_DIR" || echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
+            # Count vulnerabilities
+            LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' $SCA_JSON || echo 0)
+            MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' $SCA_JSON || echo 0)
+            HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' $SCA_JSON || echo 0)
+            CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' $SCA_JSON || echo 0)
+            TOTAL=$((LOW+MEDIUM+HIGH+CRITICAL))
 
-            # --- Summary CSV ---
-            SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
-            SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
-            SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
-            SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
+            echo "\"$repo\",$LOW,$MEDIUM,$HIGH,$CRITICAL,$TOTAL" >> results/summary.csv
 
-            SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
-            SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
-            SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
-            SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
-
-            SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' "$SEMGREP_SARIF" || echo 0)
-            SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' "$SEMGREP_SARIF" || echo 0)
-            SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' "$SEMGREP_SARIF" || echo 0)
-            SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' "$SEMGREP_SARIF" || echo 0)
-
-            TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
-
-            echo "\"$REPO\",$TOTAL,$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL" >> artifacts/summary.csv
-
-            # --- Upload artifacts ---
-            actions/upload-artifact@v4:
-              name: "$SAFE_NAME-snyk-sca"
-              path: "$PROJECT_DIR/snyk-sca.json"
-
-            actions/upload-artifact@v4:
-              name: "$SAFE_NAME-snyk-code"
-              path: "$PROJECT_DIR/snyk-code.sarif"
-
-            actions/upload-artifact@v4:
-              name: "$SAFE_NAME-semgrep"
-              path: "$SEMGREP_SARIF"
-
+            # Save SARIF files for each repo
+            mkdir -p results/$repo
+            cp $SAST_SARIF results/$repo/ || true
+            cp $SEMGREP_SARIF results/$repo/ || true
+            cp $SCA_JSON results/$repo/ || true
           done
 
-      - name: Upload summary CSV
+      # 4️⃣ Upload results
+      - name: Upload scan results
         uses: actions/upload-artifact@v4
         with:
-          name: summary-csv
-          path: artifacts/summary.csv
+          name: multi-repo-security-results
+          path: results
