@@ -1,4 +1,4 @@
-name: Multi-Repo Security Scan
+name: Multi-Repo Security Scan with SBOM Filter
 
 on:
   workflow_dispatch:
@@ -44,22 +44,45 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install semgrep jq
 
-      # Fetch top N starred repos with SBOMs in the chosen language
+      # Fetch top N starred repos
       - name: Fetch top repositories
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
           REPO_COUNT="${{ github.event.inputs.repo_count }}"
-          echo "Fetching top $REPO_COUNT repositories for language $LANGUAGE with SBOM..."
-          REPOS=$(gh search repos "language:$LANGUAGE" --sort stars --limit $REPO_COUNT --json nameWithOwner | jq -r '.[].nameWithOwner')
-          echo "REPOS=$REPOS" >> $GITHUB_ENV
+          echo "Fetching top $REPO_COUNT repositories for language $LANGUAGE..."
+          REPOS=$(gh search repos "language:$LANGUAGE" --sort stars --limit 50 --json nameWithOwner | jq -r '.[].nameWithOwner')
 
+          # Filter repos that contain SBOM files
+          FILTERED_REPOS=""
+          for REPO in $REPOS; do
+            echo "Checking SBOM in $REPO..."
+            if gh repo clone $REPO temp-repo -- --depth 1; then
+              if [ -f temp-repo/bom.xml ] || [ -f temp-repo/sbom.json ]; then
+                FILTERED_REPOS="$FILTERED_REPOS $REPO"
+              fi
+              rm -rf temp-repo
+            fi
+            # Stop when we reach REPO_COUNT
+            COUNT=$(echo $FILTERED_REPOS | wc -w)
+            if [ "$COUNT" -ge "$REPO_COUNT" ]; then
+              break
+            fi
+          done
+          echo "FILTERED_REPOS=$FILTERED_REPOS" >> $GITHUB_ENV
+
+      # Scan filtered repos
       - name: Scan repositories
         run: |
-          echo "repo,total,low,medium,high,critical" > summary.csv
-          for REPO in $REPOS; do
+          echo "repo,total,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical" > summary.csv
+          for REPO in $FILTERED_REPOS; do
             echo "Scanning $REPO..."
             git clone --depth 1 https://github.com/$REPO project-src
             cd project-src || exit 1
+
+            # --- Optional: install dependencies if pom.xml exists ---
+            if [ -f pom.xml ]; then
+              mvn dependency:resolve
+            fi
 
             # --- Snyk Open Source ---
             snyk test . --all-projects --json > snyk-sca.json || echo '{"vulnerabilities":[]}' > snyk-sca.json
