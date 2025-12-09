@@ -41,14 +41,11 @@ jobs:
       - name: Fetch top repositories with SBOM
         id: fetch_repos
         run: |
-          LANGUAGE="${{ github.event.inputs.language }}"
-          TOP_N="${{ github.event.inputs.top_n }}"
-          echo "Fetching top $TOP_N repositories for language $LANGUAGE with SBOM..."
-          
-          REPOS=$(python - << 'EOF'
-          import requests, sys
-          lang = sys.argv[1]
-          n = int(sys.argv[2])
+          echo "Fetching top ${{ github.event.inputs.top_n }} repositories for language ${{ github.event.inputs.language }} with SBOM..."
+          REPOS=$(python3 - << 'EOF'
+          import os, requests
+          lang = os.environ['LANGUAGE']
+          n = int(os.environ['TOP_N'])
           repos = []
           page = 1
           while len(repos) < n:
@@ -62,8 +59,12 @@ jobs:
               page += 1
           print(",".join(repos[:n]))
           EOF
-          "$LANGUAGE" "$TOP_N")
+              )
           echo "repos=$REPOS" >> $GITHUB_OUTPUT
+          env:
+              LANGUAGE: ${{ github.event.inputs.language }}
+              TOP_N: ${{ github.event.inputs.top_n }}
+
 
       - name: Scan each repository
         run: |
