@@ -26,14 +26,14 @@ jobs:
           repository: ${{ github.event.inputs.repo_name }}
           fetch-depth: 1
 
-      # 2️⃣ Setup Java + Maven
+      # 2️⃣ Setup Java + Maven with correct cache
       - name: Setup Java 17 + Maven
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
           cache: maven
-          cache-dependency-path: '**/pom.xml'
+          cache-dependency-path: 'project-src/**/pom.xml'
 
       # 3️⃣ Install Semgrep + jq
       - name: Install Semgrep
