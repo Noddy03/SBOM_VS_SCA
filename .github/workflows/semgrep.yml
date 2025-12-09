@@ -32,14 +32,17 @@ jobs:
 
       - name: Fetch top N repos with SBOM
         id: fetch_repos
+        env:
+          INPUT_LANGUAGE: ${{ inputs.language }}
+          INPUT_TOP_N: ${{ inputs.top_n }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python << 'EOF'
-          import os, requests, urllib.parse, sys
+          import os, requests, urllib.parse
 
           lang = os.environ["INPUT_LANGUAGE"]
-          top_n = int(os.environ.get("INPUT_TOP_N", "20"))
+          top_n = int(os.environ["INPUT_TOP_N"])
 
-          # Option A: expand SBOM filename search (NO parentheses!)
           sbom_terms = (
               "filename:sbom.json OR "
               "filename:sbom.xml OR "
@@ -56,26 +59,20 @@ jobs:
           encoded_q = urllib.parse.quote(query)
 
           url = f"https://api.github.com/search/repositories?q={encoded_q}&sort=stars&order=desc&per_page={top_n}"
-          headers = {"Authorization": f"token {os.environ['GITHUB_TOKEN']}"}
+          print("DEBUG URL:", url)
 
-          print("DEBUG: URL =", url)
+          r = requests.get(url, headers={"Authorization": f"token {os.environ['GITHUB_TOKEN']}"})
+          print("DEBUG STATUS:", r.status_code)
+          print("DEBUG RESPONSE:", r.text)
 
-          r = requests.get(url, headers=headers)
-          if not r.ok:
-            print("DEBUG: GitHub API response:", r.text)
-            r.raise_for_status()
+          r.raise_for_status()
 
-          items = r.json().get("items", [])
-          repos = [i["full_name"] for i in items]
+          repos = [item["full_name"] for item in r.json().get("items", [])]
+          print("DEBUG REPOS:", repos)
 
-          print("DEBUG: Found repos =", repos)
-
-          if not repos:
-            print("DEBUG: No repositories matched.")
-          
-          # Output
           print(f"::set-output name=repos::{','.join(repos)}")
           EOF
+
 
       - name: Prepare summary.csv
         run: |
