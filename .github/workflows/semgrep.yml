@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Programming language to filter repos"
+        description: "Programming language to filter repositories"
         required: true
-        default: "java"
+        default: 'Java'
       repo_count:
-        description: "Number of top-starred repos to scan"
-        required: true
+        description: "Number of top-starred repositories to scan"
+        required: false
         default: '20'
 
 permissions:
@@ -21,125 +21,79 @@ jobs:
   scan_top_repos:
     runs-on: ubuntu-latest
     env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
     steps:
-      # 1️⃣ Checkout this workflow repo (needed to run scripts)
-      - name: Checkout workflow repo
-        uses: actions/checkout@v3
-
-      # 2️⃣ Set up Java (disable Maven cache to avoid pom.xml errors)
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-         distribution: temurin
-         java-version: '17'
-         cache: maven
-
-
-      # 3️⃣ Install dependencies
-      - name: Install CLI tools
+      - name: Install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl python3-pip
           python3 -m pip install --upgrade pip
-          pip install semgrep jq requests
+          pip install semgrep
 
-      # 4️⃣ Fetch top N starred repos with SBOM
       - name: Fetch top repositories
         id: fetch_repos
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
           COUNT="${{ github.event.inputs.repo_count }}"
           echo "Fetching top $COUNT repositories for language $LANGUAGE with SBOM..."
-          python3 - << 'PYTHON'
-          import requests, os, sys, json
+          REPOS=$(gh repo list --public --language "$LANGUAGE" --limit 100 --json nameWithOwner,files,stargazerCount \
+                  | jq -r '.[] | select(.files | any(.name | test(".*bom.*|.*sbom.*";"i"))) | .nameWithOwner' \
+                  | sort -t: -k2 -nr | head -n "$COUNT")
+          echo "TOP_REPOS<<EOF" >> $GITHUB_OUTPUT
+          echo "$REPOS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
-          lang = os.environ["LANGUAGE"]
-          count = int(os.environ["COUNT"])
-          top_repos = []
-
-          # GitHub search API: repos with a manifest or SBOM file
-          query = f"https://api.github.com/search/repositories?q=language:{lang}+filename:sbom.json&sort=stars&order=desc&per_page={count}"
-
-          resp = requests.get(query, headers={"Accept": "application/vnd.github+json"})
-          if resp.status_code != 200:
-              print("Error fetching repos:", resp.text)
-              sys.exit(1)
-
-          data = resp.json()
-          for item in data.get("items", []):
-              top_repos.append(item["full_name"])
-
-          print(json.dumps(top_repos))
-          with open("repos.json", "w") as f:
-              json.dump(top_repos, f)
-          PYTHON
-          REPOS=$(jq -r '.[]' repos.json)
-          echo "REPOS=$REPOS" >> $GITHUB_OUTPUT
-
-      # 5️⃣ Loop over each repo and scan
-      - name: Scan repositories
+      - name: Loop over repositories
         run: |
-          mkdir -p scan_results
-          for repo in ${{ steps.fetch_repos.outputs.REPOS }}; do
-            echo "Scanning $repo ..."
-            git clone --depth 1 "https://github.com/$repo" project-src
-            cd project-src
+          for REPO in ${{ steps.fetch_repos.outputs.TOP_REPOS }}; do
+            echo "Scanning $REPO..."
+            mkdir -p repos
+            git clone --depth 1 "https://github.com/$REPO" "repos/$(basename $REPO)"
 
-            # Install dependencies if Java
-            if [ -f pom.xml ]; then
-              mvn dependency:resolve || true
-            fi
+            PROJECT_DIR="repos/$(basename $REPO)"
 
-            cd ..
+            # Run Snyk SCA
+            snyk test "$PROJECT_DIR" --all-projects --json > "$PROJECT_DIR/snyk-sca.json" || echo '{"vulnerabilities":[]}' > "$PROJECT_DIR/snyk-sca.json"
 
-            # 1️⃣ Run Snyk SCA
-            snyk test project-src --all-projects --json > scan_results/snyk-sca-$(echo $repo | tr / _).json || \
-            echo '{"vulnerabilities":[]}' > scan_results/snyk-sca-$(echo $repo | tr / _).json
+            # Run Snyk Code
+            snyk code test "$PROJECT_DIR" --all-projects --sarif-file="$PROJECT_DIR/snyk-code.sarif" || echo '{"version":"2.1.0","runs":[]}' > "$PROJECT_DIR/snyk-code.sarif"
 
-            # 2️⃣ Run Snyk Code (SAST)
-            snyk code test project-src --all-projects --sarif-file=scan_results/snyk-code-$(echo $repo | tr / _).sarif || \
-            echo '{"version":"2.1.0","runs":[]}' > scan_results/snyk-code-$(echo $repo | tr / _).sarif
+            # Run Semgrep
+            SEMGREP_SARIF="$PROJECT_DIR/semgrep.sarif"
+            semgrep scan --config "p/security-audit" --sarif -o "$SEMGREP_SARIF" "$PROJECT_DIR" || echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
 
-            # 3️⃣ Run Semgrep
-            semgrep --config p/security-audit --lang java --sarif -o scan_results/semgrep-$(echo $repo | tr / _).sarif project-src || \
-            echo '{"version":"2.1.0","runs":[]}' > scan_results/semgrep-$(echo $repo | tr / _).sarif
+            # Generate summary.csv
+            SUMMARY="$PROJECT_DIR/summary.csv"
+            echo "repo,total,low,medium,high,critical" > "$SUMMARY"
 
-            rm -rf project-src
-          done
+            # SCA counts
+            SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
+            SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
+            SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
+            SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
 
-      # 6️⃣ Generate summary CSV
-      - name: Generate summary.csv
-        run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,total" > summary.csv
-          for sca in scan_results/snyk-sca-*.json; do
-            base=$(basename "$sca" | sed 's/snyk-sca-//;s/.json//')
-            SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' "$sca")
-            SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' "$sca")
-            SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' "$sca")
-            SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' "$sca")
+            # SAST counts
+            SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
+            SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
+            SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
+            SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
 
-            SAST_FILE="scan_results/snyk-code-$base.sarif"
-            SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$SAST_FILE")
-            SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$SAST_FILE")
-            SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SAST_FILE")
-            SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' "$SAST_FILE")
-
-            SEM_FILE="scan_results/semgrep-$base.sarif"
-            SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' "$SEM_FILE")
-            SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' "$SEM_FILE")
-            SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' "$SEM_FILE")
-            SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' "$SEM_FILE")
+            # Semgrep counts
+            SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' "$SEMGREP_SARIF" || echo 0)
+            SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' "$SEMGREP_SARIF" || echo 0)
+            SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' "$SEMGREP_SARIF" || echo 0)
+            SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' "$SEMGREP_SARIF" || echo 0)
 
             TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
 
-            echo "$base,$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> summary.csv
-          done
+            echo "\"$REPO\",$TOTAL,$((SCA_LOW+SAST_LOW+SEM_LOW)),$((SCA_MEDIUM+SAST_MEDIUM+SEM_MEDIUM)),$((SCA_HIGH+SAST_HIGH+SEM_HIGH)),$((SCA_CRITICAL+SAST_CRITICAL+SEM_CRITICAL))" >> "$SUMMARY"
 
-      # 7️⃣ Upload CSV + artifacts
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: top_repos_security_scan
-          path: |
-            summary.csv
-            scan_results/
+            # Upload artifacts
+            SAFE_NAME=$(echo "$REPO" | sed 's/[^A-Za-z0-9._-]/_/g')
+            gh actions upload-artifact --name "${SAFE_NAME}-summary" --path "$SUMMARY"
+            gh actions upload-artifact --name "${SAFE_NAME}-snyk-sca" --path "$PROJECT_DIR/snyk-sca.json"
+            gh actions upload-artifact --name "${SAFE_NAME}-snyk-code" --path "$PROJECT_DIR/snyk-code.sarif"
+            gh actions upload-artifact --name "${SAFE_NAME}-semgrep" --path "$SEMGREP_SARIF"
+
+          done
