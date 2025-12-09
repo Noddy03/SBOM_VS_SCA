@@ -1,4 +1,4 @@
-name: Single-Repo Security Scan (SCA + SAST + Semgrep)
+name: Single-Repo Security Scan (SCA + SAST + Licenses)
 
 on:
   workflow_dispatch:
@@ -6,10 +6,10 @@ on:
       repo_name:
         description: "GitHub repository to scan (e.g., owner/repo)"
         required: true
-      language:
-        description: "Optional Semgrep language hint"
+      semgrep_enabled:
+        description: "Enable Semgrep scan (true/false)"
         required: false
-        default: "java"
+        default: "false"
 
 permissions:
   contents: read
@@ -25,64 +25,65 @@ jobs:
     steps:
       # 1️⃣ Checkout repo
       - name: Checkout repository
-        run: |
-          git clone --depth 1 "https://github.com/${{ github.event.inputs.repo_name }}" project-src
+        run: git clone --depth 1 "https://github.com/${{ github.event.inputs.repo_name }}" project-src
 
-      # 2️⃣ Install dependencies for Java (Maven)
-      - name: Install dependencies
+      # 2️⃣ Setup JDK 21
+      - name: Setup JDK 21
+        uses: actions/setup-java@v3
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # 3️⃣ Build Java project (resolve dependencies)
+      - name: Build Java project
         run: |
           cd project-src
-          if [ -f pom.xml ]; then
-            mvn dependency:resolve
-          fi
+          mvn clean install -DskipTests
 
-      # 3️⃣ Setup Semgrep
-      - name: Install Semgrep
-        run: |
-          python3 -m pip install --upgrade pip
-          pip install semgrep jq
-
-      # 4️⃣ Run Semgrep SAST scan
-      - name: Run Semgrep scan
-        run: |
-          SEMGREP_SARIF="project-src/semgrep.sarif"
-          semgrep --config "p/security-audit" \
-                  --lang ${{ github.event.inputs.language }} \
-                  --recursive \
-                  --sarif -o "$SEMGREP_SARIF" project-src || true
-          if [ ! -s "$SEMGREP_SARIF" ]; then
-            echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
-          fi
-
-      # 5️⃣ Setup Snyk CLI
+      # 4️⃣ Setup Snyk CLI
       - name: Setup Snyk
         uses: snyk/actions/setup@v1
         with:
           snyk-version: "latest"
 
-      # 6️⃣ Run Snyk SCA (dependency scanning)
+      # 5️⃣ Run Snyk Open Source (SCA + license)
       - name: Run Snyk Open Source (SCA)
         run: |
           snyk test project-src --all-projects --json > project-src/snyk-sca.json || \
           echo '{"vulnerabilities":[]}' > project-src/snyk-sca.json
 
-      # 7️⃣ Run Snyk Code (SAST)
+      # 6️⃣ Run Snyk Code (SAST)
       - name: Run Snyk Code (SAST)
         run: |
           snyk code test project-src --all-projects --sarif-file=project-src/snyk-code.sarif || \
           echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
 
+      # 7️⃣ Optional Semgrep scan
+      - name: Run Semgrep scan
+        if: ${{ github.event.inputs.semgrep_enabled == 'true' }}
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install semgrep jq
+          SEMGREP_SARIF="project-src/semgrep.sarif"
+          semgrep --config auto --sarif -o "$SEMGREP_SARIF" project-src || true
+          if [ ! -s "$SEMGREP_SARIF" ]; then
+            echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
+          fi
+
       # 8️⃣ Generate summary CSV
       - name: Generate summary.csv
         run: |
           SUMMARY="project-src/summary.csv"
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,total" > "$SUMMARY"
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,licenses,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,total" > "$SUMMARY"
 
-          # SCA counts
+          # SCA severity counts
           SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' project-src/snyk-sca.json || echo 0)
           SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' project-src/snyk-sca.json || echo 0)
           SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' project-src/snyk-sca.json || echo 0)
           SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' project-src/snyk-sca.json || echo 0)
+
+          # License issues count
+          LICENSES=$(jq '[.vulnerabilities[] | select(.isLicense==true)] | length' project-src/snyk-sca.json || echo 0)
 
           # Snyk Code counts
           SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' project-src/snyk-code.sarif || echo 0)
@@ -90,15 +91,22 @@ jobs:
           SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' project-src/snyk-code.sarif || echo 0)
           SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' project-src/snyk-code.sarif || echo 0)
 
-          # Semgrep counts
-          SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' project-src/semgrep.sarif || echo 0)
-          SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' project-src/semgrep.sarif || echo 0)
-          SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' project-src/semgrep.sarif || echo 0)
-          SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' project-src/semgrep.sarif || echo 0)
+          # Semgrep counts (if enabled)
+          if [ -f project-src/semgrep.sarif ]; then
+            SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' project-src/semgrep.sarif || echo 0)
+            SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' project-src/semgrep.sarif || echo 0)
+            SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' project-src/semgrep.sarif || echo 0)
+            SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' project-src/semgrep.sarif || echo 0)
+          else
+            SEM_LOW=0
+            SEM_MEDIUM=0
+            SEM_HIGH=0
+            SEM_CRITICAL=0
+          fi
 
-          TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
+          TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+LICENSES+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
 
-          echo "\"${{ github.event.inputs.repo_name }}\",$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> "$SUMMARY"
+          echo "\"${{ github.event.inputs.repo_name }}\",$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$LICENSES,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> "$SUMMARY"
 
       # 9️⃣ Sanitize artifact name
       - name: Sanitize artifact name
@@ -107,7 +115,7 @@ jobs:
           SAFE_NAME=$(echo "${{ github.event.inputs.repo_name }}" | sed 's/[^A-Za-z0-9._-]/_/g')
           echo "safe_repo=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      # 🔟 Upload artifacts
+      # 🔟 Upload scan results
       - name: Upload scan results
         uses: actions/upload-artifact@v4
         with:
