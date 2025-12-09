@@ -19,14 +19,15 @@ jobs:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      # 1️⃣ Checkout repository
+      # 1️⃣ Checkout repository first (required for caching)
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.inputs.repo_name }}
+          path: project-src
           fetch-depth: 1
 
-      # 2️⃣ Setup Java + Maven with correct cache
+      # 2️⃣ Setup Java 17 + Maven (cache works now)
       - name: Setup Java 17 + Maven
         uses: actions/setup-java@v4
         with:
