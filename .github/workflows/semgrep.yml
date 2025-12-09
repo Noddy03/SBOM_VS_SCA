@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Programming language to filter repositories"
+        description: "Programming language to filter repos (e.g., java, python)"
         required: true
         default: 'Java'
-      repo_count:
-        description: "Number of top-starred repositories to scan"
-        required: false
+      top_n:
+        description: "Number of top-starred repos to scan"
+        required: true
         default: '20'
 
 permissions:
@@ -18,68 +18,86 @@ permissions:
   actions: read
 
 jobs:
-  scan_top_repos:
+  full_scan:
     runs-on: ubuntu-latest
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
     steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python for Semgrep
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl python3-pip
-          python3 -m pip install --upgrade pip
-          pip install semgrep
+          python -m pip install --upgrade pip
+          pip install semgrep jq requests
 
-      - name: Fetch top repositories
+      - name: Fetch top repositories with SBOM
         id: fetch_repos
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
-          COUNT="${{ github.event.inputs.repo_count }}"
-          echo "Fetching top $COUNT repositories for language $LANGUAGE with SBOM..."
-          REPOS=$(gh repo list --public --language "$LANGUAGE" --limit 100 --json nameWithOwner,files,stargazerCount \
-                  | jq -r '.[] | select(.files | any(.name | test(".*bom.*|.*sbom.*";"i"))) | .nameWithOwner' \
-                  | sort -t: -k2 -nr | head -n "$COUNT")
-          echo "TOP_REPOS<<EOF" >> $GITHUB_OUTPUT
-          echo "$REPOS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          TOP_N="${{ github.event.inputs.top_n }}"
+          echo "Fetching top $TOP_N repositories for language $LANGUAGE with SBOM..."
+          
+          REPOS=$(python - << 'EOF'
+          import requests, sys
+          lang = sys.argv[1]
+          n = int(sys.argv[2])
+          repos = []
+          page = 1
+          while len(repos) < n:
+              url = f"https://api.github.com/search/repositories?q=language:{lang}+filename:sbom&type=Repositories&sort=stars&order=desc&per_page=100&page={page}"
+              r = requests.get(url, headers={'Accept':'application/vnd.github+json'})
+              r.raise_for_status()
+              items = r.json().get('items', [])
+              if not items:
+                  break
+              repos.extend([i['full_name'] for i in items])
+              page += 1
+          print(",".join(repos[:n]))
+          EOF
+          "$LANGUAGE" "$TOP_N")
+          echo "repos=$REPOS" >> $GITHUB_OUTPUT
 
-      - name: Loop over repositories
+      - name: Scan each repository
         run: |
-          for REPO in ${{ steps.fetch_repos.outputs.TOP_REPOS }}; do
+          IFS=',' read -ra REPO_LIST <<< "${{ steps.fetch_repos.outputs.repos }}"
+          mkdir -p artifacts
+          echo "repo,total,low,medium,high,critical" > artifacts/summary.csv
+
+          for REPO in "${REPO_LIST[@]}"; do
             echo "Scanning $REPO..."
-            mkdir -p repos
-            git clone --depth 1 "https://github.com/$REPO" "repos/$(basename $REPO)"
+            SAFE_NAME=$(echo "$REPO" | sed 's/[^A-Za-z0-9._-]/_/g')
+            PROJECT_DIR="project-src-$SAFE_NAME"
+            rm -rf "$PROJECT_DIR"
 
-            PROJECT_DIR="repos/$(basename $REPO)"
+            git clone --depth 1 "https://github.com/$REPO" "$PROJECT_DIR"
 
-            # Run Snyk SCA
+            # --- Snyk ---
             snyk test "$PROJECT_DIR" --all-projects --json > "$PROJECT_DIR/snyk-sca.json" || echo '{"vulnerabilities":[]}' > "$PROJECT_DIR/snyk-sca.json"
-
-            # Run Snyk Code
             snyk code test "$PROJECT_DIR" --all-projects --sarif-file="$PROJECT_DIR/snyk-code.sarif" || echo '{"version":"2.1.0","runs":[]}' > "$PROJECT_DIR/snyk-code.sarif"
 
-            # Run Semgrep
+            # --- Semgrep ---
             SEMGREP_SARIF="$PROJECT_DIR/semgrep.sarif"
-            semgrep scan --config "p/security-audit" --sarif -o "$SEMGREP_SARIF" "$PROJECT_DIR" || echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
+            semgrep --config "p/security-audit" --lang java --sarif -o "$SEMGREP_SARIF" "$PROJECT_DIR" || echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
 
-            # Generate summary.csv
-            SUMMARY="$PROJECT_DIR/summary.csv"
-            echo "repo,total,low,medium,high,critical" > "$SUMMARY"
-
-            # SCA counts
+            # --- Summary CSV ---
             SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
             SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
             SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
             SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' "$PROJECT_DIR/snyk-sca.json" || echo 0)
 
-            # SAST counts
             SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
             SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
             SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
             SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' "$PROJECT_DIR/snyk-code.sarif" || echo 0)
 
-            # Semgrep counts
             SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' "$SEMGREP_SARIF" || echo 0)
             SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' "$SEMGREP_SARIF" || echo 0)
             SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' "$SEMGREP_SARIF" || echo 0)
@@ -87,13 +105,25 @@ jobs:
 
             TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
 
-            echo "\"$REPO\",$TOTAL,$((SCA_LOW+SAST_LOW+SEM_LOW)),$((SCA_MEDIUM+SAST_MEDIUM+SEM_MEDIUM)),$((SCA_HIGH+SAST_HIGH+SEM_HIGH)),$((SCA_CRITICAL+SAST_CRITICAL+SEM_CRITICAL))" >> "$SUMMARY"
+            echo "\"$REPO\",$TOTAL,$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL" >> artifacts/summary.csv
 
-            # Upload artifacts
-            SAFE_NAME=$(echo "$REPO" | sed 's/[^A-Za-z0-9._-]/_/g')
-            gh actions upload-artifact --name "${SAFE_NAME}-summary" --path "$SUMMARY"
-            gh actions upload-artifact --name "${SAFE_NAME}-snyk-sca" --path "$PROJECT_DIR/snyk-sca.json"
-            gh actions upload-artifact --name "${SAFE_NAME}-snyk-code" --path "$PROJECT_DIR/snyk-code.sarif"
-            gh actions upload-artifact --name "${SAFE_NAME}-semgrep" --path "$SEMGREP_SARIF"
+            # --- Upload artifacts ---
+            actions/upload-artifact@v4:
+              name: "$SAFE_NAME-snyk-sca"
+              path: "$PROJECT_DIR/snyk-sca.json"
+
+            actions/upload-artifact@v4:
+              name: "$SAFE_NAME-snyk-code"
+              path: "$PROJECT_DIR/snyk-code.sarif"
+
+            actions/upload-artifact@v4:
+              name: "$SAFE_NAME-semgrep"
+              path: "$SEMGREP_SARIF"
 
           done
+
+      - name: Upload summary CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: summary-csv
+          path: artifacts/summary.csv
