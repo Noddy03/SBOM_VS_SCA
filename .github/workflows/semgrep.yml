@@ -21,7 +21,6 @@ jobs:
   fetch_and_scan:
     runs-on: ubuntu-latest
     env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
@@ -32,12 +31,16 @@ jobs:
 
       - name: Fetch top N repos with SBOM
         id: fetch_repos
+        env:
+          LANGUAGE: ${{ github.event.inputs.language }}
+          TOP_N: ${{ github.event.inputs.top_n }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python << 'EOF'
           import os, requests, urllib.parse
 
-          language = os.environ["INPUT_LANGUAGE"]
-          top_n = int(os.environ.get("INPUT_TOP_N", "20"))
+          language = os.environ["LANGUAGE"]
+          top_n = int(os.environ.get("TOP_N", "20"))
 
           query = f'language:{language} filename:sbom OR filename:cyclonedx.json OR filename:bom.xml'
           encoded_query = urllib.parse.quote(query)
@@ -71,7 +74,7 @@ jobs:
             git clone --depth 1 https://github.com/$repo project-src
             cd project-src || exit 1
 
-            # Detect dependencies
+            # Detect package manager
             if [ -f pom.xml ]; then
               echo "Using Maven"
               mvn -B dependency:go-offline
