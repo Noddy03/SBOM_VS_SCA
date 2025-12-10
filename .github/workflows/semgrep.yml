@@ -40,16 +40,14 @@ jobs:
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
-
           headers = {"Authorization": f"token {token}"}
           q = urllib.parse.quote(f"language:{lang}")
           url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page={top_n}"
-
           r = requests.get(url, headers=headers)
           r.raise_for_status()
           repos = [item["full_name"] for item in r.json()["items"]]
-
-          print(f"::set-output name=repos::{','.join(repos)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
+              gh.write(f"repos={','.join(repos)}\n")
           EOF
 
       - name: Detect SBOM repos
@@ -60,23 +58,19 @@ jobs:
         run: |
           mkdir sbom-check
           SBOM_REPOS=""
-
           SBOM_PATTERNS="bom cyclonedx sbom spdx"
-
           IFS=',' read -ra REPO_ARRAY <<< "$REPOS"
+
           for repo in "${REPO_ARRAY[@]}"; do
               echo "Checking SBOM in $repo"
               git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo sbom-check/$repo || continue
               cd sbom-check/$repo
 
               FILES=$(find . -type f \( -iname "*.json" -o -iname "*.xml" -o -iname "*.spdx" \) 2>/dev/null)
-
               HIT=0
               for f in $FILES; do
                 for p in $SBOM_PATTERNS; do
-                  if echo "$f" | grep -qi "$p"; then
-                    HIT=1
-                  fi
+                  if echo "$f" | grep -qi "$p"; then HIT=1; fi
                 done
               done
 
@@ -86,20 +80,19 @@ jobs:
               else
                 echo "→ No SBOM"
               fi
-
               cd ../../
           done
 
           # ALWAYS add known vulnerable repos
           TEST_REPOS="snyk/test-vulnerabilities-java,snyk/test-vulnerabilities-node"
-
           FINAL_LIST="${SBOM_REPOS#,},$TEST_REPOS"
+
           echo "Final scan list: $FINAL_LIST"
-          echo "::set-output name=filtered::$FINAL_LIST"
+          echo "filtered=$FINAL_LIST" >> $GITHUB_OUTPUT
 
       - name: Prepare summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
 
       - name: Scan repositories
         env:
@@ -109,40 +102,70 @@ jobs:
 
           for repo in "${REPOS[@]}"; do
             echo "=== SCANNING $repo ==="
+
             git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo project || continue
             cd project
 
+            # Install dependencies
             if [ -f pom.xml ]; then mvn -B install -DskipTests || true; fi
             if [ -f package.json ]; then npm ci || npm install || true; fi
             if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
 
+            # Security scans
             snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
             snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
             semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
             cd ..
 
+            # ------------ Parse SCA ---------------
             SCA_L=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' sca.json)
             SCA_M=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' sca.json)
             SCA_H=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' sca.json)
             SCA_C=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' sca.json)
 
+            # ------------ Parse SAST ---------------
             SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' sast.sarif)
             SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' sast.sarif)
             SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' sast.sarif)
             SAST_C=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' sast.sarif)
 
+            # ------------ Parse Semgrep ---------------
             SEM_L=$(jq '[.results[] | select(.extra.level=="INFO")] | length' semgrep.json)
             SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' semgrep.json)
             SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' semgrep.json)
             SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' semgrep.json)
 
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C))
+            # ------------ Parse SBOM ---------------
+            SBOM_L=0
+            SBOM_M=0
+            SBOM_H=0
+            SBOM_C=0
 
-            echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$TOTAL" >> summary.csv
+            SBOM_FILES=$(find project -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \) 2>/dev/null)
+
+            for sbom in $SBOM_FILES; do
+                echo "Parsing SBOM: $sbom"
+
+                # CycloneDX JSON
+                if jq -e '.vulnerabilities' "$sbom" >/dev/null 2>&1; then
+                    SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
+                    SBOM_M=$((SBOM_M + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="medium")] | length' "$sbom")))
+                    SBOM_H=$((SBOM_H + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="high")] | length' "$sbom")))
+                    SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
+                fi
+
+                # SPDX JSON
+                if jq -e '.packages' "$sbom" >/dev/null 2>&1; then
+                    SBOM_H=$((SBOM_H + $(jq '[.packages[] | select(.externalRefs[].referenceCategory=="SECURITY")] | length' "$sbom")))
+                fi
+            done
+
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C + SAST_L+SAST_M+SAST_H+SAST_C + SEM_L+SEM_M+SEM_H+SEM_C + SBOM_L+SBOM_M+SBOM_H+SBOM_C))
+
+            echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
 
             rm -rf project
-          done
 
       - name: Upload results
         uses: actions/upload-artifact@v4
