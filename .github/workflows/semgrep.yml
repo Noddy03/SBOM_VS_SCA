@@ -20,7 +20,6 @@ jobs:
   fetch_and_scan:
     runs-on: ubuntu-latest
     env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
     steps:
       - name: Install dependencies
@@ -30,6 +29,10 @@ jobs:
 
       - name: Fetch top N repos and detect SBOMs recursively
         id: fetch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_LANGUAGE: ${{ inputs.language }}
+          INPUT_TOP_N: ${{ inputs.top_n }}
         run: |
           python << 'EOF'
           import os, requests, urllib.parse, time
