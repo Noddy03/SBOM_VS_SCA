@@ -17,23 +17,21 @@ permissions:
   security-events: write
 
 jobs:
-  fetch_and_scan:
+  fetch_repos:
     runs-on: ubuntu-latest
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
+    outputs:
+      repo_list: ${{ steps.collect.outputs.repo_list }}
     steps:
       - name: Install Python dependencies
         run: |
-          pip install --upgrade pip
-          pip install requests semgrep jq
+          pip install --upgrade pip requests
 
-      - name: Fetch top N repos and detect SBOMs recursively
-        id: fetch
+      - name: Fetch top N repos and detect SBOMs
+        id: collect
         env:
           INPUT_LANGUAGE: ${{ inputs.language }}
           INPUT_TOP_N: ${{ inputs.top_n }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python << 'EOF'
           import os, requests, urllib.parse, time
@@ -43,124 +41,123 @@ jobs:
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
 
-          # Fetch top repos by language
+          # Fetch top repos
           q = urllib.parse.quote(f"language:{lang}")
           url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page={top_n}"
-          print("DEBUG: Search URL:", url)
           r = requests.get(url, headers=headers)
           r.raise_for_status()
           repos = [i["full_name"] for i in r.json().get("items", [])]
 
-          # SBOM filename patterns
-          sbom_keywords = [
-              "sbom", "bom", "cyclonedx", "spdx",
-              "sbom.json", "sbom.xml", "bom.json", "bom.xml",
-              "package-lock.cdx.json"
-          ]
-
+          # SBOM detection
+          sbom_keywords = ["sbom", "bom", "cyclonedx", "spdx","sbom.json","sbom.xml","bom.json","bom.xml","package-lock.cdx.json"]
           matches = []
-
           for repo in repos:
-              print(f"Checking SBOM in {repo}...")
               tree_url = f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1"
               t = requests.get(tree_url, headers=headers)
-              if t.status_code == 403:
-                  time.sleep(30)
-                  t = requests.get(tree_url, headers=headers)
               if not t.ok:
-                  print("Failed:", repo, t.text)
                   continue
               files = [node["path"].lower() for node in t.json().get("tree", []) if node.get("type")=="blob"]
               if any(keyword in f for keyword in sbom_keywords for f in files):
                   matches.append(repo)
 
           # Add known vulnerable test repos
-          known_vuln_repos = [
-              "snyk/test-vulnerabilities-java",
-              "snyk/test-vulnerabilities-node"
-          ]
-          matches.extend(known_vuln_repos)
+          matches.extend(["snyk/test-vulnerabilities-java","snyk/test-vulnerabilities-node"])
 
-          print(f"FINAL SBOM repos + test repos: {matches}")
           print(f"::set-output name=repo_list::{','.join(matches)}")
           EOF
 
-      - name: Prepare summary.csv
-        run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,total" > summary.csv
+  scan_repos:
+    needs: fetch_repos
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJson('["' + join(needs.fetch_repos.outputs.repo_list, '","') + '"]') }}
 
-      - name: Scan repositories
+    steps:
+      - name: Install tools
         run: |
-          REPOS="${{ steps.fetch.outputs.repo_list }}"
-          if [ -z "$REPOS" ]; then
-              echo "No repositories found. Exiting."
-              exit 0
-          fi
-
-          # Install required tools
           sudo apt-get update
           sudo apt-get install -y jq npm
           npm install -g snyk
           pip install --upgrade semgrep requests
 
-          IFS=',' read -ra REPO_ARRAY <<< "$REPOS"
-          for repo in "${REPO_ARRAY[@]}"; do
-              echo "Scanning $repo"
+      - name: Clone repository
+        run: |
+          git clone --depth 1 https://x-access-token:${GITHUB_TOKEN}@github.com/${{ matrix.repo }} project-src
 
-              # Clone repo with token
-              git clone https://x-access-token:${GITHUB_TOKEN}@github.com/${repo}.git project-src || { echo "Failed to clone $repo"; continue; }
-              cd project-src || continue
+      - name: Install dependencies
+        working-directory: project-src
+        run: |
+          if [ -f pom.xml ]; then
+              mvn -B install -DskipTests || echo "⚠ Maven build failed, continuing..."
+          elif [ -f package.json ]; then
+              npm ci || npm install || echo "⚠ NPM install failed, continuing..."
+          elif [ -f requirements.txt ]; then
+              pip install -r requirements.txt || echo "⚠ Python install failed, continuing..."
+          fi
 
-              # Install dependencies (continue even if failing)
-              if [ -f pom.xml ]; then
-                  mvn -B install -DskipTests || echo "⚠ Maven build failed, continuing..."
-              elif [ -f package.json ]; then
-                  npm ci || npm install || echo "⚠ NPM install failed, continuing..."
-              elif [ -f requirements.txt ]; then
-                  pip install -r requirements.txt || echo "⚠ Python install failed, continuing..."
-              fi
+      - name: Run Snyk SCA
+        working-directory: project-src
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk test --all-projects --json > ../snyk-sca.json || echo '{"vulnerabilities":[]}' > ../snyk-sca.json
 
-              # Run Snyk SCA
-              snyk test --all-projects --json > ../snyk-sca.json || echo '{"vulnerabilities":[]}' > ../snyk-sca.json
+      - name: Run Snyk Code (SAST)
+        working-directory: project-src
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk code test --all-projects --sarif > ../snyk-code.sarif || echo '{"runs":[]}' > ../snyk-code.sarif
 
-              # Run Snyk Code (SAST)
-              snyk code test --all-projects --sarif > ../snyk-code.sarif || echo '{"runs":[]}' > ../snyk-code.sarif
+      - name: Run Semgrep
+        working-directory: project-src
+        run: semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
-              # Run Semgrep (JSON output)
-              semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
+      - name: Compute summary for repo
+        run: |
+          REPO="${{ matrix.repo }}"
+          SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' ../snyk-sca.json)
+          SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' ../snyk-sca.json)
+          SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' ../snyk-sca.json)
+          SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' ../snyk-sca.json)
 
-              # Parse vulnerabilities
-              SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' ../snyk-sca.json)
-              SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' ../snyk-sca.json)
-              SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' ../snyk-sca.json)
-              SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' ../snyk-sca.json)
+          SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' ../snyk-code.sarif)
+          SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' ../snyk-code.sarif)
+          SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' ../snyk-code.sarif)
+          SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' ../snyk-code.sarif)
 
-              SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' ../snyk-code.sarif)
-              SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' ../snyk-code.sarif)
-              SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' ../snyk-code.sarif)
-              SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' ../snyk-code.sarif)
+          SEM_LOW=$(jq '[.results[] | select(.extra.level=="INFO")] | length' ../semgrep.json)
+          SEM_MEDIUM=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' ../semgrep.json)
+          SEM_HIGH=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' ../semgrep.json)
+          SEM_CRITICAL=$(jq '[.results[] | select(.check_id | test("critical|hardcoded|sql-injection|xss"))] | length' ../semgrep.json)
 
-              SEM_LOW=$(jq '[.results[] | select(.extra.level=="INFO")] | length' ../semgrep.json)
-              SEM_MEDIUM=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' ../semgrep.json)
-              SEM_HIGH=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' ../semgrep.json)
-              SEM_CRITICAL=$(jq '[.results[] | select(.check_id | test("critical|hardcoded|sql-injection|xss"))] | length' ../semgrep.json)
+          TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
 
-              TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
+          echo "repo,SCA_LOW,SCA_MEDIUM,SCA_HIGH,SCA_CRITICAL,SAST_LOW,SAST_MEDIUM,SAST_HIGH,SAST_CRITICAL,SEM_LOW,SEM_MEDIUM,SEM_HIGH,SEM_CRITICAL,TOTAL" > summary_${REPO//\//_}.csv
+          echo "$REPO,$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> summary_${REPO//\//_}.csv
 
-              echo "\"$repo\",$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> ../summary.csv
+      - name: Upload repo CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: "repo-summary-${{ matrix.repo }}"
+          path: summary_${{ matrix.repo//\//_ }}.csv
 
-              cd ..
-              rm -rf project-src
-          done
+  merge_results:
+    needs: scan_repos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all CSVs
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+
+      - name: Merge CSVs
+        run: |
+          echo "repo,SCA_LOW,SCA_MEDIUM,SCA_HIGH,SCA_CRITICAL,SAST_LOW,SAST_MEDIUM,SAST_HIGH,SAST_CRITICAL,SEM_LOW,SEM_MEDIUM,SEM_HIGH,SEM_CRITICAL,TOTAL" > summary.csv
+          cat results/**/*.csv | grep -v "repo,SCA_LOW" >> summary.csv
 
       - name: Upload summary.csv
         uses: actions/upload-artifact@v4
         with:
-          name: top-repos-security-summary
+          name: final-summary
           path: summary.csv
-
-      - name: Upload SARIF logs
-        uses: actions/upload-artifact@v4
-        with:
-          name: sarif-logs
-          path: "*.sarif"
