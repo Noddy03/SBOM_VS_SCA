@@ -64,6 +64,7 @@ jobs:
           for repo in "${REPO_ARRAY[@]}"; do
               echo "Checking SBOM in $repo"
               git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo sbom-check/$repo || continue
+
               cd sbom-check/$repo
 
               FILES=$(find . -type f \( -iname "*.json" -o -iname "*.xml" -o -iname "*.spdx" \) 2>/dev/null)
@@ -80,14 +81,13 @@ jobs:
               else
                 echo "→ No SBOM"
               fi
+
               cd ../../
           done
 
-          # ALWAYS add known vulnerable repos
           TEST_REPOS="snyk/test-vulnerabilities-java,snyk/test-vulnerabilities-node"
           FINAL_LIST="${SBOM_REPOS#,},$TEST_REPOS"
 
-          echo "Final scan list: $FINAL_LIST"
           echo "filtered=$FINAL_LIST" >> $GITHUB_OUTPUT
 
       - name: Prepare summary.csv
@@ -106,37 +106,36 @@ jobs:
             git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo project || continue
             cd project
 
-            # Install dependencies
             if [ -f pom.xml ]; then mvn -B install -DskipTests || true; fi
             if [ -f package.json ]; then npm ci || npm install || true; fi
             if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
 
-            # Security scans
-            snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
-            snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
-            semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
+            # Security scans with safe fallbacks
+            snyk test --json > ../sca.json || { echo '{"vulnerabilities":[]}' > ../sca.json; }
+            snyk code test --sarif > ../sast.sarif || { echo '{"runs":[]}' > ../sast.sarif; }
+            semgrep --config p/ci --json > ../semgrep.json || { echo '{"results":[]}' > ../semgrep.json; }
 
             cd ..
 
-            # ------------ Parse SCA ---------------
+            # ---------------- SCA ----------------
             SCA_L=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' sca.json)
             SCA_M=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' sca.json)
             SCA_H=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' sca.json)
             SCA_C=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' sca.json)
 
-            # ------------ Parse SAST ---------------
+            # ---------------- SAST --------------
             SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' sast.sarif)
             SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' sast.sarif)
             SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' sast.sarif)
             SAST_C=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' sast.sarif)
 
-            # ------------ Parse Semgrep ---------------
+            # ---------------- Semgrep ----------
             SEM_L=$(jq '[.results[] | select(.extra.level=="INFO")] | length' semgrep.json)
             SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' semgrep.json)
             SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' semgrep.json)
             SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' semgrep.json)
 
-            # ------------ Parse SBOM ---------------
+            # ---------------- SBOM parsing -------
             SBOM_L=0
             SBOM_M=0
             SBOM_H=0
@@ -147,7 +146,7 @@ jobs:
             for sbom in $SBOM_FILES; do
                 echo "Parsing SBOM: $sbom"
 
-                # CycloneDX JSON
+                # CycloneDX
                 if jq -e '.vulnerabilities' "$sbom" >/dev/null 2>&1; then
                     SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
                     SBOM_M=$((SBOM_M + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="medium")] | length' "$sbom")))
@@ -155,7 +154,7 @@ jobs:
                     SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
                 fi
 
-                # SPDX JSON
+                # SPDX (security refs)
                 if jq -e '.packages' "$sbom" >/dev/null 2>&1; then
                     SBOM_H=$((SBOM_H + $(jq '[.packages[] | select(.externalRefs[].referenceCategory=="SECURITY")] | length' "$sbom")))
                 fi
