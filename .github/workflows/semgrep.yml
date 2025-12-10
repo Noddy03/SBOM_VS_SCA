@@ -58,7 +58,7 @@ jobs:
                       stdout=subprocess.PIPE, stderr=subprocess.PIPE
                   )
                   if result.returncode != 0:
-                      continue  # skip repo if it cannot be cloned
+                      continue
                   sbom_files = subprocess.run(
                       ["find", tmpdir, "-type", "f", "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
                        "-o", "-iname", "*cyclonedx*.json", "-o", "-iname", "*cyclonedx*.xml",
@@ -70,9 +70,8 @@ jobs:
               finally:
                   shutil.rmtree(tmpdir)
           
-          final_list = selected_repos
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
-              gh.write(f"repos={json.dumps(final_list)}\n")
+              gh.write(f"repos={json.dumps(selected_repos)}\n")
           EOF
 
   scan_repos:
@@ -89,6 +88,7 @@ jobs:
           sudo apt-get install -y jq git npm python3-pip
           pip3 install semgrep
           npm install -g snyk
+
       - name: Clone repository safely
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -97,6 +97,7 @@ jobs:
             echo "Repo ${{ matrix.repo }} not found, skipping."
             exit 0
           }
+
       - name: Run security scans
         run: |
           cd project || exit 0
@@ -104,6 +105,7 @@ jobs:
           snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
           snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
           semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
+          
           SBOM_L=0
           SBOM_M=0
           SBOM_H=0
@@ -117,6 +119,7 @@ jobs:
                   SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
               fi
           done
+          
           cd ..
           mkdir -p results
           echo "${{ matrix.repo }}" > results/repo.txt
@@ -124,10 +127,11 @@ jobs:
           cp sast.sarif results/
           cp semgrep.json results/
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
+
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
-          # Sanitize repo name by replacing slashes with dashes
+          # Replace slashes in repo names with dashes
           name: "repo-results-${{ matrix.repo//\//- }}"
           path: results
 
@@ -164,6 +168,7 @@ jobs:
             SBOM_C=$(cut -d',' -f4 "$d/sbom_counts.txt")
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
             echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
+
       - name: Upload summary
         uses: actions/upload-artifact@v4
         with:
