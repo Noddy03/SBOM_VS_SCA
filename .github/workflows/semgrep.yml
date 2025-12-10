@@ -106,6 +106,8 @@ jobs:
           IFS=',' read -ra REPO_ARRAY <<< "$REPOS"
           for repo in "${REPO_ARRAY[@]}"; do
               echo "Scanning $repo"
+
+              # Clone repo with token
               git clone https://x-access-token:${GITHUB_TOKEN}@github.com/${repo}.git project-src || { echo "Failed to clone $repo"; continue; }
               cd project-src || continue
 
@@ -124,8 +126,8 @@ jobs:
               # Run Snyk Code (SAST)
               snyk code test --all-projects --sarif > ../snyk-code.sarif || echo '{"runs":[]}' > ../snyk-code.sarif
 
-              # Run Semgrep
-              semgrep --config p/ci --sarif > ../semgrep.sarif || echo '{"runs":[]}' > ../semgrep.sarif
+              # Run Semgrep (JSON output)
+              semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
               # Parse vulnerabilities
               SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' ../snyk-sca.json)
@@ -138,10 +140,10 @@ jobs:
               SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' ../snyk-code.sarif)
               SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' ../snyk-code.sarif)
 
-              SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' ../semgrep.sarif)
-              SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' ../semgrep.sarif)
-              SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' ../semgrep.sarif)
-              SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' ../semgrep.sarif)
+              SEM_LOW=$(jq '[.results[] | select(.extra.level=="INFO")] | length' ../semgrep.json)
+              SEM_MEDIUM=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' ../semgrep.json)
+              SEM_HIGH=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' ../semgrep.json)
+              SEM_CRITICAL=$(jq '[.results[] | select(.check_id | test("critical|hardcoded|sql-injection|xss"))] | length' ../semgrep.json)
 
               TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
 
