@@ -64,7 +64,6 @@ jobs:
           for repo in "${REPO_ARRAY[@]}"; do
               echo "Checking SBOM in $repo"
               git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo sbom-check/$repo || continue
-
               cd sbom-check/$repo
 
               FILES=$(find . -type f \( -iname "*.json" -o -iname "*.xml" -o -iname "*.spdx" \) 2>/dev/null)
@@ -87,7 +86,6 @@ jobs:
 
           TEST_REPOS="snyk/test-vulnerabilities-java,snyk/test-vulnerabilities-node"
           FINAL_LIST="${SBOM_REPOS#,},$TEST_REPOS"
-
           echo "filtered=$FINAL_LIST" >> $GITHUB_OUTPUT
 
       - name: Prepare summary.csv
@@ -154,9 +152,9 @@ jobs:
                     SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
                 fi
 
-                # SPDX (security refs)
+                # SPDX (security refs) - SAFE version
                 if jq -e '.packages' "$sbom" >/dev/null 2>&1; then
-                    SBOM_H=$((SBOM_H + $(jq '[.packages[] | select(.externalRefs[].referenceCategory=="SECURITY")] | length' "$sbom")))
+                    SBOM_H=$((SBOM_H + $(jq '[.packages[] | select((.externalRefs // []) | map(.referenceCategory=="SECURITY") | any)] | length' "$sbom")))
                 fi
             done
 
