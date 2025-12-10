@@ -1,16 +1,16 @@
-name: Multi-Repo Static Analysis (Secretless SonarQube Replacement)
+name: Top Repos Security Scan  faster parallel (SBOM Filtered)
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Language filter (C++, Python, Java, JavaScript)"
+        description: "Programming language to filter repos"
         required: true
-        default: "C++"
-      max_repos:
-        description: "Max repositories to scan"
-        required: true
-        default: "25"
+        default: "Java"
+      top_n:
+        description: "Number of top repositories to scan"
+        required: false
+        default: "5"
 
 permissions:
   contents: read
@@ -20,127 +20,158 @@ jobs:
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
-      repos: ${{ steps.out.outputs.repos }}
+      repos: ${{ steps.set_output.outputs.repos }}
     steps:
-      - name: Install jq & gh
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq gh
+      - name: Install Python and git
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git
 
-      - id: out
+      - name: Fetch top N repositories with SBOM
+        id: set_output
         env:
-          LANG: ${{ github.event.inputs.language }}
-          LIMIT: ${{ github.event.inputs.max_repos }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LANG_FILTER: ${{ inputs.language }}
+          TOP_N: ${{ inputs.top_n }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          QUERY="topic:iot language:$LANG fork:false archived:false"
-          PAGE=1
-          COLLECT="[]"
+          python3 <<'EOF'
+          import os, requests, urllib.parse, subprocess, tempfile, shutil, json
 
-          while [ $PAGE -le 10 ]; do
-            PAGE_DATA=$(gh api -X GET /search/repositories \
-              --raw-field q="$QUERY" \
-              --raw-field sort=stars \
-              --raw-field order=desc \
-              --raw-field per_page=100 \
-              --raw-field page=$PAGE \
-              --jq '.items[].full_name' || true)
+          lang = os.environ["LANG_FILTER"]
+          top_n = int(os.environ["TOP_N"])
+          token = os.environ["GITHUB_TOKEN"]
+          headers = {"Authorization": f"token {token}"}
 
-            if [ -z "$PAGE_DATA" ]; then break; fi
+          q = urllib.parse.quote(f"language:{lang}")
+          url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=100"
+          r = requests.get(url, headers=headers)
+          r.raise_for_status()
+          items = r.json()["items"]
 
-            COLLECT=$(printf "%s\n%s" "$COLLECT" "$PAGE_DATA" | jq -R -s -c '
-              split("\n") | map(select(length>0))')
+          selected_repos = []
+          for repo in items:
+              if len(selected_repos) >= top_n:
+                  break
+              full_name = repo["full_name"]
+              tmpdir = tempfile.mkdtemp()
+              try:
+                  result = subprocess.run(
+                      ["git", "clone", "--depth", "1", f"https://x-access-token:{token}@github.com/{full_name}", tmpdir],
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                  )
+                  if result.returncode != 0:
+                      continue
+                  sbom_files = subprocess.run(
+                      ["find", tmpdir, "-type", "f",
+                       "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
+                       "-o", "-iname", "*cyclonedx*.json", "-o", "-iname", "*cyclonedx*.xml",
+                       "-o", "-iname", "*.cdx.json", "-o", "-iname", "*.spdx.json", "-o", "-iname", "*.spdx"],
+                      stdout=subprocess.PIPE
+                  ).stdout.decode().strip()
+                  if sbom_files:
+                      selected_repos.append(full_name)
+              finally:
+                  shutil.rmtree(tmpdir)
 
-            COUNT=$(echo "$COLLECT" | jq 'length')
-            if [ "$COUNT" -ge "$LIMIT" ]; then break; fi
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
+              gh.write(f"repos={json.dumps(selected_repos or [])}\n")
+          EOF
 
-            PAGE=$((PAGE+1))
-          done
-
-          echo "repos=$COLLECT" >> $GITHUB_OUTPUT
-
-  static_scan:
+  scan_repo:
     needs: fetch_repos
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
-
+    continue-on-error: true
     steps:
-      - name: Checkout repository
-        run: |
-          git clone --depth 1 "https://github.com/${{ matrix.repo }}" project || true
-
       - name: Install tools
         run: |
-          sudo apt-get install -y jq python3 python3-pip nodejs npm default-jre
-          pip install semgrep bandit flake8 || true
-          npm install -g eslint || true
-          wget https://github.com/pmd/pmd/releases/latest/download/pmd-bin-6.55.0.zip
-          unzip -q pmd-bin-6.55.0.zip
+          sudo apt-get update
+          sudo apt-get install -y jq git npm python3-pip
+          pip3 install semgrep
+          npm install -g snyk
 
-      - name: Run Semgrep
+      - name: Clone repository safely
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          semgrep --config auto -o project/semgrep.sarif --sarif project || echo '{"runs":[]}' > project/semgrep.sarif
+          SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          mkdir -p project
+          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || exit 0
 
-      - name: Run Bandit (Python)
+      - name: Run security scans
         run: |
-          bandit -r project -f sarif -o project/bandit.sarif || echo '{"runs":[]}' > project/bandit.sarif
+          SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          mkdir -p results
+          cd project || exit 0
 
-      - name: Run ESLint (JS/TS)
-        run: |
-          eslint project -f json -o project/eslint.json || echo '{"runs":[]}' > project/eslint.json
+          snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
+          snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
+          semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
-      - name: Run Flake8 (Python)
-        run: |
-          flake8 project --format=json > project/flake8.json || echo '{}' > project/flake8.json
-
-      - name: Run PMD (Java)
-        run: |
-          ./pmd-bin-*/bin/run.sh pmd -d project -R rulesets/java/quickstart.xml -f sarif -r project/pmd.sarif || echo '{"runs":[]}' > project/pmd.sarif
-
-      - name: Create summary.csv
-        run: |
-          OUT=project/summary.csv
-          echo "repo,semgrep,bandit,eslint,pmd,flake8" > $OUT
-
-          S1=$(jq '[.runs[].results[]] | length' project/semgrep.sarif 2>/dev/null || echo 0)
-          S2=$(jq '[.runs[].results[]] | length' project/bandit.sarif 2>/dev/null || echo 0)
-          S3=$(jq '. | length' project/eslint.json 2>/dev/null || echo 0)
-          S4=$(jq '[.runs[].results[]] | length' project/pmd.sarif 2>/dev/null || echo 0)
-          S5=$(jq 'to_entries | length' project/flake8.json 2>/dev/null || echo 0)
-
-          echo "\"${{ matrix.repo }}\",$S1,$S2,$S3,$S4,$S5" >> $OUT
-
-      - name: Safe artifact name
-        id: safe
-        run: |
-          SAFE=$(echo "${{ matrix.repo }}" | sed 's/[^A-Za-z0-9._-]/_/g')
-          echo "safe=$SAFE" >> $GITHUB_OUTPUT
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.safe.outputs.safe }}-scan
-          path: project/**
-
-  aggregate:
-    needs: static_scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: all_summaries
-
-      - name: Build master_summary.csv
-        run: |
-          echo "repo,semgrep,bandit,eslint,pmd,flake8" > master_summary.csv
-          for f in $(find all_summaries -name "summary.csv"); do
-            tail -n +2 "$f" >> master_summary.csv
+          SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
+          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
+          for sbom in $SBOM_FILES; do
+            if jq -e ".vulnerabilities" "$sbom" >/dev/null 2>&1; then
+                SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
+                SBOM_M=$((SBOM_M + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="medium")] | length' "$sbom")))
+                SBOM_H=$((SBOM_H + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="high")] | length' "$sbom")))
+                SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
+            fi
           done
 
-      - uses: actions/upload-artifact@v4
+          cd ..
+          echo "${{ matrix.repo }}" > results/repo.txt
+          cp sca.json results/
+          cp sast.sarif results/
+          cp semgrep.json results/
+          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
+
+          mv results all_results/$SAFE_NAME
+          rm -rf project
+
+      - name: Upload per-repo results
+        uses: actions/upload-artifact@v4
         with:
-          name: master_summary
-          path: master_summary.csv
+          name: "repo-results-${{ github.run_id }}-${{ matrix.repo }}" 
+          path: all_results/${{ matrix.repo }}  
+
+  summarize:
+    needs: scan_repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all repo results
+        uses: actions/download-artifact@v4
+        with:
+          path: all_results
+
+      - name: Generate summary.csv
+        run: |
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          for d in all_results/*; do
+            [ -d "$d" ] || continue
+            repo=$(cat "$d/repo.txt")
+            SCA_L=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' "$d/sca.json")
+            SCA_M=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' "$d/sca.json")
+            SCA_H=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' "$d/sca.json")
+            SCA_C=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' "$d/sca.json")
+            SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$d/sast.sarif")
+            SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$d/sast.sarif")
+            SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$d/sast.sarif")
+            SAST_C=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' "$d/sast.sarif")
+            SEM_L=$(jq '[.results[] | select(.extra.level=="INFO")] | length' "$d/semgrep.json")
+            SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' "$d/semgrep.json")
+            SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' "$d/semgrep.json")
+            SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' "$d/semgrep.json")
+            SBOM_L=$(cut -d',' -f1 "$d/sbom_counts.txt")
+            SBOM_M=$(cut -d',' -f2 "$d/sbom_counts.txt")
+            SBOM_H=$(cut -d',' -f3 "$d/sbom_counts.txt")
+            SBOM_C=$(cut -d',' -f4 "$d/sbom_counts.txt")
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
+            echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: "security-summary-${{ github.run_id }}"
+          path: summary.csv
