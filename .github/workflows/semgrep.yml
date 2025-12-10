@@ -10,24 +10,28 @@ on:
       top_n:
         description: "Number of top repositories to scan"
         required: false
-        default: "20"
+        default: "5"
+  push:
+    branches:
+      - main  # Optional: runs on push to main
 
 permissions:
   contents: read
   security-events: write
 
 jobs:
-
-  fetch_repos:
+  fetch_and_scan:
     runs-on: ubuntu-latest
-    outputs:
-      repos: ${{ steps.set_output.outputs.repos }}
     steps:
-      - name: Install Python and git
-        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip git jq npm
+          pip3 install semgrep
+          npm install -g snyk
 
       - name: Fetch top N repositories with SBOM
-        id: set_output
+        id: fetch_repos
         env:
           LANG_FILTER: ${{ inputs.language }}
           TOP_N: ${{ inputs.top_n }}
@@ -72,88 +76,62 @@ jobs:
               finally:
                   shutil.rmtree(tmpdir)
 
-          # Safe JSON output
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
               gh.write(f"repos={json.dumps(selected_repos or [])}\n")
           EOF
 
-  scan_repos:
-    needs: fetch_repos
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos || '[]') }}
-
-    steps:
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip
-          pip3 install semgrep
-          npm install -g snyk
-
-      - name: Prepare results folder
-        run: mkdir -p all_results
-
-      - name: Clone and scan repository
+      - name: Loop through repos and scan
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOS: ${{ steps.fetch_repos.outputs.repos }}
         run: |
-          SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          mkdir -p project results
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || {
-            echo "Repo ${{ matrix.repo }} not found, skipping."
-            continue
-          }
+          mkdir -p all_results
+          for repo in $(echo "$REPOS" | jq -r '.[]'); do
+            echo "Scanning $repo"
+            SAFE_NAME=$(echo "$repo" | tr '/' '-')
+            mkdir -p project results
+            git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo project || {
+              echo "Repo $repo not found, skipping."
+              continue
+            }
 
-          cd project || exit 0
+            cd project || continue
 
-          # Run scans
-          snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
-          snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
-          semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
+            # Run scans
+            snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
+            snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
+            semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
-          # SBOM counts
-          SBOM_L=0
-          SBOM_M=0
-          SBOM_H=0
-          SBOM_C=0
-          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
-          for sbom in $SBOM_FILES; do
-            if jq -e ".vulnerabilities" "$sbom" >/dev/null 2>&1; then
-                SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
-                SBOM_M=$((SBOM_M + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="medium")] | length' "$sbom")))
-                SBOM_H=$((SBOM_H + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="high")] | length' "$sbom")))
-                SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
-            fi
+            # SBOM counts
+            SBOM_L=0
+            SBOM_M=0
+            SBOM_H=0
+            SBOM_C=0
+            SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
+            for sbom in $SBOM_FILES; do
+              if jq -e ".vulnerabilities" "$sbom" >/dev/null 2>&1; then
+                  SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
+                  SBOM_M=$((SBOM_M + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="medium")] | length' "$sbom")))
+                  SBOM_H=$((SBOM_H + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="high")] | length' "$sbom")))
+                  SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
+              fi
+            done
+
+            cd ..
+            echo "$repo" > results/repo.txt
+            cp sca.json results/
+            cp sast.sarif results/
+            cp semgrep.json results/
+            echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
+
+            mv results "all_results/$SAFE_NAME"
+            rm -rf project
           done
 
-          cd ..
-          mkdir -p results
-          echo "${{ matrix.repo }}" > results/repo.txt
-          cp sca.json results/
-          cp sast.sarif results/
-          cp semgrep.json results/
-          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
-
-          # Move results safely into all_results
-          mv results "all_results/$SAFE_NAME"
-          rm -rf project
-
-      - name: Upload per-repo results
+      - name: Upload all repo results
         uses: actions/upload-artifact@v4
         with:
-          name: "repo-results-${{ matrix.repo//\//-}}"
-          path: "all_results/${{ matrix.repo//\//-}}"
-
-  summarize:
-    needs: scan_repos
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all repo results
-        uses: actions/download-artifact@v4
-        with:
+          name: "repo-results-${{ github.run_id }}"
           path: all_results
 
       - name: Generate summary.csv
