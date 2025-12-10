@@ -34,6 +34,7 @@ jobs:
           LANG_FILTER: ${{ inputs.language }}
           TOP_N: ${{ inputs.top_n }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           python <<'EOF'
           import os, requests, urllib.parse
@@ -55,6 +56,7 @@ jobs:
         env:
           REPOS: ${{ steps.fetch.outputs.repos }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           mkdir sbom-check
           SBOM_REPOS=""
@@ -89,10 +91,12 @@ jobs:
           echo "filtered=$FINAL_LIST" >> $GITHUB_OUTPUT
 
       - name: Prepare summary.csv
+        shell: bash
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
 
       - name: Scan repositories
+        shell: bash
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
