@@ -34,19 +34,18 @@ jobs:
         run: |
           python3 <<'EOF'
           import os, requests, urllib.parse, subprocess, tempfile, shutil, json
-
+          
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
-
-          # Search top 100 repos by stars
+          
           q = urllib.parse.quote(f"language:{lang}")
           url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=100"
           r = requests.get(url, headers=headers)
           r.raise_for_status()
           items = r.json()["items"]
-
+          
           selected_repos = []
           for repo in items:
               if len(selected_repos) >= top_n:
@@ -59,7 +58,7 @@ jobs:
                       stdout=subprocess.PIPE, stderr=subprocess.PIPE
                   )
                   if result.returncode != 0:
-                      continue
+                      continue  # skip repo if it cannot be cloned
                   sbom_files = subprocess.run(
                       ["find", tmpdir, "-type", "f", "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
                        "-o", "-iname", "*cyclonedx*.json", "-o", "-iname", "*cyclonedx*.xml",
@@ -70,9 +69,10 @@ jobs:
                       selected_repos.append(full_name)
               finally:
                   shutil.rmtree(tmpdir)
-
+          
+          final_list = selected_repos
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
-              gh.write(f"repos={json.dumps(selected_repos)}\n")
+              gh.write(f"repos={json.dumps(final_list)}\n")
           EOF
 
   scan_repos:
@@ -89,7 +89,6 @@ jobs:
           sudo apt-get install -y jq git npm python3-pip
           pip3 install semgrep
           npm install -g snyk
-
       - name: Clone repository safely
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -98,7 +97,6 @@ jobs:
             echo "Repo ${{ matrix.repo }} not found, skipping."
             exit 0
           }
-
       - name: Run security scans
         run: |
           cd project || exit 0
@@ -106,15 +104,11 @@ jobs:
           snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
           snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
           semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
-          cd ..
-          mkdir -p results
-          echo "${{ matrix.repo }}" > results/repo.txt
-          cp sca.json results/
-          cp sast.sarif results/
-          cp semgrep.json results/
-          # Count SBOM vulnerabilities
-          SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOM_FILES=$(find project -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
+          SBOM_L=0
+          SBOM_M=0
+          SBOM_H=0
+          SBOM_C=0
+          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
           for sbom in $SBOM_FILES; do
               if jq -e ".vulnerabilities" "$sbom" >/dev/null 2>&1; then
                   SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
@@ -123,12 +117,18 @@ jobs:
                   SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
               fi
           done
+          cd ..
+          mkdir -p results
+          echo "${{ matrix.repo }}" > results/repo.txt
+          cp sca.json results/
+          cp sast.sarif results/
+          cp semgrep.json results/
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
-
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
-          name: "repo-results-${{ matrix.repo//\//__ }}"
+          # Sanitize repo name by replacing slashes with dashes
+          name: "repo-results-${{ matrix.repo//\//- }}"
           path: results
 
   summarize:
@@ -164,7 +164,6 @@ jobs:
             SBOM_C=$(cut -d',' -f4 "$d/sbom_counts.txt")
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
             echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
-
       - name: Upload summary
         uses: actions/upload-artifact@v4
         with:
