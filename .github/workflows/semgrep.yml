@@ -99,7 +99,9 @@ jobs:
               exit 0
           fi
 
-          for repo in $REPOS; do
+          # Split comma-separated repos into array
+          IFS=',' read -ra REPO_ARRAY <<< "$REPOS"
+          for repo in "${REPO_ARRAY[@]}"; do
               echo "Scanning $repo"
               git clone --depth 1 https://github.com/$repo project-src
               cd project-src || exit 1
