@@ -21,10 +21,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.collect.outputs.repo_list }}
+
     steps:
       - name: Install Python dependencies
-        run: |
-          pip install --upgrade pip requests
+        run: pip install --upgrade pip requests
 
       - name: Fetch top N repos and detect SBOMs
         id: collect
@@ -60,10 +60,13 @@ jobs:
               if any(keyword in f for keyword in sbom_keywords for f in files):
                   matches.append(repo)
 
-          # Add known vulnerable test repos
-          matches.extend(["snyk/test-vulnerabilities-java","snyk/test-vulnerabilities-node"])
+          # Add at least one repo if none detected
+          if not matches:
+              matches.append("snyk/test-vulnerabilities-java")
 
-          print(f"::set-output name=repo_list::{','.join(matches)}")
+          # Write to GITHUB_OUTPUT
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as ghout:
+              ghout.write(f"repo_list={','.join(matches)}\n")
           EOF
 
   scan_repos:
@@ -72,7 +75,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        repo: ${{ fromJson('["' + join(needs.fetch_repos.outputs.repo_list, '","') + '"]') }}
+        repo: ${{ fromJson('["' + replace(needs.fetch_repos.outputs.repo_list, ',', '","') + '"]') }}
 
     steps:
       - name: Install tools
@@ -83,8 +86,7 @@ jobs:
           pip install --upgrade semgrep requests
 
       - name: Clone repository
-        run: |
-          git clone --depth 1 https://x-access-token:${GITHUB_TOKEN}@github.com/${{ matrix.repo }} project-src
+        run: git clone --depth 1 https://x-access-token:${GITHUB_TOKEN}@github.com/${{ matrix.repo }} project-src
 
       - name: Install dependencies
         working-directory: project-src
