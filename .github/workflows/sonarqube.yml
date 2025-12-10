@@ -1,4 +1,4 @@
-name: Top Repos Security Scan  faster parallel (SBOM Filtered)
+name: Top Repos Security Scan (SBOM Filtered)
 
 on:
   workflow_dispatch:
@@ -127,6 +127,7 @@ jobs:
           cp semgrep.json results/
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
 
+          mkdir -p all_results
           mv results all_results/$SAFE_NAME
           rm -rf project
 
@@ -134,7 +135,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: "repo-results-${{ github.run_id }}-${{ matrix.repo }}" 
-          path: all_results/${{ matrix.repo }}  
+          path: all_results/${{ matrix.repo }}
 
   summarize:
     needs: scan_repo
@@ -149,26 +150,28 @@ jobs:
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           for d in all_results/*; do
-            [ -d "$d" ] || continue
-            repo=$(cat "$d/repo.txt")
-            SCA_L=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' "$d/sca.json")
-            SCA_M=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' "$d/sca.json")
-            SCA_H=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' "$d/sca.json")
-            SCA_C=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' "$d/sca.json")
-            SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$d/sast.sarif")
-            SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$d/sast.sarif")
-            SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$d/sast.sarif")
-            SAST_C=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' "$d/sast.sarif")
-            SEM_L=$(jq '[.results[] | select(.extra.level=="INFO")] | length' "$d/semgrep.json")
-            SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' "$d/semgrep.json")
-            SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' "$d/semgrep.json")
-            SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' "$d/semgrep.json")
-            SBOM_L=$(cut -d',' -f1 "$d/sbom_counts.txt")
-            SBOM_M=$(cut -d',' -f2 "$d/sbom_counts.txt")
-            SBOM_H=$(cut -d',' -f3 "$d/sbom_counts.txt")
-            SBOM_C=$(cut -d',' -f4 "$d/sbom_counts.txt")
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
-            echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
+            if [ -d "$d" ]; then
+              repo=$(cat "$d/repo.txt")
+              SCA_L=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' "$d/sca.json")
+              SCA_M=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' "$d/sca.json")
+              SCA_H=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' "$d/sca.json")
+              SCA_C=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' "$d/sca.json")
+              SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$d/sast.sarif")
+              SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$d/sast.sarif")
+              SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$d/sast.sarif")
+              SAST_C=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' "$d/sast.sarif")
+              SEM_L=$(jq '[.results[] | select(.extra.level=="INFO")] | length' "$d/semgrep.json")
+              SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' "$d/semgrep.json")
+              SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' "$d/semgrep.json")
+              SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' "$d/semgrep.json")
+              SBOM_L=$(cut -d',' -f1 "$d/sbom_counts.txt")
+              SBOM_M=$(cut -d',' -f2 "$d/sbom_counts.txt")
+              SBOM_H=$(cut -d',' -f3 "$d/sbom_counts.txt")
+              SBOM_C=$(cut -d',' -f4 "$d/sbom_counts.txt")
+              TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
+              echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
+            fi
+          done
 
       - name: Upload summary
         uses: actions/upload-artifact@v4
