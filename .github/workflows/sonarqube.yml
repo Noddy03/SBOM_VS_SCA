@@ -1,4 +1,4 @@
-name: Top Repos Security Scan faster (SBOM Filtered)
+name: Top Repos Security Scan (SBOM Filtered)
 
 on:
   workflow_dispatch:
@@ -91,17 +91,18 @@ jobs:
           pip3 install semgrep
           npm install -g snyk
 
+      - name: Set safe repo name
+        run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
+
       - name: Clone repository safely
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
           mkdir -p project
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || exit 0
 
       - name: Run security scans
         run: |
-          SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
           mkdir -p results
           cd project || exit 0
 
@@ -134,8 +135,8 @@ jobs:
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
-          name: "repo-results-${{ github.run_id }}-${{ matrix.repo }}" 
-          path: all_results/${{ matrix.repo }}
+          name: "repo-results-${{ github.run_id }}-${{ env.SAFE_NAME }}"
+          path: all_results/${{ env.SAFE_NAME }}
 
   summarize:
     needs: scan_repo
