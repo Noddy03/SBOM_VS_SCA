@@ -141,11 +141,11 @@ jobs:
           mv results "all_results/$SAFE_NAME"
           rm -rf project
 
-      - name: Upload all repo results
+      - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
-          name: repo-results
-          path: all_results
+          name: "repo-results-${{ matrix.repo//\//-}}"
+          path: "all_results/${{ matrix.repo//\//-}}"
 
   summarize:
     needs: scan_repos
@@ -184,5 +184,5 @@ jobs:
       - name: Upload summary
         uses: actions/upload-artifact@v4
         with:
-          name: security-summary
+          name: "security-summary-${{ github.run_id }}"
           path: summary.csv
