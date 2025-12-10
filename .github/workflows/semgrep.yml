@@ -49,43 +49,53 @@ jobs:
           r.raise_for_status()
           repos = [item["full_name"] for item in r.json()["items"]]
 
-          print(",".join(repos))
           print(f"::set-output name=repos::{','.join(repos)}")
           EOF
 
-      - name: Detect repos with SBOM
+      - name: Detect SBOM repos
         id: filter
         env:
           REPOS: ${{ steps.fetch.outputs.repos }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir sbom-check
-          FILTERED=""
+          SBOM_REPOS=""
+
+          SBOM_PATTERNS="bom cyclonedx sbom spdx"
 
           IFS=',' read -ra REPO_ARRAY <<< "$REPOS"
           for repo in "${REPO_ARRAY[@]}"; do
               echo "Checking SBOM in $repo"
-
               git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo sbom-check/$repo || continue
-
               cd sbom-check/$repo
 
-              if ls **/*.{xml,json,spdx} 2>/dev/null | grep -Ei "(bom|cyclonedx|sbom|spdx)" >/dev/null; then
-                  FILTERED="$FILTERED,$repo"
-                  echo "→ SBOM FOUND in $repo"
+              FILES=$(find . -type f \( -iname "*.json" -o -iname "*.xml" -o -iname "*.spdx" \) 2>/dev/null)
+
+              HIT=0
+              for f in $FILES; do
+                for p in $SBOM_PATTERNS; do
+                  if echo "$f" | grep -qi "$p"; then
+                    HIT=1
+                  fi
+                done
+              done
+
+              if [ $HIT -eq 1 ]; then
+                echo "→ SBOM FOUND in $repo"
+                SBOM_REPOS="$SBOM_REPOS,$repo"
               else
-                  echo "→ No SBOM"
+                echo "→ No SBOM"
               fi
 
               cd ../../
           done
 
-          # Add test repos to guarantee vulnerabilities
-          FILTERED="$FILTERED,snyk/test-vulnerabilities-java,snyk/test-vulnerabilities-node"
+          # ALWAYS add known vulnerable repos
+          TEST_REPOS="snyk/test-vulnerabilities-java,snyk/test-vulnerabilities-node"
 
-          FILTERED="${FILTERED#,}"
-          echo "Filtered repos: $FILTERED"
-          echo "::set-output name=filtered::$FILTERED"
+          FINAL_LIST="${SBOM_REPOS#,},$TEST_REPOS"
+          echo "Final scan list: $FINAL_LIST"
+          echo "::set-output name=filtered::$FINAL_LIST"
 
       - name: Prepare summary.csv
         run: |
