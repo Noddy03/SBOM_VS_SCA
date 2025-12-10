@@ -106,9 +106,10 @@ jobs:
               git clone --depth 1 https://github.com/$repo project-src
               cd project-src || exit 1
 
-              # Dependency installation
+              # Dependency installation (handle Maven failures gracefully)
               if [ -f pom.xml ]; then
-                  mvn -B dependency:go-offline
+                  echo "Using Maven (allowing failures)..."
+                  mvn -B dependency:go-offline || echo "⚠ Could not fetch all Maven dependencies. Continuing scan..."
               elif [ -f package.json ]; then
                   npm ci || npm install
               elif [ -f requirements.txt ]; then
