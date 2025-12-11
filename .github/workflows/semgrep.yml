@@ -1,4 +1,4 @@
-name: Top Repos Security Scan  (SBOM Filtered)
+name: Top Repos Security Scan (SBOM Filtered)
 
 on:
   workflow_dispatch:
@@ -34,13 +34,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 <<'EOF'
-          import os, requests, urllib.parse, subprocess, tempfile, shutil, json
+          import os, requests, urllib.parse, tempfile, shutil, json, subprocess
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
           q = urllib.parse.quote(f"language:{lang}")
-          url = f"https://api.github.com/search/repositories?q={q}+language:Java&sort=stars&order=desc&per_page=100"
+          url = f"https://api.github.com/search/repositories?q={q}+language:{lang}&sort=stars&order=desc&per_page=100"
           r = requests.get(url, headers=headers)
           r.raise_for_status()
           items = r.json()["items"]
@@ -77,12 +77,6 @@ jobs:
   scan_repo:
     needs: fetch_repos
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
-    continue-on-error: true
-
     steps:
       - name: Install tools
         run: |
@@ -90,124 +84,133 @@ jobs:
           sudo apt-get install -y jq git npm python3-pip maven gradle
           pip3 install semgrep
           npm install -g snyk
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
-          echo "⚙️ Installing Grype safely..."
-          install_cmd="curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin"
-          for i in 1 2 3 4 5; do
-            if eval "$install_cmd"; then
-              if command -v grype >/dev/null; then
-                echo "Grype installed successfully"
-                break
-              fi
-            fi
-            sleep 3
-          done
-          if ! command -v grype >/dev/null; then
-            echo "❌ Failed to install Grype"
-            exit 1
-          fi
-
-      - name: Set safe repo name
-        run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
-
-      - name: Clone repository
+      - name: Clone and scan all repos
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p project
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || true
-
-      - name: Run SCA, SAST, Semgrep, SBOM per module
-        env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+          REPOS: ${{ needs.fetch_repos.outputs.repos }}
         run: |
           ROOT_DIR="$GITHUB_WORKSPACE/project"
           RESULT_DIR="$GITHUB_WORKSPACE/results"
           mkdir -p "$RESULT_DIR"
+          REPO_LIST=($(echo "$REPOS" | jq -r '.[]'))
 
-          # Prepare summary CSV for this repo
-          echo "module,sca_low,sca_medium,sca_high,sca_critical" > "$RESULT_DIR/sca_summary.csv"
+          for repo in "${REPO_LIST[@]}"; do
+            SAFE_NAME=$(echo "$repo" | tr '/' '-')
+            REPO_PATH="$ROOT_DIR/$SAFE_NAME"
+            mkdir -p "$REPO_PATH"
 
-          MODULE_FILES=$(find "$ROOT_DIR" -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
-          for module_file in $MODULE_FILES; do
-            MODULE_NAME=$(basename $(dirname "$module_file"))
-            MODULE_JSON="$RESULT_DIR/module_sca_$(echo $MODULE_NAME | tr '/' '-')".json
-            snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null || continue
+            echo "📥 Cloning $repo..."
+            git clone --depth 1 https://x-access-token:$TOKEN@github.com/$repo "$REPO_PATH" || continue
 
-            # Count severity per module
-            SCA_L=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="low")] | length' "$MODULE_JSON")
-            SCA_M=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="medium")] | length' "$MODULE_JSON")
-            SCA_H=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="high")] | length' "$MODULE_JSON")
-            SCA_C=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="critical")] | length' "$MODULE_JSON")
+            # SCA
+            SCA_CSV="$RESULT_DIR/sca_summary_$SAFE_NAME.csv"
+            echo "module,sca_low,sca_medium,sca_high,sca_critical" > "$SCA_CSV"
+            MODULE_FILES=$(find "$REPO_PATH" -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
+            for module_file in $MODULE_FILES; do
+              MODULE_NAME=$(basename $(dirname "$module_file"))
+              MODULE_JSON="$RESULT_DIR/module_sca_${SAFE_NAME}_${MODULE_NAME}.json"
+              snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null || echo '{"vulnerabilities":[]}' > "$MODULE_JSON"
 
-            echo "$MODULE_NAME,$SCA_L,$SCA_M,$SCA_H,$SCA_C" >> "$RESULT_DIR/sca_summary.csv"
+              SCA_L=$(jq '[.vulnerabilities[]? | (.severity // .vulnerability.severity // "unknown" | ascii_downcase) | select(.=="low")] | length' "$MODULE_JSON")
+              SCA_M=$(jq '[.vulnerabilities[]? | (.severity // .vulnerability.severity // "unknown" | ascii_downcase) | select(.=="medium")] | length' "$MODULE_JSON")
+              SCA_H=$(jq '[.vulnerabilities[]? | (.severity // .vulnerability.severity // "unknown" | ascii_downcase) | select(.=="high")] | length' "$MODULE_JSON")
+              SCA_C=$(jq '[.vulnerabilities[]? | (.severity // .vulnerability.severity // "unknown" | ascii_downcase) | select(.=="critical")] | length' "$MODULE_JSON")
+
+              echo "$MODULE_NAME,$SCA_L,$SCA_M,$SCA_H,$SCA_C" >> "$SCA_CSV"
+            done
+
+            # SAST
+            SAST_JSON="$RESULT_DIR/sast_$SAFE_NAME.sarif"
+            snyk code test --sarif > "$SAST_JSON" || echo '{"runs":[]}' > "$SAST_JSON"
+
+            # Semgrep
+            SEMGREP_JSON="$RESULT_DIR/semgrep_$SAFE_NAME.json"
+            semgrep --config p/ci --json > "$SEMGREP_JSON" || echo '{"results":[]}' > "$SEMGREP_JSON"
+
+            # SBOM
+            SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
+            SBOM_FILES=$(find "$REPO_PATH" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" -o -iname "*bom*.xml" \))
+            for sbom in $SBOM_FILES; do
+              SBOM_JSON="$RESULT_DIR/sbom_${SAFE_NAME}.json"
+              grype sbom:"$sbom" -o json > "$SBOM_JSON" || continue
+              SBOM_L=$(( SBOM_L + $(jq '[.matches[]? | select(.vulnerability.severity=="Low")] | length' "$SBOM_JSON") ))
+              SBOM_M=$(( SBOM_M + $(jq '[.matches[]? | select(.vulnerability.severity=="Medium")] | length' "$SBOM_JSON") ))
+              SBOM_H=$(( SBOM_H + $(jq '[.matches[]? | select(.vulnerability.severity=="High")] | length' "$SBOM_JSON") ))
+              SBOM_C=$(( SBOM_C + $(jq '[.matches[]? | select(.vulnerability.severity=="Critical")] | length' "$SBOM_JSON") ))
+            done
+            echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > "$RESULT_DIR/sbom_counts_$SAFE_NAME.txt"
+
+            # Zip per-repo results
+            zip -r "$RESULT_DIR/${SAFE_NAME}_results.zip" "$SCA_CSV" "$SAST_JSON" "$SEMGREP_JSON" "$RESULT_DIR/sbom_counts_$SAFE_NAME.txt"
           done
-
-          # SAST scan
-          SAST_JSON="$RESULT_DIR/sast.sarif"
-          snyk code test --sarif > "$SAST_JSON" || echo '{"runs":[]}' > "$SAST_JSON"
-
-          # Semgrep scan
-          SEMGREP_JSON="$RESULT_DIR/semgrep.json"
-          semgrep --config p/ci --json > "$SEMGREP_JSON" || echo '{"results":[]}' > "$SEMGREP_JSON"
-
-          # SBOM scan summary
-          SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOM_FILES=$(find "$ROOT_DIR" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
-                                                -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
-                                                -o -iname "*.spdx" -o -iname "*bom*.xml" \))
-          for sbom in $SBOM_FILES; do
-            SBOM_JSON="$RESULT_DIR/sbom_scan.json"
-            grype sbom:"$sbom" -o json > "$SBOM_JSON" || continue
-            SBOM_L=$(( SBOM_L + $(jq '[.matches[] | select(.vulnerability.severity=="Low")] | length' "$SBOM_JSON") ))
-            SBOM_M=$(( SBOM_M + $(jq '[.matches[] | select(.vulnerability.severity=="Medium")] | length' "$SBOM_JSON") ))
-            SBOM_H=$(( SBOM_H + $(jq '[.matches[] | select(.vulnerability.severity=="High")] | length' "$SBOM_JSON") ))
-            SBOM_C=$(( SBOM_C + $(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' "$SBOM_JSON") ))
-          done
-          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > "$RESULT_DIR/sbom_counts.txt"
 
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
-          name: "repo-results-${{ github.run_id }}-${{ env.SAFE_NAME }}"
-          path: results
+          name: "repo-results-${{ github.run_id }}"
+          path: results/*.zip
 
   summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all repo results
+        uses: actions/download-artifact@v4
         with:
           path: all_results
 
       - name: Generate summary.csv
         run: |
           echo "repo,module,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
-          for d in all_results/*; do
-            repo_name=$(echo "$d" | awk -F'-' '{print $1"/"$2}')
-            SCA_FILE="$d/sca_summary.csv"
+
+          for zipfile in all_results/*.zip; do
+            unzip -o "$zipfile" -d tmp_results
+            SAFE_NAME=$(basename "$zipfile" | sed 's/_results.zip//')
+            REPO_NAME=$(echo "$SAFE_NAME" | tr '-' '/')
+
+            SCA_FILE=$(find tmp_results -name "sca_summary_$SAFE_NAME.csv" | head -n1)
             [ ! -f "$SCA_FILE" ] && echo "module,0,0,0,0" > "$SCA_FILE"
+
             while IFS=',' read -r module sca_l sca_m sca_h sca_c; do
               [ "$module" == "module" ] && continue
+
               SAST_L=0; SAST_M=0; SAST_H=0; SAST_C=0
               SEM_L=0; SEM_M=0; SEM_H=0; SEM_C=0
               SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
 
-              SAST_FILE="$d/sast.sarif"
-              [ -f "$SAST_FILE" ] && SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$SAST_FILE") && SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$SAST_FILE") && SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SAST_FILE") && SAST_C=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' "$SAST_FILE")
+              SAST_FILE=$(find tmp_results -name "sast_$SAFE_NAME.sarif" | head -n1)
+              if [ -f "$SAST_FILE" ]; then
+                SAST_L=$(jq '[.runs[].results[]? | select(.level=="note")] | length' "$SAST_FILE")
+                SAST_M=$(jq '[.runs[].results[]? | select(.level=="warning")] | length' "$SAST_FILE")
+                SAST_H=$(jq '[.runs[].results[]? | select(.level=="error")] | length' "$SAST_FILE")
+                SAST_C=$(jq '[.runs[].results[]? | select(.ruleId | test("critical"))] | length' "$SAST_FILE")
+              fi
 
-              SEM_FILE="$d/semgrep.json"
-              [ -f "$SEM_FILE" ] && SEM_L=$(jq '[.results[] | select(.extra.level=="INFO")] | length' "$SEM_FILE") && SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' "$SEM_FILE") && SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' "$SEM_FILE") && SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' "$SEM_FILE")
+              SEM_FILE=$(find tmp_results -name "semgrep_$SAFE_NAME.json" | head -n1)
+              if [ -f "$SEM_FILE" ]; then
+                SEM_L=$(jq '[.results[]? | select(.extra.level=="INFO")] | length' "$SEM_FILE")
+                SEM_M=$(jq '[.results[]? | select(.extra.level=="WARNING")] | length' "$SEM_FILE")
+                SEM_H=$(jq '[.results[]? | select(.extra.level=="ERROR")] | length' "$SEM_FILE")
+                SEM_C=$(jq '[.results[]? | select(.check_id | test("critical|sql|xss|injection"))] | length' "$SEM_FILE")
+              fi
 
-              SBOM_FILE="$d/sbom_counts.txt"
-              [ -f "$SBOM_FILE" ] && SBOM_L=$(cut -d',' -f1 "$SBOM_FILE") && SBOM_M=$(cut -d',' -f2 "$SBOM_FILE") && SBOM_H=$(cut -d',' -f3 "$SBOM_FILE") && SBOM_C=$(cut -d',' -f4 "$SBOM_FILE")
+              SBOM_FILE=$(find tmp_results -name "sbom_counts_$SAFE_NAME.txt" | head -n1)
+              if [ -f "$SBOM_FILE" ]; then
+                IFS=',' read -r SBOM_L SBOM_M SBOM_H SBOM_C < "$SBOM_FILE"
+              fi
 
               TOTAL=$((sca_l+sca_m+sca_h+sca_c+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
-              echo "\"$repo_name\",\"$module\",$sca_l,$sca_m,$sca_h,$sca_c,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
+              echo "\"$REPO_NAME\",\"$module\",$sca_l,$sca_m,$sca_h,$sca_c,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
             done < "$SCA_FILE"
+
+            rm -rf tmp_results/*
           done
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload final summary
+        uses: actions/upload-artifact@v4
         with:
           name: "security-summary-${{ github.run_id }}"
           path: summary.csv
