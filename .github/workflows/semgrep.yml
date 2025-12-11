@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (SBOM Filtered)
+name: Top Repos Security Scan  (SBOM Filtered)
 
 on:
   workflow_dispatch:
@@ -90,9 +90,22 @@ jobs:
           sudo apt-get install -y jq git npm python3-pip maven gradle
           pip3 install semgrep
           npm install -g snyk
+
           echo "⚙️ Installing Grype safely..."
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-          grype version || echo "Grype installation failed"
+          install_cmd="curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin"
+          for i in 1 2 3 4 5; do
+            if eval "$install_cmd"; then
+              if command -v grype >/dev/null; then
+                echo "Grype installed successfully"
+                break
+              fi
+            fi
+            sleep 3
+          done
+          if ! command -v grype >/dev/null; then
+            echo "❌ Failed to install Grype"
+            exit 1
+          fi
 
       - name: Set safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
@@ -104,7 +117,7 @@ jobs:
           mkdir -p project
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || true
 
-      - name: Run security scans
+      - name: Run SCA, SAST, Semgrep, SBOM per module
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
@@ -112,25 +125,39 @@ jobs:
           RESULT_DIR="$GITHUB_WORKSPACE/results"
           mkdir -p "$RESULT_DIR"
 
-          # --- SCA scan using Snyk on all modules ---
-          SCA_JSON="$RESULT_DIR/sca.json"
-          snyk test --all-projects --json > "$SCA_JSON" || echo '{"vulnerabilities":[]}' > "$SCA_JSON"
+          # Prepare summary CSV for this repo
+          echo "module,sca_low,sca_medium,sca_high,sca_critical" > "$RESULT_DIR/sca_summary.csv"
 
-          # --- SAST scan ---
+          MODULE_FILES=$(find "$ROOT_DIR" -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
+          for module_file in $MODULE_FILES; do
+            MODULE_NAME=$(basename $(dirname "$module_file"))
+            MODULE_JSON="$RESULT_DIR/module_sca_$(echo $MODULE_NAME | tr '/' '-')".json
+            snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null || continue
+
+            # Count severity per module
+            SCA_L=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="low")] | length' "$MODULE_JSON")
+            SCA_M=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="medium")] | length' "$MODULE_JSON")
+            SCA_H=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="high")] | length' "$MODULE_JSON")
+            SCA_C=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="critical")] | length' "$MODULE_JSON")
+
+            echo "$MODULE_NAME,$SCA_L,$SCA_M,$SCA_H,$SCA_C" >> "$RESULT_DIR/sca_summary.csv"
+          done
+
+          # SAST scan
           SAST_JSON="$RESULT_DIR/sast.sarif"
           snyk code test --sarif > "$SAST_JSON" || echo '{"runs":[]}' > "$SAST_JSON"
 
-          # --- Semgrep scan ---
+          # Semgrep scan
           SEMGREP_JSON="$RESULT_DIR/semgrep.json"
           semgrep --config p/ci --json > "$SEMGREP_JSON" || echo '{"results":[]}' > "$SEMGREP_JSON"
 
-          # --- SBOM scan using existing SBOMs ---
+          # SBOM scan summary
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
           SBOM_FILES=$(find "$ROOT_DIR" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
                                                 -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
                                                 -o -iname "*.spdx" -o -iname "*bom*.xml" \))
           for sbom in $SBOM_FILES; do
-            SBOM_JSON="$RESULT_DIR/$(basename $sbom)_scan.json"
+            SBOM_JSON="$RESULT_DIR/sbom_scan.json"
             grype sbom:"$sbom" -o json > "$SBOM_JSON" || continue
             SBOM_L=$(( SBOM_L + $(jq '[.matches[] | select(.vulnerability.severity=="Low")] | length' "$SBOM_JSON") ))
             SBOM_M=$(( SBOM_M + $(jq '[.matches[] | select(.vulnerability.severity=="Medium")] | length' "$SBOM_JSON") ))
@@ -155,45 +182,29 @@ jobs:
 
       - name: Generate summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          echo "repo,module,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           for d in all_results/*; do
-            if [ -d "$d" ]; then
-              repo=$(cat "$d/repo.txt" || echo "$d")
-              SCA_JSON="$d/sca.json"
-              [ ! -f "$SCA_JSON" ] && echo '{"vulnerabilities":[]}' > "$SCA_JSON"
-              SAST_SARIF="$d/sast.sarif"
-              [ ! -f "$SAST_SARIF" ] && echo '{"runs":[]}' > "$SAST_SARIF"
-              SEM_JSON="$d/semgrep.json"
-              [ ! -f "$SEM_JSON" ] && echo '{"results":[]}' > "$SEM_JSON"
+            repo_name=$(echo "$d" | awk -F'-' '{print $1"/"$2}')
+            SCA_FILE="$d/sca_summary.csv"
+            [ ! -f "$SCA_FILE" ] && echo "module,0,0,0,0" > "$SCA_FILE"
+            while IFS=',' read -r module sca_l sca_m sca_h sca_c; do
+              [ "$module" == "module" ] && continue
+              SAST_L=0; SAST_M=0; SAST_H=0; SAST_C=0
+              SEM_L=0; SEM_M=0; SEM_H=0; SEM_C=0
+              SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
+
+              SAST_FILE="$d/sast.sarif"
+              [ -f "$SAST_FILE" ] && SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$SAST_FILE") && SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$SAST_FILE") && SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SAST_FILE") && SAST_C=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' "$SAST_FILE")
+
+              SEM_FILE="$d/semgrep.json"
+              [ -f "$SEM_FILE" ] && SEM_L=$(jq '[.results[] | select(.extra.level=="INFO")] | length' "$SEM_FILE") && SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' "$SEM_FILE") && SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' "$SEM_FILE") && SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' "$SEM_FILE")
+
               SBOM_FILE="$d/sbom_counts.txt"
-              if [ -f "$SBOM_FILE" ]; then
-                SBOM_L=$(cut -d',' -f1 "$SBOM_FILE")
-                SBOM_M=$(cut -d',' -f2 "$SBOM_FILE")
-                SBOM_H=$(cut -d',' -f3 "$SBOM_FILE")
-                SBOM_C=$(cut -d',' -f4 "$SBOM_FILE")
-              else
-                SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-              fi
+              [ -f "$SBOM_FILE" ] && SBOM_L=$(cut -d',' -f1 "$SBOM_FILE") && SBOM_M=$(cut -d',' -f2 "$SBOM_FILE") && SBOM_H=$(cut -d',' -f3 "$SBOM_FILE") && SBOM_C=$(cut -d',' -f4 "$SBOM_FILE")
 
-              # --- Robust SCA severity counting ---
-              SCA_L=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="low")] | length' "$SCA_JSON")
-              SCA_M=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="medium")] | length' "$SCA_JSON")
-              SCA_H=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="high")] | length' "$SCA_JSON")
-              SCA_C=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="critical")] | length' "$SCA_JSON")
-
-              SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$SAST_SARIF")
-              SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$SAST_SARIF")
-              SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SAST_SARIF")
-              SAST_C=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' "$SAST_SARIF")
-
-              SEM_L=$(jq '[.results[] | select(.extra.level=="INFO")] | length' "$SEM_JSON")
-              SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' "$SEM_JSON")
-              SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' "$SEM_JSON")
-              SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' "$SEM_JSON")
-
-              TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
-              echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
-            fi
+              TOTAL=$((sca_l+sca_m+sca_h+sca_c+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
+              echo "\"$repo_name\",\"$module\",$sca_l,$sca_m,$sca_h,$sca_c,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
+            done < "$SCA_FILE"
           done
 
       - uses: actions/upload-artifact@v4
