@@ -126,19 +126,23 @@ jobs:
         run: |
           mkdir -p results
           cd project || exit 0
-          # SCA
-          if ! snyk test --all-projects --detection-depth=8 --exclude=**/test,**/examples --json > ../sca.json; then
+
+          # --- SCA scan (scan all sub-projects) ---
+          if ! snyk test --all-sub-projects --detection-depth=8 --exclude=**/test,**/examples --json > ../sca.json; then
             echo '{"vulnerabilities":[]}' > ../sca.json
           fi
-          # SAST
+
+          # --- SAST scan ---
           if ! snyk code test --sarif > ../sast.sarif; then
             echo '{"runs":[]}' > ../sast.sarif
           fi
-          # Semgrep
+
+          # --- Semgrep scan ---
           if ! semgrep --config p/ci --json > ../semgrep.json; then
             echo '{"results":[]}' > ../semgrep.json
           fi
-          # SBOM scanning
+
+          # --- SBOM scanning ---
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
           SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
                                          -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
@@ -150,6 +154,7 @@ jobs:
             SBOM_H=$((SBOM_H + $(jq '[.matches[] | select(.vulnerability.severity=="High")] | length' ../sbom_scan.json)))
             SBOM_C=$((SBOM_C + $(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' ../sbom_scan.json)))
           done
+
           cd ..
           echo "${{ matrix.repo }}" > results/repo.txt
           cp sca.json results/ || true
