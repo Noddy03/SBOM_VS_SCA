@@ -103,11 +103,47 @@ jobs:
           pip3 install semgrep cyclonedx-bom
           npm install -g snyk
 
-          # --- RELIABLE GRYPE INSTALLATION (NO 504 ERRORS) ---
-          echo "deb [trusted=yes] https://download.anchore.io/grype/stable/deb/ /" \
-            | sudo tee -a /etc/apt/sources.list
-          sudo apt-get update
-          sudo apt-get install -y grype
+          # ==========================================================
+          #  STABLE GRYPE INSTALLER WITH RETRY + FALLBACK MIRRORS
+          # ==========================================================
+          install_grype() {
+            VERSION="v0.73.2"  # stable, avoids failing latest tags
+            FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
+
+            URLS=(
+              "https://github.com/anchore/grype/releases/download/${VERSION}/${FILE}"
+              "https://fastly.jsdelivr.net/gh/anchore/grype@${VERSION}/${FILE}"
+              "https://cdn.statically.io/gh/anchore/grype/${VERSION}/${FILE}"
+            )
+
+            for url in "${URLS[@]}"; do
+              echo "Trying: $url"
+              for i in {1..5}; do
+                curl -fSL "$url" -o grype.tgz && break
+                echo "Retry $i failed, retrying..."
+                sleep 2
+              done
+
+              if [ -f grype.tgz ]; then
+                echo "Download succeeded."
+                break
+              fi
+            done
+
+            if [ ! -f grype.tgz ]; then
+              echo "❌ Grype download failed from all mirrors"
+              exit 1
+            fi
+
+            tar -xzf grype.tgz
+            sudo mv grype /usr/local/bin/
+            rm -f grype.tgz
+
+            echo "Grype installed:"
+            grype version
+          }
+
+          install_grype
 
       - name: Safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
@@ -160,7 +196,7 @@ jobs:
 
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
 
-      # Zip per-repo results
+      # Zip results
       - name: Package results
         run: zip -r "${SAFE_NAME}.zip" results
 
