@@ -198,11 +198,11 @@ jobs:
                 SBOM_H=0
                 SBOM_C=0
               fi
-              # --- Correct SCA severity classification ---
-              SCA_L=$(jq '[.vulnerabilities[] | .sev = (.severity // .vulnerability.severity) | select(.sev=="low")] | length' "$SCA_JSON")
-              SCA_M=$(jq '[.vulnerabilities[] | .sev = (.severity // .vulnerability.severity) | select(.sev=="medium")] | length' "$SCA_JSON")
-              SCA_H=$(jq '[.vulnerabilities[] | .sev = (.severity // .vulnerability.severity) | select(.sev=="high")] | length' "$SCA_JSON")
-              SCA_C=$(jq '[.vulnerabilities[] | .sev = (.severity // .vulnerability.severity) | select(.sev=="critical")] | length' "$SCA_JSON")
+              # --- Fixed SCA severity classification ---
+              SCA_L=$(jq '[.vulnerabilities[] | .sev = ((.severity // .vulnerability.severity) | ascii_downcase) | select(.sev=="low")] | length' "$SCA_JSON")
+              SCA_M=$(jq '[.vulnerabilities[] | .sev = ((.severity // .vulnerability.severity) | ascii_downcase) | select(.sev=="medium")] | length' "$SCA_JSON")
+              SCA_H=$(jq '[.vulnerabilities[] | .sev = ((.severity // .vulnerability.severity) | ascii_downcase) | select(.sev=="high")] | length' "$SCA_JSON")
+              SCA_C=$(jq '[.vulnerabilities[] | .sev = ((.severity // .vulnerability.severity) | ascii_downcase) | select(.sev=="critical")] | length' "$SCA_JSON")
               SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$SAST_SARIF")
               SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$SAST_SARIF")
               SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SAST_SARIF")
