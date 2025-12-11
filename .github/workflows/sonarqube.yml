@@ -81,13 +81,13 @@ jobs:
               gh.write(f"repos={json.dumps(selected_repos or [])}\n")
           EOF
 
-  scan_repo:
+  scan_repos_sequentially:
     needs: fetch_repos
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
+      max-parallel: 1   # Sequential execution to save disk space
     continue-on-error: true
 
     steps:
@@ -103,41 +103,31 @@ jobs:
       - name: Set safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
 
-      - name: Clone repository safely
+      - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p project
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || exit 0
 
-      - name: Build Java project (Option A - automatic detection)
+      - name: Build Java project (Option A)
         run: |
           cd project || exit 0
 
           echo "🔍 Detecting build system..."
-
           if [ -f "./mvnw" ]; then
-            echo "➡ Maven Wrapper detected"
             chmod +x mvnw
             ./mvnw -B -DskipTests clean package || exit 1
-
           elif [ -f "pom.xml" ]; then
-            echo "➡ Maven project detected"
             mvn -B -DskipTests clean package || exit 1
-
           elif [ -f "./gradlew" ]; then
-            echo "➡ Gradle Wrapper detected"
             chmod +x gradlew
             ./gradlew build -x test || exit 1
-
           elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-            echo "➡ Gradle project detected"
             gradle build -x test || exit 1
-
           else
             echo "❌ No Java build system detected — skipping build"
           fi
-
           cd ..
 
       - name: Run security scans
@@ -147,33 +137,17 @@ jobs:
           mkdir -p results
           cd project || exit 0
 
-          echo "▶ Running Snyk SCA"
-          snyk test \
-            --all-projects \
-            --detection-depth=8 \
-            --exclude=**/test,**/examples \
-            --json > ../sca.json \
-            || echo '{"vulnerabilities":[]}' > ../sca.json
+          snyk test --all-projects --detection-depth=8 --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
+          snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
+          semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
-          echo "▶ Running Snyk Code (SAST)"
-          snyk code test --sarif > ../sast.sarif \
-            || echo '{"runs":[]}' > ../sast.sarif
-
-          echo "▶ Running Semgrep"
-          semgrep --config p/ci --json > ../semgrep.json \
-            || echo '{"results":[]}' > ../semgrep.json
-
-          echo "▶ Scanning SBOM files with Grype"
+          # SBOM scanning
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-
           SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
                                          -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
                                          -o -iname "*.spdx" -o -iname "*bom*.xml" \))
-
           for sbom in $SBOM_FILES; do
-            echo "Scanning SBOM with grype: $sbom"
             grype sbom:$sbom -o json > ../sbom_scan.json || continue
-
             SBOM_L=$((SBOM_L + $(jq '[.matches[] | select(.vulnerability.severity=="Low")] | length' ../sbom_scan.json)))
             SBOM_M=$((SBOM_M + $(jq '[.matches[] | select(.vulnerability.severity=="Medium")] | length' ../sbom_scan.json)))
             SBOM_H=$((SBOM_H + $(jq '[.matches[] | select(.vulnerability.severity=="High")] | length' ../sbom_scan.json)))
@@ -181,7 +155,6 @@ jobs:
           done
 
           cd ..
-
           echo "${{ matrix.repo }}" > results/repo.txt
           cp sca.json results/
           cp sast.sarif results/
@@ -190,7 +163,11 @@ jobs:
 
           mkdir -p all_results
           mv results all_results/$SAFE_NAME
+
+          # Cleanup caches and project folder to free space
           rm -rf project
+          rm -rf ~/.m2/repository
+          rm -rf ~/.gradle/caches
 
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
@@ -199,7 +176,7 @@ jobs:
           path: all_results/${{ env.SAFE_NAME }}
 
   summarize:
-    needs: scan_repo
+    needs: scan_repos_sequentially
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
