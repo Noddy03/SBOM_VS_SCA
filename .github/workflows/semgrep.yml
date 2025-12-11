@@ -51,12 +51,12 @@ jobs:
               full_name = repo["full_name"]
               tmpdir = tempfile.mkdtemp()
               try:
-                  proc = subprocess.run(
+                  result = subprocess.run(
                       ["git", "clone", "--depth", "1",
                        f"https://x-access-token:{token}@github.com/{full_name}", tmpdir],
                       stdout=subprocess.PIPE, stderr=subprocess.PIPE
                   )
-                  if proc.returncode != 0:
+                  if result.returncode != 0:
                       continue
                   sbom_files = subprocess.run(
                       ["find", tmpdir, "-type", "f",
@@ -91,10 +91,24 @@ jobs:
           pip3 install semgrep
           npm install -g snyk
 
-          # FIX: Reliable Grype install (no 503 or checksum failures)
-          echo "deb [trusted=yes] https://apt.fury.io/anchore/ /" | sudo tee /etc/apt/sources.list.d/anchore.list
-          sudo apt-get update
-          sudo apt-get install -y grype
+          echo "⚙️ Installing Grype safely with retries..."
+          install_cmd="curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin --fail-on-checksum=false"
+
+          for i in 1 2 3 4 5; do
+            echo "Attempt $i to install Grype..."
+            if eval "$install_cmd"; then
+              echo "Grype installed successfully"
+              grype version
+              break
+            fi
+            echo "Grype install failed on attempt $i"
+            sleep 3
+          done
+
+          if ! command -v grype >/dev/null; then
+            echo "❌ Failed to install Grype after 5 attempts"
+            exit 1
+          fi
 
       - name: Set safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
@@ -109,6 +123,7 @@ jobs:
       - name: Build Java project (automatic detection)
         run: |
           cd project || exit 0
+          echo "🔍 Detecting build system..."
           if [ -f "./mvnw" ]; then
             chmod +x mvnw
             ./mvnw -B -DskipTests clean package || true
@@ -130,33 +145,39 @@ jobs:
           RESULT_DIR="$GITHUB_WORKSPACE/results"
           mkdir -p "$RESULT_DIR"
 
-          # Init aggregated SCA JSON
+          # Prepare empty aggregated SCA JSON
           AGG_SCA="$RESULT_DIR/sca.json"
           echo '{"vulnerabilities":[]}' > "$AGG_SCA"
 
+          echo "📦 Scanning modules in $ROOT_DIR"
           MODULE_FILES=$(find "$ROOT_DIR" -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
+
           for module_file in $MODULE_FILES; do
+            echo "Scanning module: $module_file"
             MODULE_JSON="$RESULT_DIR/module_sca.json"
+
             if snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null; then
-              jq -s '{ vulnerabilities: (.[0].vulnerabilities + .[1].vulnerabilities) }' \
-                "$AGG_SCA" "$MODULE_JSON" > "$RESULT_DIR/tmp.json"
+              jq -s '{
+                vulnerabilities: (.[0].vulnerabilities + .[1].vulnerabilities)
+              }' "$AGG_SCA" "$MODULE_JSON" > "$RESULT_DIR/tmp.json"
               mv "$RESULT_DIR/tmp.json" "$AGG_SCA"
             fi
           done
 
-          # SAST
+          # SAST scan
           SAST_JSON="$RESULT_DIR/sast.sarif"
           snyk code test --sarif > "$SAST_JSON" || echo '{"runs":[]}' > "$SAST_JSON"
 
-          # Semgrep
+          # Semgrep scan
           SEMGREP_JSON="$RESULT_DIR/semgrep.json"
           semgrep --config p/ci --json > "$SEMGREP_JSON" || echo '{"results":[]}' > "$SEMGREP_JSON"
 
-          # SBOM scanning
+          # SBOM scan summary
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
           SBOM_FILES=$(find "$ROOT_DIR" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
                                                 -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
                                                 -o -iname "*.spdx" -o -iname "*bom*.xml" \))
+
           for sbom in $SBOM_FILES; do
             SBOM_JSON="$RESULT_DIR/sbom_scan.json"
             grype sbom:"$sbom" -o json > "$SBOM_JSON" || continue
@@ -167,13 +188,6 @@ jobs:
           done
 
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > "$RESULT_DIR/sbom_counts.txt"
-
-          # FIX: You never saved repo.txt → summary could not read repo name
-          echo "${{ matrix.repo }}" > "$RESULT_DIR/repo.txt"
-
-          # FIX: save results in the folder expected by upload-artifact
-          mkdir -p all_results/$SAFE_NAME
-          mv results/* all_results/$SAFE_NAME/
 
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
@@ -197,27 +211,10 @@ jobs:
               repo=$(cat "$d/repo.txt")
               SCA_JSON="$d/sca.json"
               [ ! -f "$SCA_JSON" ] && echo '{"vulnerabilities":[]}' > "$SCA_JSON"
-
-              # robust severity extraction
-              SCA_L=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="low")] | length' "$SCA_JSON")
-              SCA_M=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="medium")] | length' "$SCA_JSON")
-              SCA_H=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="high")] | length' "$SCA_JSON")
-              SCA_C=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="critical")] | length' "$SCA_JSON")
-
               SAST_SARIF="$d/sast.sarif"
               [ ! -f "$SAST_SARIF" ] && echo '{"runs":[]}' > "$SAST_SARIF"
-              SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$SAST_SARIF")
-              SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$SAST_SARIF")
-              SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SAST_SARIF")
-              SAST_C=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' "$SAST_SARIF")
-
               SEM_JSON="$d/semgrep.json"
               [ ! -f "$SEM_JSON" ] && echo '{"results":[]}' > "$SEM_JSON"
-              SEM_L=$(jq '[.results[] | select(.extra.level=="INFO")] | length' "$SEM_JSON")
-              SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' "$SEM_JSON")
-              SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' "$SEM_JSON")
-              SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' "$SEM_JSON")
-
               SBOM_FILE="$d/sbom_counts.txt"
               if [ -f "$SBOM_FILE" ]; then
                 SBOM_L=$(cut -d',' -f1 "$SBOM_FILE")
@@ -225,8 +222,27 @@ jobs:
                 SBOM_H=$(cut -d',' -f3 "$SBOM_FILE")
                 SBOM_C=$(cut -d',' -f4 "$SBOM_FILE")
               else
-                SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
+                SBOM_L=0
+                SBOM_M=0
+                SBOM_H=0
+                SBOM_C=0
               fi
+
+              # Robust SCA severity counting
+              SCA_L=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="low")] | length' "$SCA_JSON")
+              SCA_M=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="medium")] | length' "$SCA_JSON")
+              SCA_H=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="high")] | length' "$SCA_JSON")
+              SCA_C=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="critical")] | length' "$SCA_JSON")
+
+              SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$SAST_SARIF")
+              SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$SAST_SARIF")
+              SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SAST_SARIF")
+              SAST_C=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' "$SAST_SARIF")
+
+              SEM_L=$(jq '[.results[] | select(.extra.level=="INFO")] | length' "$SEM_JSON")
+              SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' "$SEM_JSON")
+              SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' "$SEM_JSON")
+              SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' "$SEM_JSON")
 
               TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
 
