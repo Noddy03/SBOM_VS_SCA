@@ -124,63 +124,56 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
-          mkdir -p results
-          cd project || exit 0
+          ROOT_DIR="$GITHUB_WORKSPACE/project"
+          RESULT_DIR="$GITHUB_WORKSPACE/results"
+          mkdir -p "$RESULT_DIR"
 
-          # --- Initialize empty JSON for aggregated SCA results ---
-          echo '{"vulnerabilities":[]}' > ../sca_agg.json
+          # Prepare empty aggregated SCA JSON
+          AGG_SCA="$RESULT_DIR/sca.json"
+          echo '{"vulnerabilities":[]}' > "$AGG_SCA"
 
-          # --- Find all pom.xml and build.gradle files (modules) ---
-          MODULE_FILES=$(find . -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
+          echo "Scanning modules in $ROOT_DIR"
+          MODULE_FILES=$(find "$ROOT_DIR" -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
 
-          # --- Scan each module individually ---
           for module_file in $MODULE_FILES; do
-            echo "Scanning module $module_file"
-            if snyk test --file="$module_file" --json > ../module_sca.json 2>/dev/null; then
-              # Merge vulnerabilities into aggregated JSON
-              jq -s '{vulnerabilities: map(.vulnerabilities) | add}' ../module_sca.json ../sca_agg.json > ../sca_tmp.json
-              mv ../sca_tmp.json ../sca_agg.json
+            echo "Scanning module: $module_file"
+
+            MODULE_JSON="$RESULT_DIR/module_sca.json"
+
+            if snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null; then
+              jq -s '{
+                vulnerabilities: (.[0].vulnerabilities + .[1].vulnerabilities)
+              }' "$AGG_SCA" "$MODULE_JSON" > "$RESULT_DIR/tmp.json"
+
+              mv "$RESULT_DIR/tmp.json" "$AGG_SCA"
             fi
           done
 
-          # Fallback if no vulnerabilities found
-          [ ! -s ../sca_agg.json ] && echo '{"vulnerabilities":[]}' > ../sca_agg.json
+          # SAST scan
+          SAST_JSON="$RESULT_DIR/sast.sarif"
+          snyk code test --sarif > "$SAST_JSON" || echo '{"runs":[]}' > "$SAST_JSON"
 
-          # --- Copy aggregated JSON to results ---
-          cp ../sca_agg.json results/sca.json
+          # Semgrep scan
+          SEMGREP_JSON="$RESULT_DIR/semgrep.json"
+          semgrep --config p/ci --json > "$SEMGREP_JSON" || echo '{"results":[]}' > "$SEMGREP_JSON"
 
-          # --- SAST scan ---
-          if ! snyk code test --sarif > ../sast.sarif; then
-            echo '{"runs":[]}' > ../sast.sarif
-          fi
-
-          # --- Semgrep scan ---
-          if ! semgrep --config p/ci --json > ../semgrep.json; then
-            echo '{"results":[]}' > ../semgrep.json
-          fi
-
-          # --- SBOM scanning ---
+          # SBOM scan summary
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
-                                         -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
-                                         -o -iname "*.spdx" -o -iname "*bom*.xml" \))
+          SBOM_FILES=$(find "$ROOT_DIR" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
+                                                -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
+                                                -o -iname "*.spdx" -o -iname "*bom*.xml" \))
+
           for sbom in $SBOM_FILES; do
-            grype sbom:$sbom -o json > ../sbom_scan.json || continue
-            SBOM_L=$((SBOM_L + $(jq '[.matches[] | select(.vulnerability.severity=="Low")] | length' ../sbom_scan.json)))
-            SBOM_M=$((SBOM_M + $(jq '[.matches[] | select(.vulnerability.severity=="Medium")] | length' ../sbom_scan.json)))
-            SBOM_H=$((SBOM_H + $(jq '[.matches[] | select(.vulnerability.severity=="High")] | length' ../sbom_scan.json)))
-            SBOM_C=$((SBOM_C + $(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' ../sbom_scan.json)))
+            SBOM_JSON="$RESULT_DIR/sbom_scan.json"
+            grype sbom:"$sbom" -o json > "$SBOM_JSON" || continue
+            SBOM_L=$(( SBOM_L + $(jq '[.matches[] | select(.vulnerability.severity=="Low")] | length' "$SBOM_JSON") ))
+            SBOM_M=$(( SBOM_M + $(jq '[.matches[] | select(.vulnerability.severity=="Medium")] | length' "$SBOM_JSON") ))
+            SBOM_H=$(( SBOM_H + $(jq '[.matches[] | select(.vulnerability.severity=="High")] | length' "$SBOM_JSON") ))
+            SBOM_C=$(( SBOM_C + $(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' "$SBOM_JSON") ))
           done
 
-          cd ..
-          echo "${{ matrix.repo }}" > results/repo.txt
-          cp sca.json results/ || true
-          cp sast.sarif results/ || true
-          cp semgrep.json results/ || true
-          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
-          mkdir -p all_results
-          mv results all_results/$SAFE_NAME
-          rm -rf project
+          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > "$RESULT_DIR/sbom_counts.txt"
+
 
 
       - name: Upload per-repo results
