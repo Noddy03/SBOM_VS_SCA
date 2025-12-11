@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (SBOM Filtered)
+name: Top Repos Security Scan MATRIX (SBOM Filtered)
 
 on:
   workflow_dispatch:
