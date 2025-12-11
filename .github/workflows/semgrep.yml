@@ -82,7 +82,7 @@ jobs:
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
     continue-on-error: true
-
+  
     steps:
       - name: Install tools
         run: |
@@ -90,89 +90,64 @@ jobs:
           sudo apt-get install -y jq git npm python3-pip maven gradle
           pip3 install semgrep
           npm install -g snyk
-
-      - name: Authenticate Snyk
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
-        run: snyk auth $SNYK_TOKEN
-
-      - name: Install Grype safely
-        run: |
-          echo "⚙️ Installing Grype with retries..."
-          for i in 1 2 3 4 5; do
-            if curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin; then
-              if command -v grype >/dev/null; then
-                echo "Grype installed successfully"
-                grype version
-                break
-              fi
-            fi
-            echo "❌ Grype install attempt $i failed"
-            sleep 3
-          done
-          if ! command -v grype >/dev/null; then
-            echo "❌ Failed to install Grype after 5 attempts"
-            exit 1
-          fi
-
+  
       - name: Set safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
-
+  
       - name: Clone repository safely
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p project
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || true
-
-      - name: Build Java project (automatic detection)
-        run: |
-          cd project || exit 0
-          echo "🔍 Detecting build system..."
-          if [ -f "./mvnw" ]; then
-            chmod +x mvnw
-            ./mvnw -B -DskipTests clean package || true
-          elif [ -f "pom.xml" ]; then
-            mvn -B -DskipTests clean package || true
-          elif [ -f "./gradlew" ]; then
-            chmod +x gradlew
-            ./gradlew build -x test || true
-          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-            gradle build -x test || true
-          fi
-          cd ..
-
-      - name: Run security scans
+  
+      - name: Build and scan Java modules safely
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           ROOT_DIR="$GITHUB_WORKSPACE/project"
           RESULT_DIR="$GITHUB_WORKSPACE/results"
           mkdir -p "$RESULT_DIR"
-
-          # Initialize empty aggregated SCA JSON
+  
+          # Prepare empty aggregated SCA JSON
           AGG_SCA="$RESULT_DIR/sca.json"
           echo '{"vulnerabilities":[]}' > "$AGG_SCA"
-
-          # Scan all Java modules
+  
+          echo "📦 Scanning modules in $ROOT_DIR"
           MODULE_FILES=$(find "$ROOT_DIR" -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
+  
           for module_file in $MODULE_FILES; do
+            echo "🔹 Checking module: $module_file"
+  
+            # Validate POM before scanning
+            if [[ "$module_file" == *.xml ]]; then
+              mvn -f "$module_file" validate -B >/dev/null 2>&1
+              if [ $? -ne 0 ]; then
+                echo "⚠️ Skipping unparseable POM: $module_file"
+                continue
+              fi
+            fi
+  
             MODULE_JSON="$RESULT_DIR/module_sca.json"
             if snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null; then
-              jq -s '{ vulnerabilities: (.[0].vulnerabilities + .[1].vulnerabilities) }' "$AGG_SCA" "$MODULE_JSON" > "$RESULT_DIR/tmp.json"
+              jq -s '{
+                vulnerabilities: (.[0].vulnerabilities + .[1].vulnerabilities)
+              }' "$AGG_SCA" "$MODULE_JSON" > "$RESULT_DIR/tmp.json"
               mv "$RESULT_DIR/tmp.json" "$AGG_SCA"
+            else
+              echo "⚠️ Snyk scan failed for module: $module_file"
             fi
           done
-
+  
           # SAST scan
           SAST_JSON="$RESULT_DIR/sast.sarif"
           snyk code test --sarif > "$SAST_JSON" || echo '{"runs":[]}' > "$SAST_JSON"
-
+  
           # Semgrep scan
           SEMGREP_JSON="$RESULT_DIR/semgrep.json"
           semgrep --config p/ci --json > "$SEMGREP_JSON" || echo '{"results":[]}' > "$SEMGREP_JSON"
-
-          # SBOM scan
+  
+          # SBOM scan summary
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
           SBOM_FILES=$(find "$ROOT_DIR" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
                                                 -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
@@ -186,7 +161,7 @@ jobs:
             SBOM_C=$(( SBOM_C + $(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' "$SBOM_JSON") ))
           done
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > "$RESULT_DIR/sbom_counts.txt"
-
+  
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
