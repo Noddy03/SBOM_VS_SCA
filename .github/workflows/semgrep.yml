@@ -84,6 +84,37 @@ jobs:
     continue-on-error: true
 
     steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq git npm python3-pip maven gradle
+          pip3 install semgrep
+          npm install -g snyk
+
+      - name: Authenticate Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+        run: snyk auth $SNYK_TOKEN
+
+      - name: Install Grype safely
+        run: |
+          echo "⚙️ Installing Grype with retries..."
+          for i in 1 2 3 4 5; do
+            if curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin; then
+              if command -v grype >/dev/null; then
+                echo "Grype installed successfully"
+                grype version
+                break
+              fi
+            fi
+            echo "❌ Grype install attempt $i failed"
+            sleep 3
+          done
+          if ! command -v grype >/dev/null; then
+            echo "❌ Failed to install Grype after 5 attempts"
+            exit 1
+          fi
+
       - name: Set safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
 
@@ -93,20 +124,6 @@ jobs:
         run: |
           mkdir -p project
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || true
-
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip maven gradle
-          pip3 install semgrep
-          npm install -g snyk
-          snyk auth $SNYK_TOKEN
-
-          echo "⚙️ Installing Grype binary..."
-          wget -q https://github.com/anchore/grype/releases/latest/download/grype_linux_amd64.tar.gz -O /tmp/grype.tar.gz
-          tar -xzf /tmp/grype.tar.gz -C /tmp/
-          sudo mv /tmp/grype /usr/local/bin/
-          grype version
 
       - name: Build Java project (automatic detection)
         run: |
@@ -125,39 +142,41 @@ jobs:
           fi
           cd ..
 
-      - name: Prepare per-repo result directory
-        run: |
-          mkdir -p all_results/${{ env.SAFE_NAME }}
-          echo "${{ matrix.repo }}" > all_results/${{ env.SAFE_NAME }}/repo.txt
-
       - name: Run security scans
         env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          SAFE_NAME: ${{ env.SAFE_NAME }}
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           ROOT_DIR="$GITHUB_WORKSPACE/project"
-          RESULT_DIR="$GITHUB_WORKSPACE/all_results/$SAFE_NAME"
+          RESULT_DIR="$GITHUB_WORKSPACE/results"
+          mkdir -p "$RESULT_DIR"
 
-          # Prepare empty aggregated SCA JSON
-          echo '{"vulnerabilities":[]}' > "$RESULT_DIR/sca.json"
+          # Initialize empty aggregated SCA JSON
+          AGG_SCA="$RESULT_DIR/sca.json"
+          echo '{"vulnerabilities":[]}' > "$AGG_SCA"
 
+          # Scan all Java modules
           MODULE_FILES=$(find "$ROOT_DIR" -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
           for module_file in $MODULE_FILES; do
             MODULE_JSON="$RESULT_DIR/module_sca.json"
-            snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null || echo '{"vulnerabilities":[]}' > "$MODULE_JSON"
-            jq -s '{ vulnerabilities: (.[0].vulnerabilities + .[1].vulnerabilities) }' "$RESULT_DIR/sca.json" "$MODULE_JSON" > "$RESULT_DIR/tmp.json"
-            mv "$RESULT_DIR/tmp.json" "$RESULT_DIR/sca.json"
+            if snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null; then
+              jq -s '{ vulnerabilities: (.[0].vulnerabilities + .[1].vulnerabilities) }' "$AGG_SCA" "$MODULE_JSON" > "$RESULT_DIR/tmp.json"
+              mv "$RESULT_DIR/tmp.json" "$AGG_SCA"
+            fi
           done
 
           # SAST scan
-          snyk code test --sarif > "$RESULT_DIR/sast.sarif" || echo '{"runs":[]}' > "$RESULT_DIR/sast.sarif"
+          SAST_JSON="$RESULT_DIR/sast.sarif"
+          snyk code test --sarif > "$SAST_JSON" || echo '{"runs":[]}' > "$SAST_JSON"
 
           # Semgrep scan
-          semgrep --config p/ci --json > "$RESULT_DIR/semgrep.json" || echo '{"results":[]}' > "$RESULT_DIR/semgrep.json"
+          SEMGREP_JSON="$RESULT_DIR/semgrep.json"
+          semgrep --config p/ci --json > "$SEMGREP_JSON" || echo '{"results":[]}' > "$SEMGREP_JSON"
 
-          # SBOM scan summary
+          # SBOM scan
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOM_FILES=$(find "$ROOT_DIR" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" -o -iname "*bom*.xml" \))
+          SBOM_FILES=$(find "$ROOT_DIR" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
+                                                -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
+                                                -o -iname "*.spdx" -o -iname "*bom*.xml" \))
           for sbom in $SBOM_FILES; do
             SBOM_JSON="$RESULT_DIR/sbom_scan.json"
             grype sbom:"$sbom" -o json > "$SBOM_JSON" || continue
@@ -172,7 +191,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: "repo-results-${{ github.run_id }}-${{ env.SAFE_NAME }}"
-          path: all_results/${{ env.SAFE_NAME }}
+          path: results
 
   summarize:
     needs: scan_repo
@@ -207,7 +226,7 @@ jobs:
                 SBOM_C=0
               fi
 
-              # Robust SCA severity counting
+              # Count SCA severities robustly
               SCA_L=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="low")] | length' "$SCA_JSON")
               SCA_M=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="medium")] | length' "$SCA_JSON")
               SCA_H=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="high")] | length' "$SCA_JSON")
@@ -224,7 +243,6 @@ jobs:
               SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' "$SEM_JSON")
 
               TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
-
               echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
             fi
           done
