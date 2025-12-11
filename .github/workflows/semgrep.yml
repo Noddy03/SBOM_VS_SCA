@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (SBOM Filtered)
+name: Top Repos Security Scan  (SBOM Filtered)
 
 on:
   workflow_dispatch:
@@ -82,7 +82,7 @@ jobs:
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
     continue-on-error: true
-  
+
     steps:
       - name: Install tools
         run: |
@@ -90,17 +90,36 @@ jobs:
           sudo apt-get install -y jq git npm python3-pip maven gradle
           pip3 install semgrep
           npm install -g snyk
-  
+
+          echo "⚙️ Installing Grype safely with retries..."
+          install_cmd="curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin"
+          for i in 1 2 3 4 5; do
+            echo "Attempt $i to install Grype..."
+            if eval "$install_cmd"; then
+              if command -v grype >/dev/null; then
+                echo "Grype installed successfully"
+                grype version
+                break
+              fi
+            fi
+            echo "❌ Grype install failed on attempt $i"
+            sleep 3
+          done
+          if ! command -v grype >/dev/null; then
+            echo "❌ Failed to install Grype after 5 attempts"
+            exit 1
+          fi
+
       - name: Set safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
-  
+
       - name: Clone repository safely
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p project
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || true
-  
+
       - name: Build and scan Java modules safely
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
@@ -108,26 +127,23 @@ jobs:
           ROOT_DIR="$GITHUB_WORKSPACE/project"
           RESULT_DIR="$GITHUB_WORKSPACE/results"
           mkdir -p "$RESULT_DIR"
-  
-          # Prepare empty aggregated SCA JSON
+
           AGG_SCA="$RESULT_DIR/sca.json"
           echo '{"vulnerabilities":[]}' > "$AGG_SCA"
-  
+
           echo "📦 Scanning modules in $ROOT_DIR"
           MODULE_FILES=$(find "$ROOT_DIR" -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
-  
+
           for module_file in $MODULE_FILES; do
             echo "🔹 Checking module: $module_file"
-  
-            # Validate POM before scanning
+
             if [[ "$module_file" == *.xml ]]; then
-              mvn -f "$module_file" validate -B >/dev/null 2>&1
-              if [ $? -ne 0 ]; then
+              mvn -f "$module_file" validate -B >/dev/null 2>&1 || {
                 echo "⚠️ Skipping unparseable POM: $module_file"
                 continue
-              fi
+              }
             fi
-  
+
             MODULE_JSON="$RESULT_DIR/module_sca.json"
             if snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null; then
               jq -s '{
@@ -138,15 +154,15 @@ jobs:
               echo "⚠️ Snyk scan failed for module: $module_file"
             fi
           done
-  
+
           # SAST scan
           SAST_JSON="$RESULT_DIR/sast.sarif"
           snyk code test --sarif > "$SAST_JSON" || echo '{"runs":[]}' > "$SAST_JSON"
-  
+
           # Semgrep scan
           SEMGREP_JSON="$RESULT_DIR/semgrep.json"
           semgrep --config p/ci --json > "$SEMGREP_JSON" || echo '{"results":[]}' > "$SEMGREP_JSON"
-  
+
           # SBOM scan summary
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
           SBOM_FILES=$(find "$ROOT_DIR" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
@@ -161,7 +177,7 @@ jobs:
             SBOM_C=$(( SBOM_C + $(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' "$SBOM_JSON") ))
           done
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > "$RESULT_DIR/sbom_counts.txt"
-  
+
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
@@ -195,13 +211,10 @@ jobs:
                 SBOM_H=$(cut -d',' -f3 "$SBOM_FILE")
                 SBOM_C=$(cut -d',' -f4 "$SBOM_FILE")
               else
-                SBOM_L=0
-                SBOM_M=0
-                SBOM_H=0
-                SBOM_C=0
+                SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
               fi
 
-              # Count SCA severities robustly
+              # Robust SCA severity counting
               SCA_L=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="low")] | length' "$SCA_JSON")
               SCA_M=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="medium")] | length' "$SCA_JSON")
               SCA_H=$(jq '[.vulnerabilities[] | (.severity // .vulnerability.severity // "unknown") | ascii_downcase | select(.=="high")] | length' "$SCA_JSON")
