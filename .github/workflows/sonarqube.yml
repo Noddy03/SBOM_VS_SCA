@@ -142,9 +142,6 @@ jobs:
 
           install_grype
 
-      - name: Safe repo name
-        run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
-
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -187,15 +184,15 @@ jobs:
       - name: Package results (always produces a zip)
         run: |
           mkdir -p results
-          # Add placeholder if results folder is empty
           [ -z "$(ls -A results)" ] && touch results/placeholder.txt
+          SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')
           ls -l results
           zip -r "${SAFE_NAME}.zip" results
 
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
-          name: "repo-results-${{ env.SAFE_NAME }}"
+          name: "repo-results-${{ matrix.repo }}"
           path: "${SAFE_NAME}.zip"
 
   summarize:
