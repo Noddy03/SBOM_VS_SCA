@@ -26,7 +26,7 @@ jobs:
       - name: Install Python and git
         run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git
 
-      - name: Fetch top N repositories with SBOM
+      - name: Fetch top N Java Maven repositories with SBOM
         id: set_output
         env:
           LANG_FILTER: ${{ inputs.language }}
@@ -40,14 +40,18 @@ jobs:
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
-          q = urllib.parse.quote(f"language:{lang}")
-          url = f"https://api.github.com/search/repositories?q={q}+filename:pom.xml&sort=stars&order=desc&per_page=100"
-          r = requests.get(url, headers=headers)
-          r.raise_for_status()
-          items = r.json().get("items", [])
+
+          # Fetch 200 repos (2 pages of 100 each)
+          repos = []
+          for page in range(1, 3):
+              q = urllib.parse.quote(f"language:{lang} filename:pom.xml")
+              url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=100&page={page}"
+              r = requests.get(url, headers=headers)
+              r.raise_for_status()
+              repos.extend(r.json().get("items", []))
 
           selected_repos = []
-          for repo in items:
+          for repo in repos:
               if len(selected_repos) >= top_n:
                   break
               full_name = repo["full_name"]
@@ -75,7 +79,6 @@ jobs:
               finally:
                   shutil.rmtree(tmpdir)
 
-          # Ensure at least one dummy value to avoid empty matrix errors
           if not selected_repos:
               selected_repos = ["__NO_REPO__"]
 
@@ -93,17 +96,14 @@ jobs:
     continue-on-error: true
 
     steps:
-      - name: Skip dummy repo
-        if: ${{ matrix.repo == '__NO_REPO__' }}
-        run: echo "No repositories found, skipping scan" && exit 0
-
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git npm python3-pip maven gradle
           pip3 install semgrep
           npm install -g snyk
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
 
       - name: Set safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
@@ -115,24 +115,24 @@ jobs:
           mkdir -p project
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || exit 0
 
-      - name: Build Java project (safe)
+      - name: Build Java project (automatic detection)
         run: |
           cd project || exit 0
           echo "🔍 Detecting build system..."
           if [ -f "./mvnw" ]; then
             echo "➡ Maven Wrapper detected"
             chmod +x mvnw
-            ./mvnw -B -DskipTests clean package || echo "⚠ Maven build failed, continuing"
+            ./mvnw -B -DskipTests clean package || exit 1
           elif [ -f "pom.xml" ]; then
             echo "➡ Maven project detected"
-            mvn -B -DskipTests clean package || echo "⚠ Maven build failed, continuing"
+            mvn -B -DskipTests clean package || exit 1
           elif [ -f "./gradlew" ]; then
             echo "➡ Gradle Wrapper detected"
             chmod +x gradlew
-            ./gradlew assembleDebug -x test || echo "⚠ Gradle build failed, continuing"
+            ./gradlew build -x test || exit 1
           elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
             echo "➡ Gradle project detected"
-            gradle assembleDebug -x test || echo "⚠ Gradle build failed, continuing"
+            gradle build -x test || exit 1
           else
             echo "❌ No Java build system detected — skipping build"
           fi
@@ -144,20 +144,16 @@ jobs:
         run: |
           mkdir -p results
           cd project || exit 0
-
-          # Snyk SCA
           snyk test --all-projects --detection-depth=8 --exclude=**/test,**/examples --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
-
-          # Snyk Code (SAST)
           snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
-
-          # Semgrep
           semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
-          # SBOM scanning
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" -o -iname "*bom*.xml" \))
+          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
+                                         -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
+                                         -o -iname "*.spdx" -o -iname "*bom*.xml" \))
           for sbom in $SBOM_FILES; do
+            echo "Scanning SBOM with grype: $sbom"
             grype sbom:$sbom -o json > ../sbom_scan.json || continue
             SBOM_L=$((SBOM_L + $(jq '[.matches[] | select(.vulnerability.severity=="Low")] | length' ../sbom_scan.json)))
             SBOM_M=$((SBOM_M + $(jq '[.matches[] | select(.vulnerability.severity=="Medium")] | length' ../sbom_scan.json)))
