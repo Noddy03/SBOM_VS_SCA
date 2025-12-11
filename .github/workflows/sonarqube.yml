@@ -107,7 +107,7 @@ jobs:
           #  STABLE GRYPE INSTALLER WITH RETRY + FALLBACK MIRRORS
           # ==========================================================
           install_grype() {
-            VERSION="v0.73.2"  # stable, avoids failing latest tags
+            VERSION="v0.73.2"
             FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
 
             URLS=(
@@ -151,10 +151,8 @@ jobs:
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      # ---------------- FULL SNYK SCAN ----------------
       - name: SCA - Snyk Open Source (FULL SCAN)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
@@ -196,7 +194,6 @@ jobs:
 
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
 
-      # Zip results
       - name: Package results
         run: zip -r "${SAFE_NAME}.zip" results
 
@@ -219,42 +216,45 @@ jobs:
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
 
-          for zipfile in all_results/*.zip; do
-            SAFE=$(basename "$zipfile" | sed 's/.zip//')
-            REPO=$(echo "$SAFE" | sed 's/repo-results-//')
+          shopt -s globstar
+          for zipfile in all_results/**/*.zip; do
+              [ -e "$zipfile" ] || continue
 
-            mkdir temp
-            unzip -o "$zipfile" -d temp
+              SAFE=$(basename "$zipfile" | sed 's/.zip//')
+              REPO=$(echo "$SAFE" | sed 's/repo-results-//')
 
-            # ---------- SCA ----------
-            SCA_L=$(jq '[.vulnerabilities[]?|select(.severity=="low")] | length' temp/results/sca.json)
-            SCA_M=$(jq '[.vulnerabilities[]?|select(.severity=="medium")] | length' temp/results/sca.json)
-            SCA_H=$(jq '[.vulnerabilities[]?|select(.severity=="high")] | length' temp/results/sca.json)
-            SCA_C=$(jq '[.vulnerabilities[]?|select(.severity=="critical")] | length' temp/results/sca.json)
+              mkdir temp
+              unzip -o "$zipfile" -d temp
 
-            # ---------- SAST ----------
-            SAST_L=$(jq '[.runs[].results[]?|select(.level=="note")] | length' temp/results/sast.sarif)
-            SAST_M=$(jq '[.runs[].results[]?|select(.level=="warning")] | length' temp/results/sast.sarif)
-            SAST_H=$(jq '[.runs[].results[]?|select(.level=="error")] | length' temp/results/sast.sarif)
-            SAST_C=$(jq '[.runs[].results[]?|select(.ruleId|test("critical"))] | length' temp/results/sast.sarif)
+              # ---------- SCA ----------
+              SCA_L=$(jq '[.vulnerabilities[]?|select(.severity=="low")] | length' temp/results/sca.json)
+              SCA_M=$(jq '[.vulnerabilities[]?|select(.severity=="medium")] | length' temp/results/sca.json)
+              SCA_H=$(jq '[.vulnerabilities[]?|select(.severity=="high")] | length' temp/results/sca.json)
+              SCA_C=$(jq '[.vulnerabilities[]?|select(.severity=="critical")] | length' temp/results/sca.json)
 
-            # ---------- SEMGREP ----------
-            SEM_L=$(jq '[.results[]?|select(.extra.level=="INFO")] | length' temp/results/semgrep.json)
-            SEM_M=$(jq '[.results[]?|select(.extra.level=="WARNING")] | length' temp/results/semgrep.json)
-            SEM_H=$(jq '[.results[]?|select(.extra.level=="ERROR")] | length' temp/results/semgrep.json)
-            SEM_C=$(jq '[.results[]?|select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
+              # ---------- SAST ----------
+              SAST_L=$(jq '[.runs[].results[]?|select(.level=="note")] | length' temp/results/sast.sarif)
+              SAST_M=$(jq '[.runs[].results[]?|select(.level=="warning")] | length' temp/results/sast.sarif)
+              SAST_H=$(jq '[.runs[].results[]?|select(.level=="error")] | length' temp/results/sast.sarif)
+              SAST_C=$(jq '[.runs[].results[]?|select(.ruleId|test("critical"))] | length' temp/results/sast.sarif)
 
-            # ---------- SBOM ----------
-            IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
+              # ---------- SEMGREP ----------
+              SEM_L=$(jq '[.results[]?|select(.extra.level=="INFO")] | length' temp/results/semgrep.json)
+              SEM_M=$(jq '[.results[]?|select(.extra.level=="WARNING")] | length' temp/results/semgrep.json)
+              SEM_H=$(jq '[.results[]?|select(.extra.level=="ERROR")] | length' temp/results/semgrep.json)
+              SEM_C=$(jq '[.results[]?|select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
 
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C +
-                     SAST_L+SAST_M+SAST_H+SAST_C +
-                     SEM_L+SEM_M+SEM_H+SEM_C +
-                     SBOM_L+SBOM_M+SBOM_H+SBOM_C))
+              # ---------- SBOM ----------
+              IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
 
-            echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
+              TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C +
+                       SAST_L+SAST_M+SAST_H+SAST_C +
+                       SEM_L+SEM_M+SEM_H+SEM_C +
+                       SBOM_L+SBOM_M+SBOM_H+SBOM_C))
 
-            rm -rf temp
+              echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
+
+              rm -rf temp
           done
 
       - uses: actions/upload-artifact@v4
