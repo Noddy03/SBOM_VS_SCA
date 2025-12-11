@@ -90,7 +90,8 @@ jobs:
           sudo apt-get install -y jq git npm python3-pip maven gradle
           pip3 install semgrep
           npm install -g snyk
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
 
       - name: Set safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
@@ -197,11 +198,11 @@ jobs:
                 SBOM_H=0
                 SBOM_C=0
               fi
-              # FIXED SCA severity counting
-              SCA_L=$(jq '[.vulnerabilities[] | select(.severity=="low" or .vulnerability.severity=="low")] | length' "$SCA_JSON")
-              SCA_M=$(jq '[.vulnerabilities[] | select(.severity=="medium" or .vulnerability.severity=="medium")] | length' "$SCA_JSON")
-              SCA_H=$(jq '[.vulnerabilities[] | select(.severity=="high" or .vulnerability.severity=="high")] | length' "$SCA_JSON")
-              SCA_C=$(jq '[.vulnerabilities[] | select(.severity=="critical" or .vulnerability.severity=="critical")] | length' "$SCA_JSON")
+              # --- Correct SCA severity classification ---
+              SCA_L=$(jq '[.vulnerabilities[] | .sev = (.severity // .vulnerability.severity) | select(.sev=="low")] | length' "$SCA_JSON")
+              SCA_M=$(jq '[.vulnerabilities[] | .sev = (.severity // .vulnerability.severity) | select(.sev=="medium")] | length' "$SCA_JSON")
+              SCA_H=$(jq '[.vulnerabilities[] | .sev = (.severity // .vulnerability.severity) | select(.sev=="high")] | length' "$SCA_JSON")
+              SCA_C=$(jq '[.vulnerabilities[] | .sev = (.severity // .vulnerability.severity) | select(.sev=="critical")] | length' "$SCA_JSON")
               SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$SAST_SARIF")
               SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$SAST_SARIF")
               SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SAST_SARIF")
