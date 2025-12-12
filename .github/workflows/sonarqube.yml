@@ -63,7 +63,7 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # Install tools and persist PATH for cyclonedx-bom
+      # Install tools and fix PATH for cyclonedx-bom
       ###########################################################################
       - name: Install security tools
         run: |
@@ -72,9 +72,12 @@ jobs:
           npm install -g snyk
           pip3 install --user cyclonedx-bom semgrep
 
-          # Persist ~/.local/bin in PATH across all steps
+          # Add to PATH for current shell
+          export PATH="$HOME/.local/bin:$PATH"
+          # Persist PATH for future steps
           echo "PATH=$HOME/.local/bin:$PATH" >> $GITHUB_ENV
 
+          # Install Grype
           VERSION="v0.73.2"
           FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
           curl -L "https://github.com/anchore/grype/releases/download/$VERSION/$FILE" -o grype.tgz
@@ -82,7 +85,7 @@ jobs:
           chmod +x grype
           sudo mv grype /usr/local/bin/
 
-          echo "Tool versions:"
+          # Verify versions
           snyk --version
           grype version
           semgrep --version
