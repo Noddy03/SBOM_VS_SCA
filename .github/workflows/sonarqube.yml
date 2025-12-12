@@ -237,10 +237,10 @@ jobs:
               SAST_C=$(jq '[.runs[].results[]?|select(.ruleId|test("critical"))] | length' temp/results/sast.sarif)
 
               # ---------- SEMGREP ----------
-              SEM_L=$(jq '[.results[]?|select(.extra.level=="INFO")] | length' temp/results/semgrep.json)
-              SEM_M=$(jq '[.results[]?|select(.extra.level=="WARNING")] | length' temp/results/semgrep.json)
-              SEM_H=$(jq '[.results[]?|select(.extra.level=="ERROR")] | length' temp/results/semgrep.json)
-              SEM_C=$(jq '[.results[]?|select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
+              SEM_L=$(jq '[.results[]? | select((.extra.level // .extra.severity // "") | ascii_downcase=="info")] | length' temp/results/semgrep.json)
+              SEM_M=$(jq '[.results[]? | select((.extra.level // .extra.severity // "") | ascii_downcase=="warning")] | length' temp/results/semgrep.json)
+              SEM_H=$(jq '[.results[]? | select((.extra.level // .extra.severity // "") | ascii_downcase=="error")] | length' temp/results/semgrep.json)
+              SEM_C=$(jq '[.results[]? | select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
 
               # ---------- SBOM ----------
               IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
