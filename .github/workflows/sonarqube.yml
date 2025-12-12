@@ -110,10 +110,7 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      # --------------------------------------------------------------------
-      # SCA - FIXED: Now works for multi-project output & returns ALL severities
-      # --------------------------------------------------------------------
-      - name: SCA - Multi-manifest Snyk Scan (FIXED)
+      - name: SCA - Multi-manifest Snyk Scan (FULLY FIXED)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
@@ -135,14 +132,35 @@ jobs:
               -name 'Dockerfile' \
           \) )
 
+          # We build a VALID JSON array
           echo "[]" > results/sca_raw.json
 
           for f in $FILES; do
-            snyk test --file="$f" --json >> results/sca_raw.json || true
+            echo "Scanning $f..."
+            
+            TMP=$(mktemp)
+            snyk test --file="$f" --json > "$TMP" || echo "{}" > "$TMP"
+
+            # Append this JSON object to sca_raw.json array
+            jq -s '.[0] + [.[1]]' results/sca_raw.json "$TMP" > results/sca_tmp.json
+            mv results/sca_tmp.json results/sca_raw.json
+            rm "$TMP"
           done
 
-          jq -s 'map(.vulnerabilities // []) | add // [] | { vulnerabilities: . }' \
-            results/sca_raw.json > results/sca.json
+          # Normalize Snyk output → extract ALL vulnerabilities (low/med/high/critical)
+          jq '
+            # sca_raw.json is now ALWAYS a clean array
+            map(
+              if type == "object" and has("vulnerabilities") then
+                .vulnerabilities
+              else
+                []
+              end
+            )
+            | add 
+            | { vulnerabilities: . }
+          ' results/sca_raw.json > results/sca.json
+
 
       # --------------------------------------------------------------------
       # SAST
