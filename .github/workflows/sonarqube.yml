@@ -18,9 +18,6 @@ permissions:
 
 jobs:
 
-  # ----------------------------------------------------------------------
-  # FETCH REPOS
-  # ----------------------------------------------------------------------
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -56,8 +53,8 @@ jobs:
                   break
 
               name = repo["full_name"]
-
               tmp = tempfile.mkdtemp()
+
               try:
                   subprocess.run(
                       ["git", "clone", "--depth", "1", f"https://x-access-token:{token}@github.com/{name}", tmp],
@@ -68,7 +65,8 @@ jobs:
                       ["find", tmp, "-type", "f",
                        "-iname", "*bom*.json", "-o", "-iname", "*cyclonedx*.json",
                        "-o", "-iname", "*.cdx.json", "-o", "-iname", "*.spdx.json", "-o", "-iname", "*.spdx"],
-                      stdout=subprocess.PIPE).stdout.decode().strip()
+                      stdout=subprocess.PIPE
+                  ).stdout.decode().strip()
 
                   if sbom:
                       repos.append(name)
@@ -80,9 +78,6 @@ jobs:
               gh.write(f"repos={json.dumps(repos)}\n")
           EOF
 
-  # ----------------------------------------------------------------------
-  # SCAN REPO MATRIX
-  # ----------------------------------------------------------------------
   scan_repo:
     needs: fetch_repos
     runs-on: ubuntu-latest
@@ -104,7 +99,6 @@ jobs:
           pip3 install semgrep cyclonedx-bom
           npm install -g snyk
 
-          # Install grype
           VERSION="v0.73.2"
           FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
           curl -L "https://github.com/anchore/grype/releases/download/$VERSION/$FILE" -o grype.tgz
@@ -116,7 +110,9 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      # --------------------- FIX: SCA now finds ALL severities -----------------------
+      # --------------------------------------------------------------------
+      # SCA - FIXED: Now works for multi-project output & returns ALL severities
+      # --------------------------------------------------------------------
       - name: SCA - Multi-manifest Snyk Scan (FIXED)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
@@ -140,33 +136,35 @@ jobs:
           \) )
 
           echo "[]" > results/sca_raw.json
+
           for f in $FILES; do
             snyk test --file="$f" --json >> results/sca_raw.json || true
           done
 
-          jq -s 'map(.vulnerabilities // []) | add' results/sca_raw.json > results/sca.json
+          jq -s 'map(.vulnerabilities // []) | add // [] | { vulnerabilities: . }' \
+            results/sca_raw.json > results/sca.json
 
-      # ----------------------------------------------------------------------
+      # --------------------------------------------------------------------
       # SAST
-      # ----------------------------------------------------------------------
+      # --------------------------------------------------------------------
       - name: SAST - Snyk Code
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          snyk code test --sarif --all-projects > results/sast.sarif || \
-            echo '{"runs":[]}' > results/sast.sarif
+          snyk code test --sarif --all-projects > results/sast.sarif \
+            || echo '{"runs":[]}' > results/sast.sarif
 
-      # ----------------------------------------------------------------------
+      # --------------------------------------------------------------------
       # SEMGREP
-      # ----------------------------------------------------------------------
+      # --------------------------------------------------------------------
       - name: Semgrep
         run: |
-          semgrep --config p/ci --json > results/semgrep.json || \
-            echo '{"results":[]}' > results/semgrep.json
+          semgrep --config p/ci --json > results/semgrep.json \
+            || echo '{"results":[]}' > results/semgrep.json
 
-      # ----------------------------------------------------------------------
-      # SBOM SCAN (FIXED)
-      # ----------------------------------------------------------------------
+      # --------------------------------------------------------------------
+      # SBOM - FIXED
+      # --------------------------------------------------------------------
       - name: SBOM scanning (FIXED)
         run: |
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
@@ -185,14 +183,14 @@ jobs:
             SBOM_H=$(( SBOM_H + $(jq '[.matches[]?|select(.vulnerability.severity=="High")] | length' "$TMP") ))
             SBOM_C=$(( SBOM_C + $(jq '[.matches[]?|select(.vulnerability.severity=="Critical")] | length' "$TMP") ))
 
-            rm -f "$TMP"
+            rm "$TMP"
           done
 
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
 
-      # ----------------------------------------------------------------------
-      # ZIP & ARTIFACT
-      # ----------------------------------------------------------------------
+      # --------------------------------------------------------------------
+      # Package results
+      # --------------------------------------------------------------------
       - name: Package results
         run: |
           SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
@@ -205,7 +203,7 @@ jobs:
           path: "${{ env.SAFE_NAME }}.zip"
 
   # ----------------------------------------------------------------------
-  # SUMMARY
+  # SUMMARY JOB (FULLY FIXED)
   # ----------------------------------------------------------------------
   summarize:
     needs: scan_repo
@@ -218,7 +216,7 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
 
           shopt -s globstar
           for zipfile in all_results/**/*.zip; do
@@ -228,23 +226,26 @@ jobs:
               mkdir temp
               unzip -o "$zipfile" -d temp >/dev/null
 
-              SCA_L=$(jq '[.[]|select(.severity=="low")] | length' temp/results/sca.json)
-              SCA_M=$(jq '[.[]|select(.severity=="medium")] | length' temp/results/sca.json)
-              SCA_H=$(jq '[.[]|select(.severity=="high")] | length' temp/results/sca.json)
-              SCA_C=$(jq '[.[]|select(.severity=="critical")] | length' temp/results/sca.json)
+              # ---- FIXED: SCA Summary ----
+              SCA_L=$(jq '.vulnerabilities | map(select(.severity=="low")) | length' temp/results/sca.json)
+              SCA_M=$(jq '.vulnerabilities | map(select(.severity=="medium")) | length' temp/results/sca.json)
+              SCA_H=$(jq '.vulnerabilities | map(select(.severity=="high")) | length' temp/results/sca.json)
+              SCA_C=$(jq '.vulnerabilities | map(select(.severity=="critical")) | length' temp/results/sca.json)
 
-              SAST_L=0; SAST_M=0; SAST_H=0; SAST_C=0
-
+              # ---- SEMGREP ----
               SEM_L=$(jq '[.results[]?|select(.extra.severity=="INFO")] | length' temp/results/semgrep.json)
               SEM_M=$(jq '[.results[]?|select(.extra.severity=="WARNING")] | length' temp/results/semgrep.json)
               SEM_H=$(jq '[.results[]?|select(.extra.severity=="ERROR")] | length' temp/results/semgrep.json)
+
+              # heuristically capture criticals
               SEM_C=$(jq '[.results[]?|select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
 
+              # ---- SBOM ----
               IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
 
               TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C + SEM_L+SEM_M+SEM_H+SEM_C + SBOM_L+SBOM_M+SBOM_H+SBOM_C))
 
-              echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
+              echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
 
               rm -rf temp
           done
