@@ -105,14 +105,21 @@ jobs:
       ###########################################################################
       # SCA - Cleaned (All real vulns, minimal noise)
       ###########################################################################
-      - name: SCA - Cleaned (Option B)
+      - name: SCA - Cleaned (Option B, robust)
         run: |
           echo "Cleaning SCA results (Option B)…"
 
-          # Step 1 — Keep:
-          #  - LOW only if CVE exists
-          #  - MEDIUM/HIGH/CRITICAL always (even without identifiers)
-          #  - remove ignored/patched/no-package/no-version
+          # Normalize Snyk output: if array, merge vulnerabilities; if object, keep vulnerabilities
+          jq '
+            if type=="array" then
+              map(.vulnerabilities // []) | add
+            else
+              .vulnerabilities // []
+            end
+            | { vulnerabilities: . }
+          ' results/sca_raw.json > results/sca_normalized.json
+
+          # Step 1 — keep all medium/high/critical, low only if CVE
           jq '
             .vulnerabilities |= map(
               select(
@@ -121,45 +128,38 @@ jobs:
                 and (.packageName != null)
                 and (.version != null)
                 and (.packageName != "")
-
                 and (
-                  # LOW severity keeps only real CVE-based ones
-                  (
-                    (.severity|ascii_downcase) == "low"
+                  # LOW → only if CVE
+                  ((.severity|ascii_downcase=="low")
                     and (.identifiers | type=="object")
                     and (.identifiers.CVE | type=="array")
-                    and ((.identifiers.CVE | length) > 0)
-                  )
-                  # MEDIUM/HIGH/CRITICAL → keep ALL (Option B)
+                    and ((.identifiers.CVE | length) > 0))
+                  # MEDIUM/HIGH/CRITICAL → always keep
                   or ((.severity|ascii_downcase) == "medium")
                   or ((.severity|ascii_downcase) == "high")
                   or ((.severity|ascii_downcase) == "critical")
                 )
               )
             )
-          ' results/sca_raw.json > results/sca_clean_step1.json
+          ' results/sca_normalized.json > results/sca_clean_step1.json
 
-          # Step 2 — Remove noise packages (very important)
+          # Step 2 — remove noise packages
           jq '
             .vulnerabilities |= map(
               select(
-                (.packageName | test("test"; "i") | not)
-                and (.packageName | test("mock"; "i") | not)
-                and (.packageName | test("sample"; "i") | not)
-                and (.packageName | test("example"; "i") | not)
-                and (.packageName | test("fixture"; "i") | not)
+                (.packageName | test("test|mock|sample|example|fixture"; "i") | not)
               )
             )
           ' results/sca_clean_step1.json > results/sca_clean_step2.json
 
-          # Step 3 — Deduplicate by package + version + vuln ID
+          # Step 3 — deduplicate by package + version + id
           jq '
             .vulnerabilities |= unique_by(
               (.packageName + ":" + .version + ":" + (.id // "noid"))
             )
           ' results/sca_clean_step2.json > results/sca_cleaned.json
 
-          rm results/sca_clean_step1.json results/sca_clean_step2.json
+          rm -f results/sca_normalized.json results/sca_clean_step1.json results/sca_clean_step2.json
 
       ###########################################################################
       # SAST
