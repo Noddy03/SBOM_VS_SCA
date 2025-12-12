@@ -176,11 +176,15 @@ jobs:
                                          -o -iname "*.spdx.json" \
                                          -o -iname "*.spdx")
           for sb in $SBOMS; do
-            grype sbom:"$sb" -o json > results/sbom.json || continue
-            SBOM_L=$(( SBOM_L + $(jq '[.matches[]?|select(.vulnerability.severity=="Low")] | length' results/sbom.json) ))
-            SBOM_M=$(( SBOM_M + $(jq '[.matches[]?|select(.vulnerability.severity=="Medium")] | length' results/sbom.json) ))
-            SBOM_H=$(( SBOM_H + $(jq '[.matches[]?|select(.vulnerability.severity=="High")] | length' results/sbom.json) ))
-            SBOM_C=$(( SBOM_C + $(jq '[.matches[]?|select(.vulnerability.severity=="Critical")] | length' results/sbom.json) ))
+            TMP_FILE=$(mktemp)
+            grype sbom:"$sb" -o json > "$TMP_FILE" || continue
+
+            SBOM_L=$(( SBOM_L + $(jq '[.matches[]?|select(.vulnerability.severity=="Low")] | length' "$TMP_FILE") ))
+            SBOM_M=$(( SBOM_M + $(jq '[.matches[]?|select(.vulnerability.severity=="Medium")] | length' "$TMP_FILE") ))
+            SBOM_H=$(( SBOM_H + $(jq '[.matches[]?|select(.vulnerability.severity=="High")] | length' "$TMP_FILE") ))
+            SBOM_C=$(( SBOM_C + $(jq '[.matches[]?|select(.vulnerability.severity=="Critical")] | length' "$TMP_FILE") ))
+
+            rm -f "$TMP_FILE"
           done
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
 
