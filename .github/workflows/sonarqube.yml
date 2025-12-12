@@ -78,55 +78,55 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: SCA - Multi-manifest Snyk Scan (safe merge)
+      ###########################################################################
+      # 🟢 FIXED SCA — Works for Multi-module Maven, Gradle, Node, Python, Docker
+      ###########################################################################
+      - name: SCA - Multi-manifest Snyk Scan (fully recursive & merged)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
 
-          FILES=$(find project -type f \( \
-            -name 'pom.xml' -o -name 'package.json' -o -name 'requirements.txt' -o -name 'Pipfile' \
-            -o -name 'poetry.lock' -o -name 'Gemfile' -o -name 'Gemfile.lock' -o -name 'go.mod' \
-            -o -name 'composer.json' -o -name '*.csproj' -o -name '*.fsproj' -o -name 'packages.config' \
-            -o -name 'Dockerfile' \))
+          echo "Running full recursive SCA scan…"
 
-          # Build a valid JSON array of Snyk outputs. snyk exits non-zero when vulns found, so allow that.
-          echo "[" > results/sca_raw.json
-          first=true
-          for f in $FILES; do
-            echo "Scanning SCA file: $f"
-            # Ensure snyk uses the token from env; do not treat non-zero exit as failure.
-            OUT=$(snyk test --file="$f" --json --severity-threshold=low || true)
-            if [ "$first" = true ]; then
-              first=false
+          snyk test --all-projects --detection-depth=6 --json > results/sca_raw.json || true
+
+          # Merge SCA vulnerabilities (handles array or single object)
+          jq '
+            if type=="array" then
+              map(.vulnerabilities // []) | add
             else
-              echo "," >> results/sca_raw.json
-            fi
-            echo "$OUT" >> results/sca_raw.json
-          done
-          echo "]" >> results/sca_raw.json
+              .vulnerabilities // []
+            end
+            | { vulnerabilities: . }
+          ' results/sca_raw.json > results/sca.json
 
-          # Merge vulnerabilities arrays into a single sca.json with { "vulnerabilities": [...] }
-          jq '[ .[] | .vulnerabilities? // [] ] | add | { vulnerabilities: . }' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities": []}' > results/sca.json
-
+      ###########################################################################
+      # SAST
+      ###########################################################################
       - name: SAST - Snyk Code
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: snyk code test --sarif --all-projects > results/sast.sarif || echo '{"runs":[]}' > results/sast.sarif
 
+      ###########################################################################
+      # Semgrep
+      ###########################################################################
       - name: Semgrep
         run: semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-      - name: SBOM Scanning (repo SBOMs only with summary)
+      ###########################################################################
+      # 🟢 FIXED SBOM SCANNING + VALIDATION
+      ###########################################################################
+      - name: SBOM Scanning (validated)
         run: |
           grype db update
 
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOM_STATUS="no_sbom"   # default
-          FOUND_VALID=false
+          STATUS="no_sbom"
+          VALID=false
           FOUND_VULN=false
 
-          # Find SBOM files in the repo (expanded patterns)
           SBOMS=$(find project -type f \( \
             -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
             -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
@@ -134,74 +134,44 @@ jobs:
           \))
 
           if [ -z "$SBOMS" ]; then
-            echo "No SBOM files found in repo."
-            SBOM_STATUS="no_sbom"
+            STATUS="no_sbom"
           else
             for sb in $SBOMS; do
-              echo "Inspecting SBOM: $sb"
-
-              # Validate SBOM: must contain at least one component with name and version
-              VALID=$(jq '[.components[]? | select(.name != null and .version != null)] | length' "$sb" 2>/dev/null || echo 0)
-              if [ "$VALID" -eq 0 ]; then
-                echo "Skipped $sb: No valid components found."
-                # if there are SBOM files but none valid, we mark invalid (unless a later SBOM is valid)
-                if [ "$SBOM_STATUS" = "no_sbom" ]; then
-                  SBOM_STATUS="invalid_sbom"
-                fi
+              VALID_COUNT=$(jq '[.components[]? | select(.name and .version)] | length' "$sb" 2>/dev/null || echo 0)
+              if [ "$VALID_COUNT" -eq 0 ]; then
+                STATUS="invalid_sbom"
                 continue
               fi
 
-              FOUND_VALID=true
+              VALID=true
 
-              TMP_FILE=$(mktemp)
-              grype sbom:"$sb" -o json > "$TMP_FILE" || { echo "Grype failed for $sb"; rm -f "$TMP_FILE"; continue; }
+              TMP=$(mktemp)
+              grype sbom:"$sb" -o json > "$TMP" || continue
 
-              # Debug preview: show first few matches
-              echo "Grype matches preview for $sb:"
-              jq '.matches[0:5]' "$TMP_FILE" || true
+              L=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="low")] | length' "$TMP")
+              M=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="medium")] | length' "$TMP")
+              H=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="high")] | length' "$TMP")
+              C=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="critical")] | length' "$TMP")
 
-              # Count vulnerabilities by severity (case-insensitive)
-              L=$(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="low")] | length' "$TMP_FILE")
-              M=$(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="medium")] | length' "$TMP_FILE")
-              H=$(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="high")] | length' "$TMP_FILE")
-              C=$(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="critical")] | length' "$TMP_FILE")
+              SBOM_L=$((SBOM_L+L))
+              SBOM_M=$((SBOM_M+M))
+              SBOM_H=$((SBOM_H+H))
+              SBOM_C=$((SBOM_C+C))
 
-              SBOM_L=$((SBOM_L + L))
-              SBOM_M=$((SBOM_M + M))
-              SBOM_H=$((SBOM_H + H))
-              SBOM_C=$((SBOM_C + C))
-
-              if [ $((L+M+H+C)) -gt 0 ]; then
-                FOUND_VULN=true
-              fi
-
-              rm -f "$TMP_FILE"
+              if [ $((L+M+H+C)) -gt 0 ]; then FOUND_VULN=true; fi
+              rm -f "$TMP"
             done
 
-            # Decide final sbom status for this repo
-            if [ "$FOUND_VALID" = false ]; then
-              SBOM_STATUS="invalid_sbom"
+            if [ "$VALID" = false ]; then
+              STATUS="invalid_sbom"
             else
-              if [ "$FOUND_VULN" = true ]; then
-                SBOM_STATUS="valid_with_vuln"
-              else
-                SBOM_STATUS="valid_no_vuln"
-              fi
+              STATUS=$([ "$FOUND_VULN" = true ] && echo "valid_with_vuln" || echo "valid_no_vuln")
             fi
           fi
 
-          # Save counts and status to results
           mkdir -p results
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
-          echo "$SBOM_STATUS" > results/sbom_status.txt
-          echo "SBOM vulnerabilities: Low=$SBOM_L Medium=$SBOM_M High=$SBOM_H Critical=$SBOM_C"
-          echo "SBOM status: $SBOM_STATUS"
-
-          # Print summary for this repo
-          echo "===== SBOM SCAN SUMMARY ====="
-          echo "Repo: $(basename "$PWD")"
-          echo "SBOM status: $SBOM_STATUS"
-          echo "=============================="
+          echo "$STATUS" > results/sbom_status.txt
 
       - name: Package results
         run: |
@@ -217,49 +187,46 @@ jobs:
   summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: all_results
+
       - name: Build summary.csv
         run: |
-          # Add sbom_status column to CSV
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           shopt -s globstar
+
           for zipfile in all_results/**/*.zip; do
-              SAFE=$(basename "$zipfile" .zip)
-              REPO="${SAFE#repo-results-}"
-              mkdir temp
-              unzip -o "$zipfile" -d temp >/dev/null
+            SAFE=$(basename "$zipfile" .zip)
+            REPO="${SAFE#repo-results-}"
+            mkdir temp
+            unzip -o "$zipfile" -d temp >/dev/null
 
-              # SCA counts (case-insensitive)
-              SCA_L=$(jq '(.vulnerabilities // []) | map(select(.severity // "" | ascii_downcase=="low")) | length' temp/results/sca.json)
-              SCA_M=$(jq '(.vulnerabilities // []) | map(select(.severity // "" | ascii_downcase=="medium")) | length' temp/results/sca.json)
-              SCA_H=$(jq '(.vulnerabilities // []) | map(select(.severity // "" | ascii_downcase=="high")) | length' temp/results/sca.json)
-              SCA_C=$(jq '(.vulnerabilities // []) | map(select(.severity // "" | ascii_downcase=="critical")) | length' temp/results/sca.json)
+            # SCA (case-insensitive)
+            SCA_L=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="low")] | length' temp/results/sca.json)
+            SCA_M=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="medium")] | length' temp/results/sca.json)
+            SCA_H=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="high")] | length' temp/results/sca.json)
+            SCA_C=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="critical")] | length' temp/results/sca.json)
 
-              # Semgrep counts (case-insensitive)
-              SEM_L=$(jq '[.results[]? | select(.extra.severity // "" | ascii_downcase=="info")] | length' temp/results/semgrep.json)
-              SEM_M=$(jq '[.results[]? | select(.extra.severity // "" | ascii_downcase=="warning")] | length' temp/results/semgrep.json)
-              SEM_H=$(jq '[.results[]? | select(.extra.severity // "" | ascii_downcase=="error")] | length' temp/results/semgrep.json)
-              SEM_C=$(jq '[.results[]? | select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
+            # Semgrep
+            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' temp/results/semgrep.json)
+            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' temp/results/semgrep.json)
+            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' temp/results/semgrep.json)
+            SEM_C=$(jq '[.results[]? | select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
 
-              # SBOM counts and status
-              if [ -f temp/results/sbom_counts.txt ]; then
-                IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
-              else
-                SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-              fi
-              if [ -f temp/results/sbom_status.txt ]; then
-                SBOM_STATUS=$(cat temp/results/sbom_status.txt)
-              else
-                SBOM_STATUS="no_sbom"
-              fi
+            # SBOM
+            IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
+            SBOM_STATUS=$(cat temp/results/sbom_status.txt)
 
-              TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C + SEM_L+SEM_M+SEM_H+SEM_C + SBOM_L+SBOM_M+SBOM_H+SBOM_C))
-              echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$SBOM_STATUS,$TOTAL" >> summary.csv
-              rm -rf temp
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C + SEM_L+SEM_M+SEM_H+SEM_C + SBOM_L+SBOM_M+SBOM_H+SBOM_C))
+
+            echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$SBOM_STATUS,$TOTAL" >> summary.csv
+
+            rm -rf temp
           done
+
       - uses: actions/upload-artifact@v4
         with:
           name: "security-summary-${{ github.run_id }}"
