@@ -1,4 +1,4 @@
-name: Top Repos Security Scan cleaned hard (SBOM Filtered)
+name: Top Repos Security Scan filtered  (SBOM Filtered)
 
 on:
   workflow_dispatch:
@@ -17,15 +17,13 @@ permissions:
   security-events: write
 
 jobs:
-
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
-
     steps:
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
 
       - name: Fetch top N repos
         id: set_output
@@ -47,7 +45,6 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
               gh.write(f"repos={json.dumps(repos)}\n")
           EOF
-
   scan_repo:
     needs: fetch_repos
     runs-on: ubuntu-latest
@@ -62,30 +59,38 @@ jobs:
       - name: Install Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip maven gradle unzip
+          sudo apt-get install -y jq git npm python3-pip maven gradle unzip curl
           pip3 install semgrep cyclonedx-bom
           npm install -g snyk
+          # install grype
           VERSION="v0.73.2"
           FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
           curl -L "https://github.com/anchore/grype/releases/download/$VERSION/$FILE" -o grype.tgz
           tar -xzf grype.tgz
-          sudo mv grype /usr/local/bin/
-
+          sudo mv grype /usr/local/bin/ || true
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # SCA - Multi-manifest Snyk Scan (raw)
+      # SCA - Multi-manifest Snyk Scan (raw -> normalized)
       ###########################################################################
-      - name: SCA - Multi-manifest Snyk Scan (fully recursive & merged)
+      - name: SCA - Multi-manifest Snyk Scan (fully recursive & save raw)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
           echo "Running full recursive SCA scan…"
           snyk test --all-projects --detection-depth=6 --json > results/sca_raw.json || true
+          # Normalize/merge vulnerabilities into a predictable structure `results/sca.json`
+          jq '
+            # handle array or single object Snyk output
+            if (input | length) == 0 then
+              try ( . ) catch . end
+            else .
+            end
+          ' results/sca_raw.json > /dev/null 2>&1 || true
           jq '
             if type=="array" then
               map(.vulnerabilities // []) | add
@@ -93,58 +98,80 @@ jobs:
               .vulnerabilities // []
             end
             | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca.json
-
+          ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
       ###########################################################################
-      # SCA - Cleaned (strong filters & deduplicate)
+      # SCA - Cleaned (All real vulns, minimal noise)
       ###########################################################################
-      - name: SCA - Cleaned
+      - name: SCA - Cleaned (All Real Vulns, No Noise)
         run: |
+          # step1: remove ignored/patched, require packageName/version, keep all medium+high+critical, keep low only if CVE exists
           jq '
             .vulnerabilities |= map(
               select(
                 (.isIgnored | not)
                 and (.isPatched | not)
-                and (.cvssScore // 0) >= 5
-                and (.identifiers.CVE | length > 0)
+                and (.packageName != null)
+                and (.packageName != "")
+                and (.version != null)
+                and (.version != "")
+                and (
+                  # LOW: must have identifiers object with CVE array length > 0
+                  ( (.severity|ascii_downcase=="low")
+                    and (.identifiers | type=="object")
+                    and (.identifiers.CVE | type=="array")
+                    and ((.identifiers.CVE | length) > 0)
+                  )
+                  # MEDIUM/HIGH/CRITICAL: keep ALL (these are real)
+                  or (.severity|ascii_downcase=="medium")
+                  or (.severity|ascii_downcase=="high")
+                  or (.severity|ascii_downcase=="critical")
+                )
               )
             )
-          ' results/sca.json > results/sca_cleaned_temp.json
-          # Deduplicate by packageName + version + vulnerability ID
+          ' results/sca.json > results/sca_cleaned_step1.json
+          # step2: remove obvious test/mock/example packages which are normally noise
           jq '
-            .vulnerabilities |= unique_by(.packageName + ":" + .version + ":" + .id)
-          ' results/sca_cleaned_temp.json > results/sca_cleaned.json
-          rm results/sca_cleaned_temp.json
-
+            .vulnerabilities |= map(
+              select(
+                (.packageName | test("(^|[-_.\\/])test|test-|-test|mock|sample|example|demo" ; "i") | not)
+              )
+            )
+          ' results/sca_cleaned_step1.json > results/sca_cleaned_step2.json
+          # step3: deduplicate by package + version + vulnerability id (safe with // to avoid nulls)
+          jq '
+            .vulnerabilities |= unique_by( (.packageName // "") + ":" + (.version // "") + ":" + (.id // "") )
+          ' results/sca_cleaned_step2.json > results/sca_cleaned.json
+          # cleanup temps
+          rm -f results/sca_cleaned_step1.json results/sca_cleaned_step2.json || true
       ###########################################################################
       # SAST
       ###########################################################################
       - name: SAST - Snyk Code
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
-        run: snyk code test --sarif --all-projects > results/sast.sarif || echo '{"runs":[]}' > results/sast.sarif
-
+        run: |
+          mkdir -p results
+          snyk code test --sarif --all-projects > results/sast.sarif || echo '{"runs":[]}' > results/sast.sarif
       ###########################################################################
       # Semgrep
       ###########################################################################
       - name: Semgrep
-        run: semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
-
+        run: |
+          mkdir -p results
+          semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
       ###########################################################################
-      # SBOM Scanning + Validation
+      # SBOM Scanning + Validation (grype on detected SBOMs)
       ###########################################################################
       - name: SBOM Scanning (validated)
         run: |
-          grype db update
+          mkdir -p results
+          # update grype DB (best-effort)
+          grype db update || true
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
           STATUS="no_sbom"
           VALID=false
           FOUND_VULN=false
-          SBOMS=$(find project -type f \( \
-            -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
-            -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
-            -o -iname "*.spdx" -o -iname "*sbom*.json" \
-          \))
+          SBOMS=$(find project -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" -o -iname "*sbom*.json" \) -print)
           if [ -z "$SBOMS" ]; then
             STATUS="no_sbom"
           else
@@ -156,7 +183,7 @@ jobs:
               fi
               VALID=true
               TMP=$(mktemp)
-              grype sbom:"$sb" -o json > "$TMP" || continue
+              grype sbom:"$sb" -o json > "$TMP" || { rm -f "$TMP"; continue; }
               L=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="low")] | length' "$TMP")
               M=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="medium")] | length' "$TMP")
               H=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="high")] | length' "$TMP")
@@ -168,22 +195,22 @@ jobs:
               if [ $((L+M+H+C)) -gt 0 ]; then FOUND_VULN=true; fi
               rm -f "$TMP"
             done
-            if [ $VALID = false ]; then
+            if [ "$VALID" = false ]; then
               STATUS="invalid_sbom"
             else
               STATUS=$([ "$FOUND_VULN" = true ] && echo "valid_with_vuln" || echo "valid_no_vuln")
             fi
           fi
-          mkdir -p results
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
           echo "$STATUS" > results/sbom_status.txt
-
       - name: Package results
         run: |
           SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
           echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
-          zip -r "$SAFE.zip" results
-
+          # ensure results exist
+          mkdir -p results
+          # include raw and cleaned sca files (raw=sca_raw.json, normalized=sca.json, cleaned=sca_cleaned.json)
+          zip -r "$SAFE.zip" results || true
       - uses: actions/upload-artifact@v4
         with:
           name: repo-results-${{ env.SAFE_NAME }}
@@ -207,24 +234,27 @@ jobs:
             REPO="${SAFE#repo-results-}"
             mkdir temp
             unzip -o "$zipfile" -d temp >/dev/null
-            # Cleaned SCA
-            SCA_L=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="low")] | length' temp/results/sca_cleaned.json)
-            SCA_M=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="medium")] | length' temp/results/sca_cleaned.json)
-            SCA_H=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="high")] | length' temp/results/sca_cleaned.json)
-            SCA_C=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="critical")] | length' temp/results/sca_cleaned.json)
+            # Use cleaned SCA for summary
+            SCA_L=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="low")] | length' temp/results/sca_cleaned.json)
+            SCA_M=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="medium")] | length' temp/results/sca_cleaned.json)
+            SCA_H=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="high")] | length' temp/results/sca_cleaned.json)
+            SCA_C=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="critical")] | length' temp/results/sca_cleaned.json)
             # Semgrep
             SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' temp/results/semgrep.json)
             SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' temp/results/semgrep.json)
             SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' temp/results/semgrep.json)
             SEM_C=$(jq '[.results[]? | select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
             # SBOM
-            IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
-            SBOM_STATUS=$(cat temp/results/sbom_status.txt)
+            if [ -f temp/results/sbom_counts.txt ]; then
+              IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
+            else
+              SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
+            fi
+            SBOM_STATUS=$(cat temp/results/sbom_status.txt 2>/dev/null || echo "no_sbom")
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C + SEM_L+SEM_M+SEM_H+SEM_C + SBOM_L+SBOM_M+SBOM_H+SBOM_C))
             echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$SBOM_STATUS,$TOTAL" >> summary.csv
             rm -rf temp
           done
-
       - name: Upload summary.csv
         uses: actions/upload-artifact@v4
         with:
