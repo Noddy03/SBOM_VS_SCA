@@ -103,41 +103,80 @@ jobs:
       - name: Semgrep
         run: semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-      - name: SBOM Scanning (repo SBOMs only)
+      - name: SBOM Scanning (repo SBOMs only with summary)
         run: |
           grype db update
-          SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
       
-          # Find SBOMs inside repo
-          SBOMS=$(find project -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" -o -iname "*sbom*.json" \))
-          
+          SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
+          NO_SBOM=()
+          VALID_SBOM_NO_VULN=()
+          VALID_SBOM_WITH_VULN=()
+      
+          # Find SBOM files in the repo
+          SBOMS=$(find project -type f \( \
+            -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
+            -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
+            -o -iname "*.spdx" -o -iname "*sbom*.json" \
+          \))
+      
           if [ -z "$SBOMS" ]; then
             echo "No SBOM files found in repo."
+            NO_SBOM+=("$(basename "$PWD")")
           else
             for sb in $SBOMS; do
-              echo "Scanning SBOM: $sb"
-              TMP_FILE=$(mktemp)
-              grype sbom:"$sb" -o json > "$TMP_FILE" || { echo "Grype failed for $sb"; continue; }
+              echo "Inspecting SBOM: $sb"
       
-              # Debug: show first few matches
-              echo "Preview of Grype matches:"
+              # Validate SBOM: must contain at least one component with name and version
+              VALID=$(jq '[.components[]? | select(.name != null and .version != null)] | length' "$sb" 2>/dev/null || echo 0)
+              if [ "$VALID" -eq 0 ]; then
+                echo "Skipped $sb: No valid components found."
+                continue
+              fi
+      
+              TMP_FILE=$(mktemp)
+              grype sbom:"$sb" -o json > "$TMP_FILE" || { echo "Grype failed for $sb"; rm -f "$TMP_FILE"; continue; }
+      
+              # Debug preview: show first few matches
+              echo "Grype matches preview for $sb:"
               jq '.matches[0:5]' "$TMP_FILE"
       
               # Count vulnerabilities by severity (case-insensitive)
-              SBOM_L=$(( SBOM_L + $(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="low")] | length' "$TMP_FILE") ))
-              SBOM_M=$(( SBOM_M + $(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="medium")] | length' "$TMP_FILE") ))
-              SBOM_H=$(( SBOM_H + $(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="high")] | length' "$TMP_FILE") ))
-              SBOM_C=$(( SBOM_C + $(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="critical")] | length' "$TMP_FILE") ))
+              L=$(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="low")] | length' "$TMP_FILE")
+              M=$(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="medium")] | length' "$TMP_FILE")
+              H=$(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="high")] | length' "$TMP_FILE")
+              C=$(jq '[.matches[]? | select(.vulnerability.severity | ascii_downcase=="critical")] | length' "$TMP_FILE")
+      
+              SBOM_L=$((SBOM_L + L))
+              SBOM_M=$((SBOM_M + M))
+              SBOM_H=$((SBOM_H + H))
+              SBOM_C=$((SBOM_C + C))
       
               rm -f "$TMP_FILE"
             done
+      
+            # Categorize repo based on SBOM results
+            TOTAL=$((SBOM_L+SBOM_M+SBOM_H+SBOM_C))
+            if [ "$TOTAL" -eq 0 ]; then
+              VALID_SBOM_NO_VULN+=("$(basename "$PWD")")
+            else
+              VALID_SBOM_WITH_VULN+=("$(basename "$PWD")")
+            fi
           fi
       
-          # Save results
+          # Save counts to results
           mkdir -p results
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
-          echo "SBOM vulnerability counts: Low=$SBOM_L Medium=$SBOM_M High=$SBOM_H Critical=$SBOM_C"
+          echo "SBOM vulnerabilities: Low=$SBOM_L Medium=$SBOM_M High=$SBOM_H Critical=$SBOM_C"
+      
+          # Print summary for this repo
+          echo "===== SBOM SCAN SUMMARY ====="
+          echo "Repo: $(basename "$PWD")"
+          echo "No SBOM files: ${NO_SBOM[*]:-"None"}"
+          echo "Valid SBOMs with no vulnerabilities: ${VALID_SBOM_NO_VULN[*]:-"None"}"
+          echo "Valid SBOMs with vulnerabilities: ${VALID_SBOM_WITH_VULN[*]:-"None"}"
+          echo "=============================="
 
+  
 
       - name: Package results
         run: |
