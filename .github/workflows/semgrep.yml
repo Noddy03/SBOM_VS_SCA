@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (SBOM Filtered)
+name: Top Repos Security Scan cleaned (SBOM Filtered)
 
 on:
   workflow_dispatch:
@@ -22,11 +22,12 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
-    steps:
-      - name: Install Python and git
-        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git
 
-      - name: Fetch top N repositories with SBOM
+    steps:
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq
+
+      - name: Fetch top N repos
         id: set_output
         env:
           LANG_FILTER: ${{ inputs.language }}
@@ -34,183 +35,181 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 <<'EOF'
-          import os, requests, urllib.parse, tempfile, shutil, json, subprocess
+          import os, requests, urllib.parse, json
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
-          q = urllib.parse.quote(f"language:{lang}")
-          url = f"https://api.github.com/search/repositories?q={q}+language:{lang}&sort=stars&order=desc&per_page=100"
-          r = requests.get(url, headers=headers)
-          r.raise_for_status()
-          items = r.json()["items"]
-          selected_repos = []
-          for repo in items:
-              if len(selected_repos) >= top_n:
-                  break
-              full_name = repo["full_name"]
-              tmpdir = tempfile.mkdtemp()
-              try:
-                  result = subprocess.run(
-                      ["git", "clone", "--depth", "1",
-                       f"https://x-access-token:{token}@github.com/{full_name}", tmpdir],
-                      stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                  )
-                  if result.returncode != 0:
-                      continue
-                  sbom_files = subprocess.run(
-                      ["find", tmpdir, "-type", "f",
-                       "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
-                       "-o", "-iname", "*cyclonedx*.json", "-o", "-iname", "*cyclonedx*.xml",
-                       "-o", "-iname", "*.cdx.json", "-o", "-iname", "*.spdx.json",
-                       "-o", "-iname", "*.spdx"],
-                      stdout=subprocess.PIPE
-                  ).stdout.decode().strip()
-                  if sbom_files:
-                      selected_repos.append(full_name)
-              finally:
-                  shutil.rmtree(tmpdir)
+          url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(lang)}&sort=stars&order=desc&per_page=50"
+          res = requests.get(url, headers=headers)
+          res.raise_for_status()
+          repos = [r["full_name"] for r in res.json()["items"][:top_n]]
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
-              gh.write(f"repos={json.dumps(selected_repos or [])}\n")
+              gh.write(f"repos={json.dumps(repos)}\n")
           EOF
 
   scan_repo:
     needs: fetch_repos
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
+    continue-on-error: true
+
     steps:
-      - name: Install tools
+      - name: Install Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip maven gradle
-          pip3 install semgrep
+          sudo apt-get install -y jq git npm python3-pip maven gradle unzip
+          pip3 install semgrep cyclonedx-bom
           npm install -g snyk
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          VERSION="v0.73.2"
+          FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
+          curl -L "https://github.com/anchore/grype/releases/download/$VERSION/$FILE" -o grype.tgz
+          tar -xzf grype.tgz
+          sudo mv grype /usr/local/bin/
 
-      - name: Clone and scan all repos
+      - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+
+      ###########################################################################
+      # 🟢 SCA - Multi-manifest Snyk Scan (raw)
+      ###########################################################################
+      - name: SCA - Multi-manifest Snyk Scan (fully recursive & merged)
+        env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
-          REPOS: ${{ needs.fetch_repos.outputs.repos }}
         run: |
-          ROOT_DIR="$GITHUB_WORKSPACE/project"
-          RESULT_DIR="$GITHUB_WORKSPACE/results"
-          mkdir -p "$RESULT_DIR"
-          REPO_LIST=($(echo "$REPOS" | jq -r '.[]'))
+          mkdir -p results
+          echo "Running full recursive SCA scan…"
+          snyk test --all-projects --detection-depth=6 --json > results/sca_raw.json || true
+          jq '
+            if type=="array" then
+              map(.vulnerabilities // []) | add
+            else
+              .vulnerabilities // []
+            end
+            | { vulnerabilities: . }
+          ' results/sca_raw.json > results/sca.json
 
-          for repo in "${REPO_LIST[@]}"; do
-            SAFE_NAME=$(echo "$repo" | tr '/' '-')
-            REPO_PATH="$ROOT_DIR/$SAFE_NAME"
-            mkdir -p "$REPO_PATH"
+      ###########################################################################
+      # 🟢 Cleaned SCA
+      ###########################################################################
+      - name: SCA - Cleaned
+        run: |
+          jq '
+            .vulnerabilities |= map(
+              select(
+                (.isIgnored | not) and
+                (.isPatched | not) and
+                (.cvssScore // 0) >= 5
+              )
+            )
+          ' results/sca.json > results/sca_cleaned.json
 
-            echo "📥 Cloning $repo..."
-            git clone --depth 1 https://x-access-token:$TOKEN@github.com/$repo "$REPO_PATH" || continue
+      ###########################################################################
+      # SAST
+      ###########################################################################
+      - name: SAST - Snyk Code
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+        run: snyk code test --sarif --all-projects > results/sast.sarif || echo '{"runs":[]}' > results/sast.sarif
 
-            # SCA
-            SCA_CSV="$RESULT_DIR/sca_summary_$SAFE_NAME.csv"
-            echo "module,sca_low,sca_medium,sca_high,sca_critical" > "$SCA_CSV"
-            MODULE_FILES=$(find "$REPO_PATH" -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
-            for module_file in $MODULE_FILES; do
-              MODULE_NAME=$(basename $(dirname "$module_file"))
-              MODULE_JSON="$RESULT_DIR/module_sca_${SAFE_NAME}_${MODULE_NAME}.json"
-              snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null || echo '{"vulnerabilities":[]}' > "$MODULE_JSON"
+      ###########################################################################
+      # Semgrep
+      ###########################################################################
+      - name: Semgrep
+        run: semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-              SCA_L=$(jq '[.vulnerabilities[]? | (.severity // .vulnerability.severity // "unknown" | ascii_downcase) | select(.=="low")] | length' "$MODULE_JSON")
-              SCA_M=$(jq '[.vulnerabilities[]? | (.severity // .vulnerability.severity // "unknown" | ascii_downcase) | select(.=="medium")] | length' "$MODULE_JSON")
-              SCA_H=$(jq '[.vulnerabilities[]? | (.severity // .vulnerability.severity // "unknown" | ascii_downcase) | select(.=="high")] | length' "$MODULE_JSON")
-              SCA_C=$(jq '[.vulnerabilities[]? | (.severity // .vulnerability.severity // "unknown" | ascii_downcase) | select(.=="critical")] | length' "$MODULE_JSON")
-
-              echo "$MODULE_NAME,$SCA_L,$SCA_M,$SCA_H,$SCA_C" >> "$SCA_CSV"
+      ###########################################################################
+      # 🟢 SBOM Scanning + Validation
+      ###########################################################################
+      - name: SBOM Scanning (validated)
+        run: |
+          grype db update
+          SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
+          STATUS="no_sbom"
+          VALID=false
+          FOUND_VULN=false
+          SBOMS=$(find project -type f \( \
+            -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
+            -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
+            -o -iname "*.spdx" -o -iname "*sbom*.json" \
+          \))
+          if [ -z "$SBOMS" ]; then
+            STATUS="no_sbom"
+          else
+            for sb in $SBOMS; do
+              VALID_COUNT=$(jq '[.components[]? | select(.name and .version)] | length' "$sb" 2>/dev/null || echo 0)
+              if [ "$VALID_COUNT" -eq 0 ]; then
+                STATUS="invalid_sbom"
+                continue
+              fi
+              VALID=true
+              TMP=$(mktemp)
+              grype sbom:"$sb" -o json > "$TMP" || continue
+              L=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="low")] | length' "$TMP")
+              M=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="medium")] | length' "$TMP")
+              H=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="high")] | length' "$TMP")
+              C=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="critical")] | length' "$TMP")
+              SBOM_L=$((SBOM_L+L))
+              SBOM_M=$((SBOM_M+M))
+              SBOM_H=$((SBOM_H+H))
+              SBOM_C=$((SBOM_C+C))
+              if [ $((L+M+H+C)) -gt 0 ]; then FOUND_VULN=true; fi
+              rm -f "$TMP"
             done
+            if [ $VALID = false ]; then
+              STATUS="invalid_sbom"
+            else
+              STATUS=$([ "$FOUND_VULN" = true ] && echo "valid_with_vuln" || echo "valid_no_vuln")
+            fi
+          fi
+          mkdir -p results
+          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
+          echo "$STATUS" > results/sbom_status.txt
 
-            # SAST
-            SAST_JSON="$RESULT_DIR/sast_$SAFE_NAME.sarif"
-            snyk code test --sarif > "$SAST_JSON" || echo '{"runs":[]}' > "$SAST_JSON"
+      - name: Package results
+        run: |
+          SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
+          echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
+          zip -r "$SAFE.zip" results
 
-            # Semgrep
-            SEMGREP_JSON="$RESULT_DIR/semgrep_$SAFE_NAME.json"
-            semgrep --config p/ci --json > "$SEMGREP_JSON" || echo '{"results":[]}' > "$SEMGREP_JSON"
-
-            # SBOM
-            SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-            SBOM_FILES=$(find "$REPO_PATH" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" -o -iname "*bom*.xml" \))
-            for sbom in $SBOM_FILES; do
-              SBOM_JSON="$RESULT_DIR/sbom_${SAFE_NAME}.json"
-              grype sbom:"$sbom" -o json > "$SBOM_JSON" || continue
-              SBOM_L=$(( SBOM_L + $(jq '[.matches[]? | select(.vulnerability.severity=="Low")] | length' "$SBOM_JSON") ))
-              SBOM_M=$(( SBOM_M + $(jq '[.matches[]? | select(.vulnerability.severity=="Medium")] | length' "$SBOM_JSON") ))
-              SBOM_H=$(( SBOM_H + $(jq '[.matches[]? | select(.vulnerability.severity=="High")] | length' "$SBOM_JSON") ))
-              SBOM_C=$(( SBOM_C + $(jq '[.matches[]? | select(.vulnerability.severity=="Critical")] | length' "$SBOM_JSON") ))
-            done
-            echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > "$RESULT_DIR/sbom_counts_$SAFE_NAME.txt"
-
-            # Zip per-repo results
-            zip -r "$RESULT_DIR/${SAFE_NAME}_results.zip" "$SCA_CSV" "$SAST_JSON" "$SEMGREP_JSON" "$RESULT_DIR/sbom_counts_$SAFE_NAME.txt"
-          done
-
-      - name: Upload per-repo results
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: "repo-results-${{ github.run_id }}"
-          path: results/*.zip
+          name: repo-results-${{ env.SAFE_NAME }}
+          path: "${{ env.SAFE_NAME }}.zip"
 
   summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
+
     steps:
-      - name: Download all repo results
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: all_results
 
-      - name: Generate summary.csv
+      - name: Build summary.csv
         run: |
-          echo "repo,module,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
-
-          for zipfile in all_results/*.zip; do
-            unzip -o "$zipfile" -d tmp_results
-            SAFE_NAME=$(basename "$zipfile" | sed 's/_results.zip//')
-            REPO_NAME=$(echo "$SAFE_NAME" | tr '-' '/')
-
-            SCA_FILE=$(find tmp_results -name "sca_summary_$SAFE_NAME.csv" | head -n1)
-            [ ! -f "$SCA_FILE" ] && echo "module,0,0,0,0" > "$SCA_FILE"
-
-            while IFS=',' read -r module sca_l sca_m sca_h sca_c; do
-              [ "$module" == "module" ] && continue
-
-              SAST_L=0; SAST_M=0; SAST_H=0; SAST_C=0
-              SEM_L=0; SEM_M=0; SEM_H=0; SEM_C=0
-              SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-
-              SAST_FILE=$(find tmp_results -name "sast_$SAFE_NAME.sarif" | head -n1)
-              if [ -f "$SAST_FILE" ]; then
-                SAST_L=$(jq '[.runs[].results[]? | select(.level=="note")] | length' "$SAST_FILE")
-                SAST_M=$(jq '[.runs[].results[]? | select(.level=="warning")] | length' "$SAST_FILE")
-                SAST_H=$(jq '[.runs[].results[]? | select(.level=="error")] | length' "$SAST_FILE")
-                SAST_C=$(jq '[.runs[].results[]? | select(.ruleId | test("critical"))] | length' "$SAST_FILE")
-              fi
-
-              SEM_FILE=$(find tmp_results -name "semgrep_$SAFE_NAME.json" | head -n1)
-              if [ -f "$SEM_FILE" ]; then
-                SEM_L=$(jq '[.results[]? | select(.extra.level=="INFO")] | length' "$SEM_FILE")
-                SEM_M=$(jq '[.results[]? | select(.extra.level=="WARNING")] | length' "$SEM_FILE")
-                SEM_H=$(jq '[.results[]? | select(.extra.level=="ERROR")] | length' "$SEM_FILE")
-                SEM_C=$(jq '[.results[]? | select(.check_id | test("critical|sql|xss|injection"))] | length' "$SEM_FILE")
-              fi
-
-              SBOM_FILE=$(find tmp_results -name "sbom_counts_$SAFE_NAME.txt" | head -n1)
-              if [ -f "$SBOM_FILE" ]; then
-                IFS=',' read -r SBOM_L SBOM_M SBOM_H SBOM_C < "$SBOM_FILE"
-              fi
-
-              TOTAL=$((sca_l+sca_m+sca_h+sca_c+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
-              echo "\"$REPO_NAME\",\"$module\",$sca_l,$sca_m,$sca_h,$sca_c,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
-            done < "$SCA_FILE"
-
-            rm -rf tmp_results/*
-          done
-
-      - name: Upload final summary
-        uses: actions/upload-artifact@v4
-        with:
-          name: "security-summary-${{ github.run_id }}"
-          path: summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
+          shopt -s globstar
+          for zipfile in all_results/**/*.zip; do
+            SAFE=$(basename "$zipfile" .zip)
+            REPO="${SAFE#repo-results-}"
+            mkdir temp
+            unzip -o "$zipfile" -d temp >/dev/null
+            # Cleaned SCA
+            SCA_L=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="low")] | length' temp/results/sca_cleaned.json)
+            SCA_M=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="medium")] | length' temp/results/sca_cleaned.json)
+            SCA_H=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="high")] | length' temp/results/sca_cleaned.json)
+            SCA_C=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="critical")] | length' temp/results/sca_cleaned.json)
+            # Semgrep
+            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' temp/results/semgrep.json)
+            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' temp/results/semgrep.json)
+            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' temp/results/semgrep.json)
+            SEM_C=$(jq '[.results[]? | select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
+            # SBOM
+            IFS=',' read SBOM_L SBOM_M SBOM
