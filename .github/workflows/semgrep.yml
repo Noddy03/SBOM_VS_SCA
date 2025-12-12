@@ -212,4 +212,9 @@ jobs:
             SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' temp/results/semgrep.json)
             SEM_C=$(jq '[.results[]? | select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
             # SBOM
-            IFS=',' read SBOM_L SBOM_M SBOM
+            IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
+            SBOM_STATUS=$(cat temp/results/sbom_status.txt)
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C + SEM_L+SEM_M+SEM_H+SEM_C + SBOM_L+SBOM_M+SBOM_H+SBOM_C))
+            echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$SBOM_STATUS,$TOTAL" >> summary.csv
+            rm -rf temp
+          done
