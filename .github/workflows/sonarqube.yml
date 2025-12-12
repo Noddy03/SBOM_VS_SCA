@@ -103,33 +103,24 @@ jobs:
       - name: Semgrep
         run: semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-      - name: SBOM scan (use only existing SBOMs, robust)
+      - name: SBOM Scanning
         run: |
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-      
-          SBOMS=$(find project -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
-      
+          SBOMS=$(find project -type f -iname "*bom*.json" \
+                                         -o -iname "*cyclonedx*.json" \
+                                         -o -iname "*.cdx.json" \
+                                         -o -iname "*.spdx.json" \
+                                         -o -iname "*.spdx")
           for sb in $SBOMS; do
-            echo "Scanning SBOM: $sb"
-            TMP=$(mktemp)
-            grype sbom:"$sb" -o json > "$TMP" || { echo "Grype failed for $sb"; continue; }
-      
-            L=$(jq '[.matches[]? | select(.vulnerability.severity?=="Low")] | length' "$TMP")
-            M=$(jq '[.matches[]? | select(.vulnerability.severity?=="Medium")] | length' "$TMP")
-            H=$(jq '[.matches[]? | select(.vulnerability.severity?=="High")] | length' "$TMP")
-            C=$(jq '[.matches[]? | select(.vulnerability.severity?=="Critical")] | length' "$TMP")
-      
-            SBOM_L=$(( SBOM_L + (L // 0) ))
-            SBOM_M=$(( SBOM_M + (M // 0) ))
-            SBOM_H=$(( SBOM_H + (H // 0) ))
-            SBOM_C=$(( SBOM_C + (C // 0) ))
-      
-            rm "$TMP"
+            TMP_FILE=$(mktemp)
+            grype sbom:"$sb" -o json > "$TMP_FILE" || continue
+            SBOM_L=$(( SBOM_L + $(jq '[.matches[]?|select(.vulnerability.severity=="Low")] | length' "$TMP_FILE") ))
+            SBOM_M=$(( SBOM_M + $(jq '[.matches[]?|select(.vulnerability.severity=="Medium")] | length' "$TMP_FILE") ))
+            SBOM_H=$(( SBOM_H + $(jq '[.matches[]?|select(.vulnerability.severity=="High")] | length' "$TMP_FILE") ))
+            SBOM_C=$(( SBOM_C + $(jq '[.matches[]?|select(.vulnerability.severity=="Critical")] | length' "$TMP_FILE") ))
+            rm -f "$TMP_FILE"
           done
-      
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
-
-
       - name: Package results
         run: |
           SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
