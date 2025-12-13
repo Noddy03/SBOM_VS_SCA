@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Fully Fixed)
+name: Top Repos Security Scan (SCA Optimised)
 
 on:
   workflow_dispatch:
@@ -68,14 +68,30 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # SCA - Snyk (RAW + NORMALIZED)
+      # BUILD (best-effort, improves SCA visibility)
       ###########################################################################
-      - name: SCA - Snyk (raw)
+      - name: Build project (best effort)
+        run: |
+          cd project
+          mvn -q -DskipTests package || \
+          gradle build -x test || true
+
+      ###########################################################################
+      # SCA - Snyk (OPTIMISED)
+      ###########################################################################
+      - name: SCA - Snyk (optimised)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+          SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
         run: |
           mkdir -p results
-          snyk test --all-projects --detection-depth=6 --json > results/sca_raw.json || true
+          snyk test \
+            --all-projects \
+            --detection-depth=15 \
+            --scan-unmanaged \
+            --json \
+            > results/sca_raw.json || true
+
           jq '
             if type=="array" then
               map(.vulnerabilities // []) | add
