@@ -1,17 +1,20 @@
-name: Top Repos Security Scan Trivy
+name: Top Repos Security Scan (Trivy Final Merged)
 
 on:
   workflow_dispatch:
     inputs:
       language:
+        description: "Programming language to filter repos"
         required: true
         default: "Java"
       top_n:
+        description: "Number of top repositories to scan"
         required: false
-        default: "10"
+        default: "5"
 
 permissions:
   contents: read
+  security-events: write
 
 jobs:
   fetch_repos:
@@ -19,8 +22,7 @@ jobs:
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
-      - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y python3 jq curl
+      - run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
 
       - id: set_output
         env:
@@ -30,25 +32,16 @@ jobs:
         run: |
           python3 <<'EOF'
           import os, requests, urllib.parse, json
-
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
-
           headers = {"Authorization": f"token {token}"}
-          url = (
-              "https://api.github.com/search/repositories"
-              f"?q=language:{urllib.parse.quote(lang)}"
-              "&sort=stars&order=desc&per_page=50"
-          )
-
+          url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(lang)}&sort=stars&order=desc&per_page=50"
           res = requests.get(url, headers=headers)
           res.raise_for_status()
-
           repos = [r["full_name"] for r in res.json()["items"][:top_n]]
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"repos={json.dumps(repos)}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
+              gh.write(f"repos={json.dumps(repos)}\n")
           EOF
 
   scan_repo:
@@ -58,112 +51,111 @@ jobs:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
+    continue-on-error: true
 
     steps:
-      - name: Install Trivy
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip curl
+          sudo apt-get install -y jq git unzip curl maven gradle
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
-      - name: Clone repo
-        run: git clone --depth 1 https://github.com/${{ matrix.repo }} project
+      - name: Clone repository
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # LOCATE REPO-PROVIDED SBOMS
+      # BUILD PROJECT (optional, improves dependency resolution)
       ###########################################################################
-      - name: Locate SBOMs
+      - name: Build project
+        run: |
+          cd project
+          mvn -q -DskipTests package || gradle build -x test || true
+
+      ###########################################################################
+      # TRIVY FILESYSTEM SCAN (SCA)
+      ###########################################################################
+      - name: Trivy FS scan (SCA)
         run: |
           mkdir -p results
-          find project -type f \( \
-            -iname "*sbom*.json" -o \
-            -iname "*cyclonedx*.json" -o \
-            -iname "*.cdx.json" -o \
-            -iname "*.spdx.json" \
-          \) > results/sbom_list.txt || true
+          trivy fs project \
+            --scanners vuln \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
+            --output results/trivy_fs.json || true
+          [ -f results/trivy_fs.json ] || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # TRIVY SBOM ENRICHMENT (NO GENERATION)
+      # TRIVY SBOM SCAN
       ###########################################################################
-      - name: Enrich repo SBOMs with Trivy
+      - name: Trivy SBOM scan
         run: |
           mkdir -p results
-          echo '{"Results":[]}' > results/trivy_sbom_vulns.json
-
-          while read -r sbom; do
-            [ -z "$sbom" ] && continue
-            echo "Scanning SBOM: $sbom"
-
-            trivy sbom \
-              --scanners vuln \
-              --format json \
-              "$sbom" > results/_tmp_sbom.json || continue
-
-            jq -s '
-              {
-                Results: (.[0].Results + .[1].Results)
-              }
-            ' results/trivy_sbom_vulns.json results/_tmp_sbom.json \
-              > results/_merged.json
-
-            mv results/_merged.json results/trivy_sbom_vulns.json
-          done < results/sbom_list.txt
-
-          rm -f results/_tmp_sbom.json
+          trivy sbom project \
+            --format cyclonedx \
+            --output results/trivy_sbom.json || true
+          trivy sbom results/trivy_sbom.json \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
+            --output results/trivy_sbom_vulns.json || true
+          [ -f results/trivy_sbom_vulns.json ] || echo '{"Results":[]}' > results/trivy_sbom_vulns.json
 
       ###########################################################################
-      # PACKAGE RESULTS (SAFE ARTIFACT NAME)
+      # MERGE SCA + SBOM VULNERABILITIES
+      ###########################################################################
+      - name: Merge Trivy SCA + SBOM
+        run: |
+          jq -s '
+            {
+              Results: (.[0].Results + .[1].Results)
+            }
+          ' results/trivy_fs.json results/trivy_sbom_vulns.json > results/trivy_merged.json || echo '{"Results":[]}' > results/trivy_merged.json
+
+      ###########################################################################
+      # PACKAGE RESULTS
       ###########################################################################
       - name: Package results
         run: |
-          SAFE_REPO=$(echo '${{ matrix.repo }}' | sed 's/[^a-zA-Z0-9._-]/-/g')
-          echo "SAFE_REPO=$SAFE_REPO" >> $GITHUB_ENV
-          zip -r "$SAFE_REPO.zip" results
+          SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+          zip -r "$SAFE_NAME.zip" results
 
-      - name: Upload repo artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: repo-results-${{ env.SAFE_REPO }}
-          path: "${{ env.SAFE_REPO }}.zip"
+          name: repo-results-${{ env.SAFE_NAME }}
+          path: "${{ env.SAFE_NAME }}.zip"
 
   summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: all
+          path: all_results
 
       ###########################################################################
-      # SUMMARY
+      # BUILD SUMMARY CSV
       ###########################################################################
       - name: Build summary.csv
         run: |
-          echo "repo,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          echo "repo,low,medium,high,critical,total" > summary.csv
           shopt -s globstar
-
-          for z in all/**/*.zip; do
-            unzip -o "$z" -d tmp >/dev/null
-            repo=$(basename "$z" .zip)
-
-            FILE="tmp/results/trivy_sbom_vulns.json"
-
-            SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$FILE")
-            SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$FILE")
-            SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$FILE")
-            SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$FILE")
-
-            TOTAL=$((SB_L+SB_M+SB_H+SB_C))
-            echo "$repo,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
-
-            rm -rf tmp
+          for zipfile in all_results/**/*.zip; do
+            SAFE=$(basename "$zipfile" .zip)
+            mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
+            FILE="temp/results/trivy_merged.json"
+            LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$FILE")
+            MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$FILE")
+            HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$FILE")
+            CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$FILE")
+            TOTAL=$((LOW+MEDIUM+HIGH+CRITICAL))
+            echo "$SAFE,$LOW,$MEDIUM,$HIGH,$CRITICAL,$TOTAL" >> summary.csv
+            rm -rf temp
           done
 
-      - name: Upload summary
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: security-summary
           path: summary.csv
-
