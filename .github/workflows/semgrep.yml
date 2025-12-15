@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy Fixed)
+name: Top Repos Security Scan (Trivy Final Fixed)
 
 on:
   workflow_dispatch:
@@ -67,7 +67,7 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # BUILD (best-effort)
+      # BUILD (improves dependency resolution)
       ###########################################################################
       - name: Build project (best effort)
         run: |
@@ -76,9 +76,9 @@ jobs:
           gradle build -x test || true
 
       ###########################################################################
-      # TRIVY FS SCAN (SCA)
+      # TRIVY FILESYSTEM SCAN (SCA)
       ###########################################################################
-      - name: Trivy filesystem scan
+      - name: Trivy FS scan (SCA)
         run: |
           mkdir -p results
           trivy fs project \
@@ -86,12 +86,10 @@ jobs:
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
             --output results/trivy_fs.json || true
-
-          # Ensure file exists
           [ -f results/trivy_fs.json ] || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # TRIVY SBOM GENERATION + SCAN (SAFE)
+      # TRIVY SBOM GENERATION + SCAN
       ###########################################################################
       - name: Trivy SBOM scan
         run: |
@@ -106,11 +104,10 @@ jobs:
             --format json \
             --output results/trivy_sbom_vulns.json || true
 
-          # Force empty JSON if Trivy produced nothing
           [ -f results/trivy_sbom_vulns.json ] || echo '{"Results":[]}' > results/trivy_sbom_vulns.json
 
       ###########################################################################
-      # NORMALISE TRIVY FS RESULTS (SCA MODEL)
+      # NORMALISE TRIVY FS → SCA MODEL
       ###########################################################################
       - name: Normalize Trivy SCA
         run: |
@@ -148,6 +145,9 @@ jobs:
         with:
           path: all_results
 
+      ###########################################################################
+      # BUILD SUMMARY (ROBUST PARSING)
+      ###########################################################################
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
@@ -157,15 +157,17 @@ jobs:
             SAFE=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
 
+            # SCA (FS)
             SCA_L=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' temp/results/sca.json)
             SCA_M=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' temp/results/sca.json)
             SCA_H=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' temp/results/sca.json)
             SCA_C=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' temp/results/sca.json)
 
-            SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_sbom_vulns.json)
-            SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_sbom_vulns.json)
-            SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_sbom_vulns.json)
-            SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_sbom_vulns.json)
+            # SBOM (handles both Trivy schemas)
+            SB_L=$(jq '[.Results[]?.Vulnerabilities[]?, .Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_sbom_vulns.json)
+            SB_M=$(jq '[.Results[]?.Vulnerabilities[]?, .Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_sbom_vulns.json)
+            SB_H=$(jq '[.Results[]?.Vulnerabilities[]?, .Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_sbom_vulns.json)
+            SB_C=$(jq '[.Results[]?.Vulnerabilities[]?, .Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_sbom_vulns.json)
 
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
             echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
