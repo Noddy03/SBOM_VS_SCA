@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Repo SBOM Only)
+name: Top Repos Security Scan Trivy
 
 on:
   workflow_dispatch:
