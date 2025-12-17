@@ -104,7 +104,7 @@ jobs:
           echo "no_sbom" > results/sbom_status.txt
 
       ###########################################################################
-      # TRIVY LICENSE SCAN (FIXED)
+      # TRIVY LICENSE SCAN
       ###########################################################################
       - name: Trivy License Scan
         run: |
@@ -114,17 +114,18 @@ jobs:
           trivy fs --scanners license --format json --output ../results/trivy_license.json . || true
 
       ###########################################################################
-      # PACKAGE RESULTS
+      # PACKAGE RESULTS (SANITIZED)
       ###########################################################################
       - name: Package results
         run: |
           SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
           zip -r "$SAFE_NAME.zip" results
 
       - uses: actions/upload-artifact@v4
         with:
-          name: repo-results-${{ matrix.repo }}
-          path: "*.zip"
+          name: repo-results-${{ env.SAFE_NAME }}
+          path: "${{ env.SAFE_NAME }}.zip"
 
   summarize:
     needs: scan_repo
