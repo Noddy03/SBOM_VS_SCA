@@ -1,14 +1,12 @@
-name: Top Repos Security Scan (Trivy + Grype + Licenses)
+name: Top Repos Security Scan (Trivy + Grype + Licenses FINAL)
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Programming language to filter repos"
         required: true
         default: "Python"
       top_n:
-        description: "Number of top repositories to scan"
         required: false
         default: "5"
 
@@ -22,8 +20,7 @@ jobs:
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3 git jq curl
+      - run: sudo apt-get update && sudo apt-get install -y python3 git jq curl
 
       - id: set_output
         env:
@@ -41,8 +38,8 @@ jobs:
           res = requests.get(url, headers=headers)
           res.raise_for_status()
           repos = [r["full_name"] for r in res.json()["items"][:top_n]]
-          with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
-              gh.write(f"repos={json.dumps(repos)}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
   scan_repo:
@@ -59,19 +56,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git unzip curl
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sudo sh -s -- -b /usr/local/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
-            | sh -s -- -b /usr/local/bin
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # SCA – Trivy FS Vulnerabilities
+      # SCA – Trivy FS
       ###########################################################################
       - name: Trivy FS scan (SCA)
         run: |
@@ -101,7 +95,7 @@ jobs:
           echo "$PERM,$RESTR,$UNK" > results/license_counts.txt
 
       ###########################################################################
-      # SBOM VULNERABILITIES – Grype
+      # SBOM – Grype
       ###########################################################################
       - name: SBOM Scan (Grype)
         run: |
@@ -124,14 +118,14 @@ jobs:
       ###########################################################################
       - name: Package results
         run: |
-          SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')
-          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
-          zip -r "$SAFE_NAME.zip" results
+          SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
+          echo "SAFE=$SAFE" >> $GITHUB_ENV
+          zip -r "$SAFE.zip" results
 
       - uses: actions/upload-artifact@v4
         with:
-          name: repo-results-${{ env.SAFE_NAME }}
-          path: "${{ env.SAFE_NAME }}.zip"
+          name: repo-results-${{ env.SAFE }}
+          path: "${{ env.SAFE }}.zip"
 
   summarize:
     needs: scan_repo
@@ -142,16 +136,16 @@ jobs:
           path: all_results
 
       ###########################################################################
-      # SUMMARY CSV (COUNTS)
+      # SUMMARY CSV
       ###########################################################################
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,license_permissive,license_restricted,license_unknown,total" > summary.csv
           shopt -s globstar
 
-          for zipfile in all_results/**/*.zip; do
-            REPO=$(basename "$zipfile" .zip)
-            mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
+          for zip in all_results/**/*.zip; do
+            REPO=$(basename "$zip" .zip)
+            mkdir temp && unzip -o "$zip" -d temp >/dev/null
 
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
@@ -172,19 +166,19 @@ jobs:
           path: summary.csv
 
       ###########################################################################
-      # DETAILED LICENSE CSV
+      # DETAILED LICENSE CSV (SAFE)
       ###########################################################################
       - name: Build Trivy License summary.csv
         run: |
           echo "repo,package,version,license,confidence" > trivy_license_summary.csv
           shopt -s globstar
 
-          for zipfile in all_results/**/*.zip; do
-            REPO=$(basename "$zipfile" .zip)
-            mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
-            TRIVY_JSON="temp/results/trivy_license.json"
+          for zip in all_results/**/*.zip; do
+            REPO=$(basename "$zip" .zip)
+            mkdir temp && unzip -o "$zip" -d temp >/dev/null
+            JSON="temp/results/trivy_license.json"
 
-            if [[ -f "$TRIVY_JSON" ]]; then
+            if [[ -f "$JSON" ]]; then
               jq -r --arg repo "$REPO" '
                 .Results[]?
                 | .Packages[]?
@@ -193,18 +187,18 @@ jobs:
                     if ($pkg.Licenses | length) > 0 then
                       $pkg.Licenses[]
                     else
-                      {Name:"UNKNOWN", Confidence:0}
+                      "UNKNOWN"
                     end
                   ) as $lic
                 | [
                     $repo,
                     $pkg.Name,
                     $pkg.Version,
-                    $lic.Name,
-                    ($lic.Confidence // 0)
+                    (if ($lic | type)=="object" then $lic.Name else $lic end),
+                    (if ($lic | type)=="object" then ($lic.Confidence//0) else 0 end)
                   ]
                 | @csv
-              ' "$TRIVY_JSON" >> trivy_license_summary.csv
+              ' "$JSON" >> trivy_license_summary.csv
             fi
             rm -rf temp
           done
