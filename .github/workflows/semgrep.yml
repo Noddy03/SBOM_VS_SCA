@@ -73,7 +73,7 @@ jobs:
           mvn -q -DskipTests package || gradle build -x test || true
 
       ###########################################################################
-      # TRIVY FS SCAN — SCA VULNERABILITIES
+      # SCA VULNERABILITIES (TRIVY FS)
       ###########################################################################
       - name: Trivy FS scan (SCA)
         run: |
@@ -85,24 +85,25 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # TRIVY FS SCAN — LICENSES
+      # LICENSE SCAN (TRIVY FS) — FIXED
       ###########################################################################
       - name: Trivy FS scan (Licenses)
         run: |
+          mkdir -p results
+
           trivy fs project \
             --scanners license \
             --format json \
             --output results/licenses.json || echo '{"Results":[]}' > results/licenses.json
 
-          # Normalize license counts
           PERM=$(jq '[.Results[]?.Licenses[]? | select(.License | test("MIT|BSD|Apache|ISC"))] | length' results/licenses.json)
           RESTR=$(jq '[.Results[]?.Licenses[]? | select(.License | test("GPL|AGPL|LGPL"))] | length' results/licenses.json)
           UNK=$(jq '[.Results[]?.Licenses[]? | select(.License=="UNKNOWN")] | length' results/licenses.json)
 
-          echo "$PERM,$RESTR,$UNK" > results/license_counts.txt
+          echo "${PERM:-0},${RESTR:-0},${UNK:-0}" > results/license_counts.txt
 
       ###########################################################################
-      # SBOM SCAN (GRYPE)
+      # SBOM VULNERABILITIES (GRYPE)
       ###########################################################################
       - name: SBOM Scan (Grype)
         run: |
@@ -142,12 +143,13 @@ jobs:
           path: all_results
 
       ###########################################################################
-      # SUMMARY CSV
+      # SUMMARY CSV — FIXED LICENSE PARSING
       ###########################################################################
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,license_permissive,license_restricted,license_unknown,total" > summary.csv
           shopt -s globstar
+
           for zipfile in all_results/**/*.zip; do
             SAFE=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
@@ -157,8 +159,14 @@ jobs:
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
 
-            read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt || SB_L=0
-            read LIC_P LIC_R LIC_U < temp/results/license_counts.txt || LIC_P=0
+            SB_L=$(cut -d',' -f1 temp/results/sbom_counts.txt 2>/dev/null || echo 0)
+            SB_M=$(cut -d',' -f2 temp/results/sbom_counts.txt 2>/dev/null || echo 0)
+            SB_H=$(cut -d',' -f3 temp/results/sbom_counts.txt 2>/dev/null || echo 0)
+            SB_C=$(cut -d',' -f4 temp/results/sbom_counts.txt 2>/dev/null || echo 0)
+
+            LIC_P=$(cut -d',' -f1 temp/results/license_counts.txt 2>/dev/null || echo 0)
+            LIC_R=$(cut -d',' -f2 temp/results/license_counts.txt 2>/dev/null || echo 0)
+            LIC_U=$(cut -d',' -f3 temp/results/license_counts.txt 2>/dev/null || echo 0)
 
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
             echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$LIC_P,$LIC_R,$LIC_U,$TOTAL" >> summary.csv
