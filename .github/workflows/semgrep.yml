@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy + Grype)
+name: Top Repos Security Scan (Trivy + Grype + Licenses)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ jobs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
+        run: sudo apt-get update && sudo apt-get install -y python3 git jq curl
 
       - id: set_output
         env:
@@ -59,9 +59,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git unzip curl maven gradle
-          # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          # Install Grype
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
       - name: Clone repository
@@ -75,7 +73,7 @@ jobs:
           mvn -q -DskipTests package || gradle build -x test || true
 
       ###########################################################################
-      # TRIVY FILESYSTEM SCAN (SCA)
+      # TRIVY FS SCAN — SCA VULNERABILITIES
       ###########################################################################
       - name: Trivy FS scan (SCA)
         run: |
@@ -87,13 +85,29 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # SBOM Scan (Grype)
+      # TRIVY FS SCAN — LICENSES
+      ###########################################################################
+      - name: Trivy FS scan (Licenses)
+        run: |
+          trivy fs project \
+            --scanners license \
+            --format json \
+            --output results/licenses.json || echo '{"Results":[]}' > results/licenses.json
+
+          # Normalize license counts
+          PERM=$(jq '[.Results[]?.Licenses[]? | select(.License | test("MIT|BSD|Apache|ISC"))] | length' results/licenses.json)
+          RESTR=$(jq '[.Results[]?.Licenses[]? | select(.License | test("GPL|AGPL|LGPL"))] | length' results/licenses.json)
+          UNK=$(jq '[.Results[]?.Licenses[]? | select(.License=="UNKNOWN")] | length' results/licenses.json)
+
+          echo "$PERM,$RESTR,$UNK" > results/license_counts.txt
+
+      ###########################################################################
+      # SBOM SCAN (GRYPE)
       ###########################################################################
       - name: SBOM Scan (Grype)
         run: |
-          mkdir -p results
           grype db update || true
-          L=0; M=0; H=0; C=0; STATUS="no_sbom"
+          L=0; M=0; H=0; C=0
           for sb in $(find project -type f \( -iname "*sbom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.spdx.json" \)); do
             TMP=$(mktemp)
             grype sbom:"$sb" -o json > "$TMP" || continue
@@ -102,10 +116,8 @@ jobs:
             H=$((H+$(jq '[.matches[]? | select(.vulnerability.severity=="High")] | length' "$TMP")))
             C=$((C+$(jq '[.matches[]? | select(.vulnerability.severity=="Critical")] | length' "$TMP")))
             rm -f "$TMP"
-            STATUS="valid_with_vuln"
           done
           echo "$L,$M,$H,$C" > results/sbom_counts.txt
-          echo "$STATUS" > results/sbom_status.txt
 
       ###########################################################################
       # PACKAGE RESULTS
@@ -130,31 +142,26 @@ jobs:
           path: all_results
 
       ###########################################################################
-      # BUILD SUMMARY CSV
+      # SUMMARY CSV
       ###########################################################################
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,license_permissive,license_restricted,license_unknown,total" > summary.csv
           shopt -s globstar
           for zipfile in all_results/**/*.zip; do
             SAFE=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
 
-            # SCA counts
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
 
-            # SBOM counts
-            if [ -f temp/results/sbom_counts.txt ]; then
-              read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt
-            else
-              SB_L=0; SB_M=0; SB_H=0; SB_C=0
-            fi
+            read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt || SB_L=0
+            read LIC_P LIC_R LIC_U < temp/results/license_counts.txt || LIC_P=0
 
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
-            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
+            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$LIC_P,$LIC_R,$LIC_U,$TOTAL" >> summary.csv
             rm -rf temp
           done
 
