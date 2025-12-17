@@ -99,11 +99,11 @@ jobs:
             --scanners license \
             --format json \
             --license-full \
-            --output results/licenses.json || echo '{"Results":[]}' > results/licenses.json
+            --output results/trivy_license.json || echo '{"Results":[]}' > results/trivy_license.json
 
-          PERM=$(jq '[.Results[]?.Licenses[]? | select(.Category=="permissive")] | length // 0' results/licenses.json)
-          RESTR=$(jq '[.Results[]?.Licenses[]? | select(.Category=="restricted")] | length // 0' results/licenses.json)
-          UNK=$(jq '[.Results[]?.Licenses[]? | select(.Category=="unknown")] | length // 0' results/licenses.json)
+          PERM=$(jq '[.Results[]?.Licenses[]? | select(.Category=="permissive")] | length // 0' results/trivy_license.json)
+          RESTR=$(jq '[.Results[]?.Licenses[]? | select(.Category=="restricted")] | length // 0' results/trivy_license.json)
+          UNK=$(jq '[.Results[]?.Licenses[]? | select(.Category=="unknown")] | length // 0' results/trivy_license.json)
 
           echo "${PERM},${RESTR},${UNK}" > results/license_counts_trivy.txt
 
@@ -114,7 +114,6 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          # Setup virtualenv
           python3 -m venv venv
           source venv/bin/activate
           if [ -f requirements.txt ]; then
@@ -124,7 +123,6 @@ jobs:
           pip-licenses --from=mixed --format=json > ../results/pip_licenses.json
           cd ..
 
-          # Count categories (permissive/restricted/unknown)
           PERM=$(jq '[.[] | select(.License | test("MIT|Apache|BSD|ISC"))] | length // 0' results/pip_licenses.json)
           RESTR=$(jq '[.[] | select(.License | test("GPL|LGPL"))] | length // 0' results/pip_licenses.json)
           UNK=$(jq '[.[] | select(.License=="" or .License=="UNKNOWN")] | length // 0' results/pip_licenses.json)
@@ -210,3 +208,36 @@ jobs:
         with:
           name: security-summary
           path: summary.csv
+
+      ###########################################################################
+      # BUILD DETAILED TRIVY LICENSE SUMMARY
+      ###########################################################################
+      - name: Build Trivy License summary.csv
+        run: |
+          echo "repo,package,version,license,confidence" > trivy_license_summary.csv
+          shopt -s globstar
+
+          for zipfile in all_results/**/*.zip; do
+            REPO=$(basename "$zipfile" .zip)
+            mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
+
+            TRIVY_JSON="temp/results/trivy_license.json"
+            if [[ -f "$TRIVY_JSON" ]]; then
+              jq -r --arg repo "$REPO" '
+                .Results[]?.Packages[]? as $pkg |
+                ($repo,
+                 $pkg.Name,
+                 $pkg.Version,
+                 ($pkg.Licenses[]?.Name // "UNKNOWN"),
+                 ($pkg.Licenses[]?.Confidence // 0))
+                | @csv
+              ' "$TRIVY_JSON" >> trivy_license_summary.csv
+            fi
+
+            rm -rf temp
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-license-summary
+          path: trivy_license_summary.csv
