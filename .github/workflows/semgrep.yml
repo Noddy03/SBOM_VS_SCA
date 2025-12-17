@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy + Grype + Licenses)
+name: Top Repos Security Scan (Trivy + Grype + Licenses + Python)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       language:
         description: "Programming language to filter repos"
         required: true
-        default: "Java"
+        default: "Python"
       top_n:
         description: "Number of top repositories to scan"
         required: false
@@ -23,7 +23,7 @@ jobs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3 git jq curl
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-venv git jq curl
 
       - id: set_output
         env:
@@ -58,9 +58,14 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip curl maven gradle
+          sudo apt-get install -y jq git unzip curl maven gradle python3-venv
+          # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          # Install Grype
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          # Install pip-licenses
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pip-licenses
 
       - name: Clone repository
         env:
@@ -85,7 +90,7 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # LICENSE SCAN (TRIVY FS) — IMPROVED WITH --license-full
+      # LICENSE SCAN (TRIVY FS for non-Python)
       ###########################################################################
       - name: Trivy FS scan (Licenses)
         run: |
@@ -96,12 +101,41 @@ jobs:
             --license-full \
             --output results/licenses.json || echo '{"Results":[]}' > results/licenses.json
 
-          # Count permissive, restricted, unknown licenses robustly
           PERM=$(jq '[.Results[]?.Licenses[]? | select(.Category=="permissive")] | length // 0' results/licenses.json)
           RESTR=$(jq '[.Results[]?.Licenses[]? | select(.Category=="restricted")] | length // 0' results/licenses.json)
           UNK=$(jq '[.Results[]?.Licenses[]? | select(.Category=="unknown")] | length // 0' results/licenses.json)
 
-          echo "${PERM},${RESTR},${UNK}" > results/license_counts.txt
+          echo "${PERM},${RESTR},${UNK}" > results/license_counts_trivy.txt
+
+      ###########################################################################
+      # LICENSE SCAN (Python-specific using pip-licenses)
+      ###########################################################################
+      - name: Python licenses via pip-licenses
+        run: |
+          mkdir -p results
+          cd project
+          # Setup virtualenv
+          python3 -m venv venv
+          source venv/bin/activate
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          pip install pip-licenses
+          pip-licenses --from=mixed --format=json > ../results/pip_licenses.json
+          cd ..
+
+          # Count categories (permissive/restricted/unknown)
+          PERM=$(jq '[.[] | select(.License | test("MIT|Apache|BSD|ISC"))] | length // 0' results/pip_licenses.json)
+          RESTR=$(jq '[.[] | select(.License | test("GPL|LGPL"))] | length // 0' results/pip_licenses.json)
+          UNK=$(jq '[.[] | select(.License=="" or .License=="UNKNOWN")] | length // 0' results/pip_licenses.json)
+
+          # Combine Trivy + pip-licenses
+          read TPERM TRESTR TUNK < results/license_counts_trivy.txt
+          TOTAL_P=$((TPERM + PERM))
+          TOTAL_R=$((TRESTR + RESTR))
+          TOTAL_U=$((TUNK + UNK))
+
+          echo "${TOTAL_P},${TOTAL_R},${TOTAL_U}" > results/license_counts.txt
 
       ###########################################################################
       # SBOM VULNERABILITIES (GRYPE)
@@ -144,7 +178,7 @@ jobs:
           path: all_results
 
       ###########################################################################
-      # SUMMARY CSV — LICENSES FIXED
+      # BUILD SUMMARY CSV
       ###########################################################################
       - name: Build summary.csv
         run: |
