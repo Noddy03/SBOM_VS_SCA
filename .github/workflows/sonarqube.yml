@@ -200,6 +200,9 @@ jobs:
         with:
           path: all_results
 
+      ###########################################################################
+      # Build vulnerability summary.csv
+      ###########################################################################
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
@@ -232,3 +235,36 @@ jobs:
         with:
           name: security-summary
           path: summary.csv
+
+      ###########################################################################
+      # Build Trivy license summary.csv
+      ###########################################################################
+      - name: Build trivy_license_summary.csv
+        run: |
+          echo "repo,package,version,license,confidence" > trivy_license_summary.csv
+          shopt -s globstar
+
+          for zipfile in all_results/**/*.zip; do
+            REPO=$(basename "$zipfile" .zip)
+            mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
+
+            TRIVY_JSON="temp/results/trivy_license.json"
+            if [[ -f "$TRIVY_JSON" ]]; then
+              jq -r --arg repo "$REPO" '
+                .Results[]?.Packages[]? as $pkg |
+                ($repo,
+                 $pkg.Name,
+                 $pkg.Version,
+                 ($pkg.Licenses[]?.Name // "UNKNOWN"),
+                 ($pkg.Licenses[]?.Confidence // 0))
+                | @csv
+              ' "$TRIVY_JSON" >> trivy_license_summary.csv
+            fi
+
+            rm -rf temp
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-license-summary
+          path: trivy_license_summary.csv
