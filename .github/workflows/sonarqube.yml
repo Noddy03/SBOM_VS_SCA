@@ -1,4 +1,4 @@
-name: Security Scan Semgrep + Trivy SBOM
+name: Security Scan Snyk + Semgrep + Trivy SBOM
 
 on:
   workflow_dispatch:
@@ -90,8 +90,9 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk curl
+          sudo apt-get install -y jq git unzip openjdk-17-jdk curl maven gradle npm
           pip3 install --user semgrep cyclonedx-bom
+          npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
 
       - name: Clone repo
@@ -100,7 +101,34 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # SEMGREP
+      # Build (best effort)
+      ###########################################################################
+      - name: Build project (best effort)
+        run: |
+          cd project
+          mvn -DskipTests package || gradle build -x test || echo "Build failed, will use unmanaged scan"
+
+      ###########################################################################
+      # SCA - Snyk
+      ###########################################################################
+      - name: SCA - Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+        run: |
+          mkdir -p results
+          cd project
+          snyk test --all-projects --json > ../results/sca_raw.json || snyk test --all-projects --scan-unmanaged --json > ../results/sca_raw.json
+          jq '
+            if type=="array" then
+              map(.vulnerabilities // []) | add
+            else
+              .vulnerabilities // []
+            end
+            | { vulnerabilities: . }
+          ' ../results/sca_raw.json > ../results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > ../results/sca_cleaned.json
+
+      ###########################################################################
+      # Semgrep
       ###########################################################################
       - name: Semgrep
         run: |
@@ -108,17 +136,9 @@ jobs:
           semgrep --config=p/java --config=p/owasp-top-ten --config=p/security-audit --json --output results/semgrep.json project || echo '{"results":[]}' > results/semgrep.json
 
       ###########################################################################
-      # TRIVY FS Vulnerabilities
+      # Trivy SBOM + License
       ###########################################################################
-      - name: Trivy FS Vulnerabilities
-        run: |
-          mkdir -p results
-          trivy fs project --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
-
-      ###########################################################################
-      # TRIVY SBOM
-      ###########################################################################
-      - name: Trivy SBOM
+      - name: Trivy SBOM & License
         run: |
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
@@ -129,17 +149,10 @@ jobs:
           CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/sbom_trivy.json 2>/dev/null || echo 0)
           echo "$LOW,$MED,$HIGH,$CRIT" > results/sbom_counts.txt
           echo "SUCCESS" > results/sbom_status.txt
-
-      ###########################################################################
-      # TRIVY LICENSE
-      ###########################################################################
-      - name: Trivy License Scan
-        run: |
-          mkdir -p results
           trivy fs project --scanners license --format json --output results/trivy_license.json || echo '{"Results":[]}' > results/trivy_license.json
 
       ###########################################################################
-      # PACKAGE RESULTS
+      # Package results
       ###########################################################################
       - name: Package results
         run: |
@@ -164,15 +177,21 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           shopt -s globstar
           for zipfile in all_results/**/*.zip; do
             REPO=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
 
+            SCA_FILE="temp/results/sca_cleaned.json"
             SEM_FILE="temp/results/semgrep.json"
             SBOM_COUNTS="temp/results/sbom_counts.txt"
             SBOM_STATUS="temp/results/sbom_status.txt"
+
+            SCA_L=$([ -f "$SCA_FILE" ] && jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="low")] | length' "$SCA_FILE" || echo 0)
+            SCA_M=$([ -f "$SCA_FILE" ] && jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="medium")] | length' "$SCA_FILE" || echo 0)
+            SCA_H=$([ -f "$SCA_FILE" ] && jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="high")] | length' "$SCA_FILE" || echo 0)
+            SCA_C=$([ -f "$SCA_FILE" ] && jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="critical")] | length' "$SCA_FILE" || echo 0)
 
             SEM_L=$([ -f "$SEM_FILE" ] && jq '[.results[]? | select((.extra.severity//""|ascii_upcase)=="INFO")] | length' "$SEM_FILE" || echo 0)
             SEM_M=$([ -f "$SEM_FILE" ] && jq '[.results[]? | select((.extra.severity//""|ascii_upcase)=="WARNING")] | length' "$SEM_FILE" || echo 0)
@@ -185,9 +204,9 @@ jobs:
               SB_L=0; SB_M=0; SB_H=0; SB_C=0
             fi
             STATUS=$([ -f "$SBOM_STATUS" ] && cat "$SBOM_STATUS" || echo "N/A")
-            TOTAL=$((SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
 
-            echo "$REPO,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
+            echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
             rm -rf temp
           done
       - uses: actions/upload-artifact@v4
