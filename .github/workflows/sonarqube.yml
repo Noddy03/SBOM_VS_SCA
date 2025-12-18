@@ -25,7 +25,7 @@ jobs:
     steps:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
-      - name: Fetch top Java Maven repos
+      - name: Fetch top Java Maven/Gradle repos
         id: set_output
         env:
           LANG: ${{ inputs.language }}
@@ -45,11 +45,9 @@ jobs:
           page = 1
           per_page = 30
           max_pages = 10
-          def has_java_or_build_file(repo):
-              # Check for pom.xml or build.gradle
-              urls = [f"https://api.github.com/repos/{repo}/contents/pom.xml",
-                      f"https://api.github.com/repos/{repo}/contents/build.gradle"]
-              for url in urls:
+          def has_build_file(repo):
+              for file in ["pom.xml", "build.gradle"]:
+                  url = f"https://api.github.com/repos/{repo}/contents/{file}"
                   r = requests.get(url, headers=headers)
                   if r.status_code == 200:
                       return True
@@ -69,7 +67,7 @@ jobs:
                   break
               for repo in items:
                   full = repo["full_name"]
-                  if has_java_or_build_file(full):
+                  if has_build_file(full):
                       repos.append(full)
                       if len(repos) >= TOP_N:
                           break
@@ -106,13 +104,17 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # BUILD PROJECT (best effort)
+      # BUILD PROJECT (resolve dependencies for Snyk)
       ###########################################################################
       - name: Build project
         run: |
           cd project
-          if [ -f "pom.xml" ]; then mvn -DskipTests package || true; fi
-          if [ -f "build.gradle" ]; then gradle build -x test || true; fi
+          if [ -f "pom.xml" ]; then
+            mvn dependency:resolve -B || true
+          fi
+          if [ -f "gradlew" ]; then
+            ./gradlew build --refresh-dependencies -x test || true
+          fi
 
       ###########################################################################
       # SCA - Snyk
@@ -123,7 +125,7 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          snyk test --all-projects --detection-depth=10 --json > ../results/sca_raw.json || echo '{"vulnerabilities":[]}' > ../results/sca_raw.json
+          snyk test --all-projects --scan-unmanaged --json > ../results/sca_raw.json || echo '{"vulnerabilities":[]}' > ../results/sca_raw.json
           jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | {vulnerabilities: .}' ../results/sca_raw.json > ../results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > ../results/sca_cleaned.json
 
       ###########################################################################
@@ -132,7 +134,7 @@ jobs:
       - name: Semgrep
         run: |
           mkdir -p results
-          semgrep --config=p/security-audit,p/owasp-top-ten,p/java --json --output results/semgrep.json project || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config=p/java --config=p/owasp-top-ten --config=p/security-audit --json --output results/semgrep.json project/src || echo '{"results":[]}' > results/semgrep.json
 
       ###########################################################################
       # TRIVY SBOM VULNERABILITIES
