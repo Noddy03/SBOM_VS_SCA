@@ -137,21 +137,17 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          # Use existing SBOM if present
-          if [ -f ./sbom.cdx.json ]; then
-            SBOM="../results/sbom.cdx.json"
-            cp ./sbom.cdx.json $SBOM
-          else
-            # Generate SBOM if missing
-            trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
-            SBOM="../results/sbom.cdx.json"
+          # Use existing SBOM if present, otherwise generate
+          if [ ! -f sbom.cdx.json ]; then
+            trivy fs --format cyclonedx --output sbom.cdx.json . || true
           fi
           cd ..
+          # Run DepScan container using SBOM from project folder
           docker run --rm \
             -v "${{ github.workspace }}/project":/src \
             -v "${{ github.workspace }}/results":/results \
             owasp/dep-scan:latest scan \
-            --input /src/$SBOM --format json --output /results/depscan_vulns.json || true
+            --input /src/sbom.cdx.json --format json --output /results/depscan_vulns.json || true
           # Count vulnerabilities from DepScan
           if [ -f results/depscan_vulns.json ]; then
             LOW=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan_vulns.json || echo 0)
@@ -185,7 +181,7 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,license_permissive,license_restricted,license_unknown,total" > summary.csv
+          echo "repo,sca_low,sca_medium,s ca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,license_permissive,license_restricted,license_unknown,total" > summary.csv
           shopt -s globstar
           for zip in all_results/**/*.zip; do
             REPO=$(basename "$zip" .zip)
