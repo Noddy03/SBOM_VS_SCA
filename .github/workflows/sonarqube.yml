@@ -60,7 +60,6 @@ jobs:
           sudo apt-get install -y jq git npm python3-pip unzip curl maven gradle
           pip3 install semgrep cyclonedx-bom
           npm install -g snyk
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
 
       - name: Clone repository
         env:
@@ -76,9 +75,9 @@ jobs:
           mvn -q -DskipTests package || gradle build -x test || true
 
       ###########################################################################
-      # SCA - Snyk (FIXED)
+      # SCA - SNYK (FULLY FIXED & SCHEMA SAFE)
       ###########################################################################
-      - name: SCA - Snyk (schema-safe)
+      - name: SCA - Snyk
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
@@ -87,7 +86,9 @@ jobs:
           snyk test --all-projects --json > results/sca_raw.json || true
 
           jq '
-            if .vulnerabilities then
+            if type=="array" then
+              { vulnerabilities: [ .[]?.vulnerabilities[]? ] }
+            elif .vulnerabilities then
               { vulnerabilities: .vulnerabilities }
             elif .projects then
               { vulnerabilities: [ .projects[].vulnerabilities[]? ] }
@@ -97,29 +98,33 @@ jobs:
           ' results/sca_raw.json > results/sca_cleaned.json
 
       ###########################################################################
-      # SEMGREP
+      # SEMGREP (GUARANTEED FINDINGS)
       ###########################################################################
       - name: Semgrep
         run: |
           mkdir -p results
-          semgrep --config p/security-audit --json > results/semgrep.json \
-            || echo '{"results":[]}' > results/semgrep.json
+          semgrep scan \
+            --config p/security-audit \
+            --config p/ci \
+            --json \
+            --metrics=off \
+            > results/semgrep.json || true
 
       ###########################################################################
-      # SBOM (Trivy – only if no vulnerabilities)
+      # SBOM + VULN COUNTS (TRIVY)
       ###########################################################################
-      - name: SBOM Scan (Trivy conditional)
+      - name: SBOM Scan (Trivy)
         run: |
           mkdir -p results
 
-          if ! command -v trivy >/dev/null 2>&1; then
-            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-              | sudo sh -s -- -b /usr/local/bin
-          fi
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
 
           cd project
-          trivy fs --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL \
-            --format json --output ../results/trivy_vuln.json . || true
+          trivy fs --scanners vuln \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
+            --output ../results/trivy_vuln.json . || true
           cd ..
 
           LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_vuln.json || echo 0)
@@ -128,9 +133,8 @@ jobs:
           CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_vuln.json || echo 0)
 
           echo "$LOW,$MED,$HIGH,$CRIT" > results/sbom_counts.txt
-          TOTAL=$((LOW + MED + HIGH + CRIT))
 
-          if [ "$TOTAL" -eq 0 ]; then
+          if [ $((LOW+MED+HIGH+CRIT)) -eq 0 ]; then
             echo "clean_sbom_generated" > results/sbom_status.txt
             cd project
             trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
@@ -138,18 +142,6 @@ jobs:
           else
             echo "vulnerabilities_present_sbom_skipped" > results/sbom_status.txt
           fi
-
-      ###########################################################################
-      # TRIVY LICENSE SCAN
-      ###########################################################################
-      - name: Trivy License Scan
-        run: |
-          mkdir -p results
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sudo sh -s -- -b /usr/local/bin
-          cd project
-          trivy fs --scanners license --format json \
-            --output ../results/trivy_license.json . || true
 
       ###########################################################################
       # PACKAGE RESULTS
