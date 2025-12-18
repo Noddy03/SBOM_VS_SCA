@@ -22,8 +22,9 @@ jobs:
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
-      - run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
-
+      - name: Install prerequisites
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
+  
       - id: set_output
         env:
           LANG_FILTER: ${{ inputs.language }}
@@ -31,17 +32,46 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 <<'EOF'
-          import os, requests, urllib.parse, json
+          import os, requests, urllib.parse, json, time
+  
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
-          url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(lang)}&sort=stars&order=desc&per_page=50"
-          res = requests.get(url, headers=headers)
-          res.raise_for_status()
-          repos = [r["full_name"] for r in res.json()["items"][:top_n]]
-          with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
-              gh.write(f"repos={json.dumps(repos)}\n")
+  
+          repos_with_sbom = []
+          per_page = 50
+          page = 1
+  
+          while len(repos_with_sbom) < top_n:
+              query = f"filename:sbom.cdx.json language:{lang}"
+              url = f"https://api.github.com/search/code?q={urllib.parse.quote(query)}&per_page={per_page}&page={page}"
+  
+              try:
+                  res = requests.get(url, headers=headers, timeout=10)
+                  if res.status_code != 200:
+                      break
+                  res.raise_for_status()
+              except requests.exceptions.RequestException:
+                  time.sleep(5)
+                  continue
+  
+              items = res.json().get("items", [])
+              if not items:
+                  break
+  
+              for item in items:
+                  repo_full_name = item["repository"]["full_name"]
+                  if repo_full_name not in repos_with_sbom:
+                      repos_with_sbom.append(repo_full_name)
+                      if len(repos_with_sbom) >= top_n:
+                          break
+  
+              page += 1
+              time.sleep(1)
+  
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"repos={json.dumps(repos_with_sbom)}\n")
           EOF
 
   scan_repo:
