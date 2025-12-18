@@ -108,7 +108,7 @@ jobs:
           EOF
 
       - name: Debug fetched repos
-        run: echo "Fetched repos: ${{ steps.fetch.outputs.repos }}"
+        run: echo "Fetched repos:${{ steps.fetch.outputs.repos }}"
 
 ###############################################################################
 # SCAN REPOS
