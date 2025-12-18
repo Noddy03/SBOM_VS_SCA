@@ -46,7 +46,7 @@ jobs:
           per_page = 30
           max_pages = 10
           def has_build_file(repo):
-              for file in ["pom.xml", "build.gradle"]:
+              for file in ["pom.xml", "build.gradle", "build.gradle.kts"]:
                   url = f"https://api.github.com/repos/{repo}/contents/{file}"
                   r = requests.get(url, headers=headers)
                   if r.status_code == 200:
@@ -110,7 +110,7 @@ jobs:
         run: |
           cd project
           if [ -f "pom.xml" ]; then
-            mvn dependency:resolve -B || true
+            mvn dependency:go-offline -B || true
           fi
           if [ -f "gradlew" ]; then
             ./gradlew build --refresh-dependencies -x test || true
@@ -134,7 +134,7 @@ jobs:
       - name: Semgrep
         run: |
           mkdir -p results
-          semgrep --config=p/java --config=p/owasp-top-ten --config=p/security-audit --json --output results/semgrep.json project/src || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config=p/java --config=p/owasp-top-ten --config=p/security-audit --json --output results/semgrep.json project/**/*.java || echo '{"results":[]}' > results/semgrep.json
 
       ###########################################################################
       # TRIVY SBOM VULNERABILITIES
