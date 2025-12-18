@@ -57,8 +57,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip unzip curl maven gradle
-          pip3 install semgrep cyclonedx-bom dep-scan
+          sudo apt-get install -y jq git npm python3-pip unzip curl maven gradle docker.io
+          pip3 install semgrep cyclonedx-bom
           npm install -g snyk
 
       - name: Clone repository
@@ -104,7 +104,7 @@ jobs:
           semgrep scan --config p/security-audit --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       ###########################################################################
-      # SBOM + Trivy + DepScan
+      # SBOM + Trivy + DepScan (Docker)
       ###########################################################################
       - name: SBOM + Trivy + DepScan
         run: |
@@ -112,7 +112,7 @@ jobs:
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           cd project
 
-          # Run Trivy vulnerability scan
+          # Trivy vulnerability scan
           trivy fs --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_vuln.json . || true
 
           # Count Trivy vulnerabilities
@@ -121,8 +121,10 @@ jobs:
           HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' ../results/trivy_vuln.json || echo 0)
           CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' ../results/trivy_vuln.json || echo 0)
           echo "$LOW,$MED,$HIGH,$CRIT" > ../results/sbom_counts.txt
+
           TOTAL=$((LOW+MED+HIGH+CRIT))
 
+          # If no vulnerabilities, generate SBOM
           if [ "$TOTAL" -eq 0 ]; then
             echo "clean_sbom_generated" > ../results/sbom_status.txt
             trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
@@ -132,23 +134,27 @@ jobs:
             if [ -f ./sbom.cdx.json ]; then
               SBOM="./sbom.cdx.json"
             else
+              trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
               SBOM="../results/sbom.cdx.json"
-              trivy fs --format cyclonedx --output "$SBOM" . || true
             fi
           fi
-
-          # Run DepScan on SBOM
-          depscan scan --input "$SBOM" --format json --output ../results/depscan_vulns.json || true
-
-          # Count DepScan vulnerabilities
-          if [[ -f ../results/depscan_vulns.json ]]; then
-            LOW=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' ../results/depscan_vulns.json || echo $LOW)
-            MED=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' ../results/depscan_vulns.json || echo $MED)
-            HIGH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' ../results/depscan_vulns.json || echo $HIGH)
-            CRIT=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' ../results/depscan_vulns.json || echo $CRIT)
-            echo "$LOW,$MED,$HIGH,$CRIT" > ../results/sbom_counts.txt
-          fi
           cd ..
+
+          # Run DepScan via Docker on SBOM
+          docker run --rm \
+            -v "${{ github.workspace }}/project":/src \
+            -v "${{ github.workspace }}/results":/results \
+            owasp/dep-scan:latest scan \
+            --input /src/$SBOM --format json --output /results/depscan_vulns.json || true
+
+          # Update counts from DepScan
+          if [ -f results/depscan_vulns.json ]; then
+            LOW=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan_vulns.json || echo $LOW)
+            MED=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/depscan_vulns.json || echo $MED)
+            HIGH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/depscan_vulns.json || echo $HIGH)
+            CRIT=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan_vulns.json || echo $CRIT)
+            echo "$LOW,$MED,$HIGH,$CRIT" > results/sbom_counts.txt
+          fi
 
       ###########################################################################
       # PACKAGE RESULTS
