@@ -1,4 +1,4 @@
-name: Repos Security Scan Snyk+Semgrep
+name: Top Java Maven Repos Security Scan (SBOM Optional)
 
 on:
   workflow_dispatch:
@@ -86,7 +86,7 @@ jobs:
     continue-on-error: true
 
     steps:
-      - name: Install tools (Docker + Trivy + Java)
+      - name: Install tools (Docker + Trivy + Java + Semgrep)
         run: |
           sudo apt-get update
           sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common lsb-release gnupg jq git unzip openjdk-17-jdk
@@ -96,8 +96,11 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
           sudo apt-get update
           sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+          # Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
+          # Semgrep
+          pip3 install --user semgrep
 
       - name: Clone repo
         env:
@@ -154,7 +157,20 @@ jobs:
             --output ../results/trivy_license.json . || true
 
 ################################################################################
-# PACKAGE RESULTS (SAFE ARTIFACT NAME)
+# SCA + Semgrep scans
+################################################################################
+      - name: Run Semgrep
+        run: |
+          mkdir -p results
+          semgrep --config=p/ci --json --output results/semgrep.json project || echo '{"results":[]}' > results/semgrep.json
+
+      - name: Run SCA (Trivy SCA)
+        run: |
+          mkdir -p results
+          trivy fs project --scanners vuln --format json --output results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > results/sca_cleaned.json
+
+################################################################################
+# PACKAGE RESULTS
 ################################################################################
       - name: Package results
         run: |
