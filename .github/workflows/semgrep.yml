@@ -66,7 +66,7 @@ jobs:
               page += 1
               time.sleep(1)
 
-          # Debug output
+          # Debug print in logs
           print("Fetched repos:", repos_with_sbom)
 
           # GitHub Actions output
@@ -75,7 +75,9 @@ jobs:
           EOF
 
       - name: Debug fetched repos
-        run: echo "Fetched repos ${ steps.set_output.outputs.repos }"
+        run: |
+          REPOS="${{ steps.set_output.outputs.repos }}"
+          echo "Fetched repos: $REPOS"
 
   scan_repo:
     needs: fetch_repos
