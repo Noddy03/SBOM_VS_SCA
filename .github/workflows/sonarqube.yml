@@ -1,4 +1,4 @@
-name:  Security Scan Snyk+Semgrep
+name: Security Scan Snyk+Semgrep+TrivySBOM
 
 on:
   workflow_dispatch:
@@ -23,6 +23,8 @@ jobs:
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
       - name: Fetch top Java Maven repos
         id: set_output
         env:
@@ -84,100 +86,78 @@ jobs:
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
     continue-on-error: true
-
     steps:
-      - name: Install tools (Docker + Trivy + Java + Semgrep)
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common lsb-release gnupg jq git unzip openjdk-17-jdk
-          # Install Docker from official repo to avoid containerd conflicts
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
-            | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y docker-ce docker-ce-cli containerd.io
-          # Trivy
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sudo sh -s -- -b /usr/local/bin
-          # Semgrep
-          pip3 install --user semgrep
+          sudo apt-get install -y jq git unzip openjdk-17-jdk maven curl
+          pip3 install semgrep cyclonedx-bom
+          npm install -g snyk
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
 
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-################################################################################
-# TRIVY FS SCAN
-################################################################################
-      - name: Trivy FS Vulnerabilities
+      ###########################################################################
+      # BUILD (best effort)
+      ###########################################################################
+      - name: Build project
         run: |
-          mkdir -p results
-          trivy fs project \
-            --scanners vuln \
-            --severity LOW,MEDIUM,HIGH,CRITICAL \
-            --format json \
-            --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
-
-################################################################################
-# SBOM + DEPSCAN
-################################################################################
-      - name: SBOM + DepScan
-        run: |
-          mkdir -p results
-          FOUND_SBOM=$(find project -iname '*sbom*.json' -o -iname '*cyclonedx*.json' | head -n 1)
-          if [ -n "$FOUND_SBOM" ]; then
-            echo "Using existing SBOM: $FOUND_SBOM"
-            cp "$FOUND_SBOM" results/sbom.cdx.json
-          else
-            echo "No SBOM found, generating one"
-            trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
-          fi
-          docker run --rm \
-            -v "${{ github.workspace }}/results":/results \
-            owasp/dep-scan:latest scan \
-            --input /results/sbom.cdx.json \
-            --format json \
-            --output /results/depscan.json || true
-          LOW=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan.json 2>/dev/null || echo 0)
-          MED=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/depscan.json 2>/dev/null || echo 0)
-          HIGH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/depscan.json 2>/dev/null || echo 0)
-          CRIT=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan.json 2>/dev/null || echo 0)
-          echo "$LOW,$MED,$HIGH,$CRIT" > results/sbom_counts.txt
-
-################################################################################
-# TRIVY LICENSE SCAN
-################################################################################
-      - name: Trivy License Scan
-        run: |
-          mkdir -p results
           cd project
-          trivy fs --scanners license --format json \
-            --output ../results/trivy_license.json . || true
+          mvn -q -DskipTests package || true
 
-################################################################################
-# SCA + Semgrep scans
-################################################################################
-      - name: Run Semgrep
+      ###########################################################################
+      # SCA - Snyk
+      ###########################################################################
+      - name: SCA - Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+        run: |
+          mkdir -p results
+          snyk test --all-projects --json > results/sca_raw.json || echo '{"vulnerabilities":[]}' > results/sca_raw.json
+          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | {vulnerabilities: .}' results/sca_raw.json > results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > results/sca_cleaned.json
+
+      ###########################################################################
+      # SEMGREP
+      ###########################################################################
+      - name: Semgrep
         run: |
           mkdir -p results
           semgrep --config=p/ci --json --output results/semgrep.json project || echo '{"results":[]}' > results/semgrep.json
 
-      - name: Run SCA (Trivy SCA)
+      ###########################################################################
+      # TRIVY SBOM VULNERABILITIES
+      ###########################################################################
+      - name: Trivy SBOM Scan
         run: |
           mkdir -p results
-          trivy fs project --scanners vuln --format json --output results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > results/sca_cleaned.json
+          trivy fs project --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
+          trivy sbom results/sbom.cdx.json --format json --output results/sbom_trivy.json || echo '{"Results":[]}' > results/sbom_trivy.json
+          LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/sbom_trivy.json 2>/dev/null || echo 0)
+          MED=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/sbom_trivy.json 2>/dev/null || echo 0)
+          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/sbom_trivy.json 2>/dev/null || echo 0)
+          CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/sbom_trivy.json 2>/dev/null || echo 0)
+          echo "$LOW,$MED,$HIGH,$CRIT" > results/sbom_counts.txt
+          echo "SUCCESS" > results/sbom_status.txt
 
-################################################################################
-# PACKAGE RESULTS
-################################################################################
+      ###########################################################################
+      # TRIVY LICENSE
+      ###########################################################################
+      - name: Trivy License Scan
+        run: |
+          mkdir -p results
+          trivy fs project --scanners license --format json --output results/trivy_license.json || echo '{"Results":[]}' > results/trivy_license.json
+
+      ###########################################################################
+      # PACKAGE RESULTS
+      ###########################################################################
       - name: Package results
         run: |
           SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
           echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
           zip -r "$SAFE_NAME.zip" results
-
       - uses: actions/upload-artifact@v4
         with:
           name: repo-results-${{ env.SAFE_NAME }}
@@ -194,7 +174,7 @@ jobs:
         with:
           path: all_results
 
-      - name: Build summary.csv (bulletproof)
+      - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           shopt -s globstar
@@ -202,6 +182,7 @@ jobs:
             REPO=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
 
+            # SCA counts
             SCA_FILE="temp/results/sca_cleaned.json"
             SEM_FILE="temp/results/semgrep.json"
             SBOM_COUNTS="temp/results/sbom_counts.txt"
@@ -212,24 +193,24 @@ jobs:
             SCA_H=$([ -f "$SCA_FILE" ] && jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="high")] | length' "$SCA_FILE" || echo 0)
             SCA_C=$([ -f "$SCA_FILE" ] && jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="critical")] | length' "$SCA_FILE" || echo 0)
 
+            # Semgrep counts
             SEM_L=$([ -f "$SEM_FILE" ] && jq '[.results[]? | select((.extra.severity//""|ascii_upcase)=="INFO")] | length' "$SEM_FILE" || echo 0)
             SEM_M=$([ -f "$SEM_FILE" ] && jq '[.results[]? | select((.extra.severity//""|ascii_upcase)=="WARNING")] | length' "$SEM_FILE" || echo 0)
             SEM_H=$([ -f "$SEM_FILE" ] && jq '[.results[]? | select((.extra.severity//""|ascii_upcase)=="ERROR")] | length' "$SEM_FILE" || echo 0)
             SEM_C=$SEM_H
 
+            # SBOM counts
             if [ -f "$SBOM_COUNTS" ]; then
               IFS=',' read SB_L SB_M SB_H SB_C < "$SBOM_COUNTS"
             else
               SB_L=0; SB_M=0; SB_H=0; SB_C=0
             fi
-
             STATUS=$([ -f "$SBOM_STATUS" ] && cat "$SBOM_STATUS" || echo "N/A")
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
 
             echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
             rm -rf temp
           done
-
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
@@ -249,34 +230,18 @@ jobs:
                 | if ($pkg.Licenses | type) == "array" and ($pkg.Licenses | length) > 0 then
                     $pkg.Licenses[]?
                     | if type == "object" then
-                        [ $repo,
-                          $pkg.Name,
-                          $pkg.Version,
-                          (.Name // "UNKNOWN"),
-                          (.Confidence // 0)
-                        ]
+                        [ $repo, $pkg.Name, $pkg.Version, (.Name // "UNKNOWN"), (.Confidence // 0) ]
                       elif type == "string" then
-                        [ $repo,
-                          $pkg.Name,
-                          $pkg.Version,
-                          .,
-                          0
-                        ]
+                        [ $repo, $pkg.Name, $pkg.Version, ., 0 ]
                       else empty end
                   else
-                    [ $repo,
-                      $pkg.Name,
-                      $pkg.Version,
-                      "UNKNOWN",
-                      0
-                    ]
+                    [ $repo, $pkg.Name, $pkg.Version, "UNKNOWN", 0 ]
                   end
                 | @csv
               ' "$JSON" >> trivy_license_summary.csv
             fi
             rm -rf temp
           done
-
       - uses: actions/upload-artifact@v4
         with:
           name: trivy-license-summary
