@@ -75,7 +75,7 @@ jobs:
           EOF
 
       - name: Debug fetched repos
-        run: echo "Fetched repos: ${{ steps.set_output.outputs.repos }}"
+        run: echo "Fetched repos ${ steps.set_output.outputs.repos }"
 
   scan_repo:
     needs: fetch_repos
