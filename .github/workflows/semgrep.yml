@@ -62,6 +62,8 @@ jobs:
 
     steps:
       - name: Install tools
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git unzip curl openjdk-17-jdk python3-pip python3-venv
@@ -69,8 +71,8 @@ jobs:
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           # Install Grype
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
-          # Install DepScan directly from GitHub
-          pip3 install git+https://github.com/securego/dep-scan.git
+          # Install DepScan from GitHub using GITHUB_TOKEN
+          pip3 install git+https://x-access-token:${GITHUB_TOKEN}@github.com/securego/dep-scan.git
 
       - name: Clone repository
         env:
