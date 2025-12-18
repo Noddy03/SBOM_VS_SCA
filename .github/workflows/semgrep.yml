@@ -40,7 +40,7 @@ jobs:
           repos = []
           page = 1
           per_page = 50
-          max_pages = 20  # GitHub Search API limit (1000 results)
+          max_pages = 20  # GitHub Search API limit (~1000 results)
 
           while len(repos) < top_n and page <= max_pages:
               if lang.lower() == "java":
@@ -65,17 +65,6 @@ jobs:
 
               for r in items:
                   full_name = r["full_name"]
-
-                  # Check for SBOM file in repo tree
-                  tree_url = f"https://api.github.com/repos/{full_name}/git/trees/HEAD?recursive=1"
-                  tree_res = requests.get(tree_url, headers=headers)
-                  if tree_res.status_code != 200:
-                      continue
-                  files = [f['path'] for f in tree_res.json().get('tree', [])]
-
-                  if 'sbom.cdx.json' not in files:
-                      continue  # Only include repos with SBOM
-
                   repos.append(full_name)
                   if len(repos) >= top_n:
                       break
@@ -88,6 +77,7 @@ jobs:
 
   scan_repo:
     needs: fetch_repos
+    if: needs.fetch_repos.outputs.repos != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
