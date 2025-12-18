@@ -20,7 +20,8 @@ jobs:
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
-      - run: sudo apt-get update && sudo apt-get install -y python3 git jq curl python3-pip
+      - name: Install prerequisites
+        run: sudo apt-get update && sudo apt-get install -y python3 git jq curl python3-pip
 
       - id: set_output
         env:
@@ -63,10 +64,14 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip curl openjdk-17-jdk python3-pip
-          pip3 install dep-scan
+          sudo apt-get install -y jq git unzip curl openjdk-17-jdk python3-pip python3-venv
+          # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          # Install Grype
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          # Clone and install DepScan from GitHub
+          git clone https://github.com/securego/dep-scan.git /tmp/dep-scan
+          pip3 install /tmp/dep-scan
 
       - name: Clone repository
         env:
