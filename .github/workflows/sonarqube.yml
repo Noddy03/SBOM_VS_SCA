@@ -1,4 +1,4 @@
-name: Top Java Maven Repos Security Scan (SBOM Optional)
+name:  Security Scan Snyk+Semgrep
 
 on:
   workflow_dispatch:
