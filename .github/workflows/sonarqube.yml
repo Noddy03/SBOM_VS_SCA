@@ -25,6 +25,7 @@ jobs:
     steps:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
+
       - name: Fetch top Java Maven/Gradle repos
         id: set_output
         env:
@@ -86,6 +87,7 @@ jobs:
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
     continue-on-error: true
+
     steps:
       - name: Install tools
         run: |
@@ -101,14 +103,15 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # Build (skip Docker builds)
+      # Build project (skip Docker)
       ###########################################################################
-      - name: Build project (skip Docker)
+      - name: Build project
         run: |
           if [ -e results ]; then rm -rf results; fi
           mkdir -p results
           cd project
-          mvn -DskipTests -DskipDockerBuild package || gradle build -x test -x dockerBuild || echo "Build failed, using unmanaged scan"
+          # Skip Docker builds and allow failures
+          mvn -DskipTests -DskipDockerBuild package || gradle build -x test -x dockerBuild || echo "Build failed, continuing with SCA scan"
 
       ###########################################################################
       # SCA - Snyk
@@ -117,27 +120,24 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          if [ -e results ]; then rm -rf results; fi
           mkdir -p results
           cd project
-          snyk test --all-projects --json > ../results/sca_raw.json || snyk test --all-projects --scan-unmanaged --json > ../results/sca_raw.json
-          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | { vulnerabilities: . }' ../results/sca_raw.json > ../results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > ../results/sca_cleaned.json
+          snyk test --all-projects --scan-unmanaged --json > ../results/sca_raw.json || echo '{"vulnerabilities":[]}' > ../results/sca_raw.json
+          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | { vulnerabilities: . }' ../results/sca_raw.json > ../results/sca_cleaned.json
 
       ###########################################################################
       # Semgrep
       ###########################################################################
       - name: Semgrep
         run: |
-          if [ -e results ]; then rm -rf results; fi
           mkdir -p results
           semgrep --config=p/java --config=p/owasp-top-ten --config=p/security-audit --json --output results/semgrep.json project || echo '{"results":[]}' > results/semgrep.json
 
       ###########################################################################
-      # Trivy SBOM + License
+      # Trivy SBOM & License
       ###########################################################################
-      - name: Trivy SBOM & License
+      - name: Trivy SBOM + License
         run: |
-          if [ -e results ]; then rm -rf results; fi
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
           trivy sbom results/sbom.cdx.json --format json --output results/sbom_trivy.json || echo '{"Results":[]}' > results/sbom_trivy.json
