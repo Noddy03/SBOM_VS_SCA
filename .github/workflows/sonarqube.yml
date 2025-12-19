@@ -74,7 +74,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-pip
+          sudo apt-get install -y jq git openjdk-17-jdk python3-pip
           npm install -g snyk
           pip3 install semgrep
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
@@ -95,7 +95,7 @@ jobs:
           mvn -q -DskipTests -Ddocker.skip=true dependency:tree || true
 
 ################################################################################
-# 🔥 SNYK SCA (FIXED + FAST)
+# 🔥 SNYK SCA (ROBUST)
 ################################################################################
       - name: Snyk SCA
         env:
@@ -109,7 +109,6 @@ jobs:
           snyk test --maven --all-projects --severity-threshold=low --json \
             > ../results/sca_raw.json || true
 
-          # Normalize ALL formats (object, array, multi-doc JSON)
           jq -s '
             [
               .[] |
@@ -167,9 +166,14 @@ jobs:
 
           echo "${{ matrix.repo }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" > repo_summary.csv
 
+      - name: Upload repo summary row
+        run: |
+          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
+
       - uses: actions/upload-artifact@v4
         with:
-          name: summary-${{ matrix.repo }}
+          name: summary-${{ env.SAFE_NAME }}
           path: repo_summary.csv
 
 ################################################################################
