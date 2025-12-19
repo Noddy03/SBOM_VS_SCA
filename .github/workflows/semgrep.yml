@@ -32,10 +32,19 @@ jobs:
           python3 <<'EOF'
           import os, requests, json, urllib.parse, time
 
+          language = os.environ["LANG"].lower()
           headers = {
               "Authorization": f"token {os.environ['TOKEN']}",
               "Accept": "application/vnd.github+json"
           }
+
+          # Select dependency files based on language
+          if language == "java":
+              files_to_check = ["pom.xml"]
+          elif language == "python":
+              files_to_check = ["requirements.txt", "pyproject.toml"]
+          else:
+              files_to_check = []
 
           repos = []
           page = 1
@@ -48,24 +57,33 @@ jobs:
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
                   break
+
               for repo in r.json().get("items", []):
-                  pom = f"https://api.github.com/repos/{repo['full_name']}/contents/pom.xml"
-                  if requests.get(pom, headers=headers).status_code == 200:
+                  # Include repo only if it has at least one dependency file
+                  include = False
+                  for file_name in files_to_check:
+                      file_url = f"https://api.github.com/repos/{repo['full_name']}/contents/{file_name}"
+                      if requests.get(file_url, headers=headers).status_code == 200:
+                          include = True
+                          break
+                  if include:
                       repos.append(repo["full_name"])
                       if len(repos) >= int(os.environ["TOP_N"]):
                           break
               page += 1
               time.sleep(1)
+
+          # Always output a JSON array
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
 ################################################################################
-# SCAN EACH REPO
+# SCAN EACH REPO (MATRIX)
 ################################################################################
   scan_repo:
     needs: fetch_repos
-    if: needs.fetch_repos.outputs.repos != '[]'
+    if: ${{ needs.fetch_repos.outputs.repos != '[]' && needs.fetch_repos.outputs.repos != '' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -74,12 +92,13 @@ jobs:
     continue-on-error: true
 
     steps:
-      - name: Install tools (conflict-free)
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk
+          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-pip
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
+          pip3 install --upgrade pip
 
       - name: Clone repo
         env:
@@ -96,15 +115,20 @@ jobs:
 ################################################################################
 # RESOLVE DEPENDENCIES
 ################################################################################
-      - name: Resolve Maven dependencies
+      - name: Resolve dependencies
         run: |
           cd project
-          mvn -q -DskipTests dependency:resolve || true
+          if [ "${{ inputs.language }}" == "Java" ]; then
+            mvn -q -DskipTests dependency:resolve || true
+          elif [ "${{ inputs.language }}" == "Python" ]; then
+            pip3 install --upgrade pip
+            if [ -f requirements.txt ]; then pip3 install -r requirements.txt; fi
+          fi
 
 ################################################################################
-# TRIVY DEPENDENCY SCA
+# TRIVY SCA
 ################################################################################
-      - name: Trivy Java Dependency SCA
+      - name: Trivy Dependency SCA
         run: |
           mkdir -p results
           trivy fs project \
@@ -115,24 +139,18 @@ jobs:
             --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
 
 ################################################################################
-# TRIVY SBOM GENERATION
+# TRIVY SBOM
 ################################################################################
-      - name: Generate SBOM (CycloneDX)
+      - name: Generate SBOM
         run: |
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
-
-################################################################################
-# TRIVY SBOM VULNERABILITY SCAN
-################################################################################
-      - name: Trivy SBOM Scan
-        run: |
           trivy sbom results/sbom.cdx.json \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
             --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
 
 ################################################################################
-# OWASP DEP-SCAN (SBOM)
+# DEP-SCAN
 ################################################################################
       - name: OWASP DepScan
         run: |
@@ -144,17 +162,15 @@ jobs:
             --output /results/depscan.json || true
 
 ################################################################################
-# COUNT VULNERABILITIES
+# BUILD PER-REPO SUMMARY
 ################################################################################
-      - name: Build repo summary row
+      - name: Build repo summary
         run: |
-          # Trivy SCA
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
           SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
 
-          # Trivy SBOM
           SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sbom_vuln.json)
           SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sbom_vuln.json)
           SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json)
@@ -165,9 +181,6 @@ jobs:
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
 
-################################################################################
-# UPLOAD REPO SUMMARY
-################################################################################
       - name: Upload repo summary
         uses: actions/upload-artifact@v4
         with:
@@ -175,12 +188,11 @@ jobs:
           path: repo_summary.csv
 
 ################################################################################
-# BUILD FINAL SUMMARY
+# FINAL SUMMARY
 ################################################################################
   build_summary:
     needs: scan_repo
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/download-artifact@v4
         with:
