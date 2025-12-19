@@ -1,4 +1,5 @@
-name: Security Scan full Trivy 
+name: Security Scan full Trivy
+
 on:
   workflow_dispatch:
     inputs:
@@ -74,9 +75,12 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk docker.io
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
+
+      - name: Verify Docker
+        run: docker --version
 
       - name: Clone repo
         env:
@@ -97,15 +101,13 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
 ################################################################################
-# SBOM (OPTIONAL) + DEPSCAN
+# SBOM + DEPSCAN
 ################################################################################
       - name: SBOM + DepScan
         run: |
           mkdir -p results
 
-          # Try to find existing SBOM
           FOUND_SBOM=$(find project -iname '*sbom*.json' -o -iname '*cyclonedx*.json' | head -n 1)
-
           if [ -n "$FOUND_SBOM" ]; then
             echo "Using existing SBOM: $FOUND_SBOM"
             cp "$FOUND_SBOM" results/sbom.cdx.json
@@ -129,7 +131,7 @@ jobs:
           echo "$LOW,$MED,$HIGH,$CRIT" > results/sbom_counts.txt
 
 ################################################################################
-# PACKAGE
+# PACKAGE RESULTS
 ################################################################################
       - name: Package results
         run: |
