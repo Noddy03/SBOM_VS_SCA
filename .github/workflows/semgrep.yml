@@ -15,6 +15,9 @@ permissions:
   security-events: write
 
 jobs:
+################################################################################
+# FETCH REPOS
+################################################################################
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -29,16 +32,16 @@ jobs:
           python3 <<'EOF'
           import os, requests, json, urllib.parse, time
           headers = {
-            "Authorization": f"token {os.environ['TOKEN']}",
-            "Accept": "application/vnd.github+json"
+              "Authorization": f"token {os.environ['TOKEN']}",
+              "Accept": "application/vnd.github+json"
           }
           repos = []
           page = 1
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
               url = (
-                "https://api.github.com/search/repositories"
-                f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
-                "&sort=stars&order=desc&per_page=30&page=" + str(page)
+                  "https://api.github.com/search/repositories"
+                  f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
+                  "&sort=stars&order=desc&per_page=30&page=" + str(page)
               )
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
@@ -55,6 +58,9 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
+################################################################################
+# SCAN REPOS (MATRIX)
+################################################################################
   scan_repo:
     needs: fetch_repos
     if: needs.fetch_repos.outputs.repos != '[]'
@@ -79,6 +85,9 @@ jobs:
         run: |
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
+################################################################################
+# TRIVY FS SCAN
+################################################################################
       - name: Trivy FS Vulnerabilities
         run: |
           mkdir -p results
@@ -88,6 +97,9 @@ jobs:
             --format json \
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
+################################################################################
+# SBOM + DEPSCAN
+################################################################################
       - name: SBOM + DepScan
         run: |
           mkdir -p results
@@ -109,6 +121,9 @@ jobs:
           CRIT=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan.json 2>/dev/null || echo 0)
           echo "$LOW $MED $HIGH $CRIT" > results/sbom_counts.txt
 
+################################################################################
+# PACKAGE (INTERNAL ONLY)
+################################################################################
       - name: Package repo results
         run: |
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
@@ -116,14 +131,17 @@ jobs:
           zip -r "all_results/$SAFE.zip" results
 
       - name: Upload repo results
-        run: |
-          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          gh actions upload-artifact --name "all-results-$SAFE" --path all_results/*.zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-results-${{ matrix.repo && matrix.repo.replace('/', '-') }}
+          path: all_results/*.zip
 
+################################################################################
+# BUILD FINAL SUMMARY
+################################################################################
   build_summary:
     needs: scan_repo
     runs-on: ubuntu-latest
-
     steps:
       - name: Download all repo artifacts
         uses: actions/download-artifact@v4
