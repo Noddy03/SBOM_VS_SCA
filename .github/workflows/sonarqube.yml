@@ -186,36 +186,36 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: all_results
-
-      - name: Build summary.csv
+  
+      - name: Build normalized summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
-
+  
           for d in all_results/repo-results-*; do
             REPO=$(basename "$d" | sed 's/^repo-results-//')
             RESULTS="$d"
-
+  
             # ---- SCA (Snyk) ----
             SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' $RESULTS/sca_cleaned.json)
             SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' $RESULTS/sca_cleaned.json)
             SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' $RESULTS/sca_cleaned.json)
             SC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' $RESULTS/sca_cleaned.json)
-
-            # ---- Semgrep ----
+  
+            # ---- Semgrep normalized ----
             SEM_L=$(jq '[.results[]? | select((.extra.severity // "")=="INFO")] | length' $RESULTS/semgrep.json)
             SEM_M=$(jq '[.results[]? | select((.extra.severity // "")=="WARNING")] | length' $RESULTS/semgrep.json)
             SEM_H=$(jq '[.results[]? | select((.extra.severity // "")=="ERROR")] | length' $RESULTS/semgrep.json)
             SEM_C=$(jq '[.results[]? | select((.extra.severity // "")=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' $RESULTS/semgrep.json)
-
-            # ---- SBOM (Trivy + DepScan merged) ----
+  
+            # ---- SBOM normalized (Trivy + DepScan) ----
             IFS=',' read SB_L SB_M SB_H SB_C < $RESULTS/sbom_counts.txt
             STATUS=$(cat $RESULTS/sbom_status.txt)
-
+  
             TOTAL=$((SL+SM+SH+SC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
-
+  
             echo "$REPO,$SL,$SM,$SH,$SC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
           done
-
+  
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
