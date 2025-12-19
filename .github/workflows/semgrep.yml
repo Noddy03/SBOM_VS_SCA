@@ -1,4 +1,4 @@
-name: Security Scan – Trivy Java SCA + SBOM
+name: Security Scan – Trivy SCA + Trivy SBOM + DepScan
 
 on:
   workflow_dispatch:
@@ -81,7 +81,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk
+          sudo apt-get install -y jq git unzip openjdk-17-jdk docker.io
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
@@ -98,7 +98,7 @@ jobs:
           echo "safe=$SAFE" >> "$GITHUB_OUTPUT"
 
 ################################################################################
-# FORCE DEPENDENCY RESOLUTION
+# RESOLVE DEPENDENCIES
 ################################################################################
       - name: Resolve Maven dependencies
         run: |
@@ -106,9 +106,9 @@ jobs:
           mvn -q -DskipTests dependency:resolve || true
 
 ################################################################################
-# TRIVY JAVA SCA
+# TRIVY DEPENDENCY SCA (AUTHORITATIVE)
 ################################################################################
-      - name: Trivy Java Dependency Scan
+      - name: Trivy Java Dependency SCA
         run: |
           mkdir -p results
           trivy fs project \
@@ -119,63 +119,83 @@ jobs:
             --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
 
 ################################################################################
-# SBOM (COMPLIANCE ONLY)
+# TRIVY SBOM GENERATION
 ################################################################################
-      - name: Generate SBOM
+      - name: Generate SBOM (CycloneDX)
         run: |
-          mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
+
+################################################################################
+# TRIVY SBOM VULNERABILITY SCAN
+################################################################################
+      - name: Trivy SBOM Scan
+        run: |
+          trivy sbom results/sbom.cdx.json \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
+            --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
+
+################################################################################
+# OWASP DEP-SCAN (SBOM)
+################################################################################
+      - name: OWASP DepScan
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/results":/results \
+            owasp/dep-scan:latest scan \
+            --input /results/sbom.cdx.json \
+            --format json \
+            --output /results/depscan.json || true
+
+################################################################################
+# COUNT VULNERABILITIES
+################################################################################
+      - name: Build repo summary row
+        run: |
+          # Trivy SCA
+          SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
+          SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
+          SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
+          SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
+
+          # Trivy SBOM
+          SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sbom_vuln.json)
+          SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sbom_vuln.json)
+          SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json)
+          SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sbom_vuln.json)
+
+          TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
+
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
+          echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
 
 ################################################################################
 # PACKAGE & UPLOAD
 ################################################################################
-      - name: Package repo results
-        run: |
-          mkdir -p all_results
-          zip -r "all_results/${{ steps.sanitize.outputs.safe }}.zip" results
-
-      - name: Upload repo artifact
+      - name: Upload repo summary
         uses: actions/upload-artifact@v4
         with:
-          name: repo-results-${{ steps.sanitize.outputs.safe }}
-          path: all_results/*.zip
+          name: repo-summary-${{ steps.sanitize.outputs.safe }}
+          path: repo_summary.csv
 
 ################################################################################
-# BUILD FINAL SUMMARY
+# FINAL SUMMARY
 ################################################################################
   build_summary:
     needs: scan_repo
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download all repo artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: all_results
+          path: rows
 
-      - name: Build summary.csv
+      - name: Build final summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,total" > summary.csv
-          shopt -s globstar
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          find rows -name repo_summary.csv -exec tail -n +2 {} \; >> summary.csv
 
-          for zipfile in all_results/**/*.zip; do
-            REPO=$(basename "$zipfile" .zip)
-            mkdir temp
-            unzip -o "$zipfile" -d temp >/dev/null
-
-            SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_sca.json)
-            SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_sca.json)
-            SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_sca.json)
-            SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_sca.json)
-
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C))
-
-            echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$TOTAL" >> summary.csv
-            rm -rf temp
-          done
-
-      - name: Upload final summary
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: security-summary
           path: summary.csv
