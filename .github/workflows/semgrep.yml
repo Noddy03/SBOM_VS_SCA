@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 ################################################################################
-# FETCH REPOS
+# FETCH REPOSITORIES
 ################################################################################
 jobs:
   fetch_repos:
@@ -50,9 +50,9 @@ jobs:
 
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
               url = (
-                "https://api.github.com/search/repositories"
-                f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
-                "&sort=stars&order=desc&per_page=30&page=" + str(page)
+                  "https://api.github.com/search/repositories"
+                  f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
+                  "&sort=stars&order=desc&per_page=30&page=" + str(page)
               )
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
@@ -75,7 +75,7 @@ jobs:
           EOF
 
 ################################################################################
-# SCAN REPOS
+# SCAN REPOSITORIES
 ################################################################################
   scan_repo:
     needs: fetch_repos
@@ -95,7 +95,7 @@ jobs:
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
-      - name: Clone repo
+      - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -114,14 +114,14 @@ jobs:
             --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
 
 ################################################################################
-# SBOM GENERATION (ALL)
+# SBOM GENERATION (ALL LANGUAGES)
 ################################################################################
       - name: Generate SBOM
         run: |
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
 
 ################################################################################
-# JAVA: TRIVY SBOM VULNS
+# JAVA: SBOM VULNERABILITY SCAN
 ################################################################################
       - name: Java SBOM scan
         if: inputs.language == 'Java'
@@ -132,7 +132,7 @@ jobs:
             --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
 
 ################################################################################
-# PYTHON: pip-audit SBOM VULNS
+# PYTHON: SBOM VULNERABILITY SCAN (pip-audit)
 ################################################################################
       - name: Python SBOM scan
         if: inputs.language == 'Python'
@@ -141,10 +141,13 @@ jobs:
           pip-audit --format json --output ../results/pip_audit.json || echo '[]' > ../results/pip_audit.json
 
 ################################################################################
-# BUILD SUMMARY ROW
+# BUILD PER-REPO SUMMARY
 ################################################################################
       - name: Build repo summary
         run: |
+          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          echo "SAFE_REPO=$SAFE" >> $GITHUB_ENV
+
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
@@ -162,15 +165,14 @@ jobs:
             SB_C=$(jq '[.[] | select(.severity=="CRITICAL")] | length' results/pip_audit.json)
           fi
 
-          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
+          echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" > repo_summary.csv
 
-          echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" > "$SAFE.csv"
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload repo summary
+        uses: actions/upload-artifact@v4
         with:
-          name: repo-${{ matrix.repo }}
-          path: "*.csv"
+          name: repo-${{ env.SAFE_REPO }}
+          path: repo_summary.csv
 
 ################################################################################
 # FINAL SUMMARY
@@ -186,7 +188,7 @@ jobs:
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
-          find rows -name "*.csv" -exec cat {} \; >> summary.csv
+          find rows -name "repo_summary.csv" -exec cat {} \; >> summary.csv
 
       - uses: actions/upload-artifact@v4
         with:
