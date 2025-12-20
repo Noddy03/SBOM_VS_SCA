@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy + Grype + SBOM)
+name: Top Repos Security Scan (Trivy + Grype)
 
 on:
   workflow_dispatch:
@@ -58,70 +58,78 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip curl maven gradle python3-venv
+          sudo apt-get install -y jq git unzip curl maven gradle python3-venv python3-pip
+          # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          # Install Grype
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-          pip install --upgrade pip cyclonedx-python-lib
 
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Prepare results folder
-        run: |
-          mkdir -p results
-          echo '{"Results":[]}' > results/trivy_fs.json
-          echo "0,0,0,0" > results/sbom_counts.txt
-
-      ###########################################################################
-      # Python setup & SBOM (if requirements.txt exists)
-      ###########################################################################
-      - name: Python setup & SBOM
+      - name: Build project (optional)
         run: |
           cd project
+          mvn -q -DskipTests package || gradle build -x test || true
+          # Create Python venv if requirements exist
           if [ -f requirements.txt ]; then
             python3 -m venv .venv
             source .venv/bin/activate
             pip install --upgrade pip setuptools wheel
             pip install -r requirements.txt || true
-            cyclonedx-py -r requirements.txt -o ../results/sbom_python.cdx.json || true
           fi
-          cd ..
 
       ###########################################################################
-      # Java Maven build & SBOM (if pom.xml exists)
+      # TRIVY FILESYSTEM SCAN (SCA)
       ###########################################################################
-      - name: Java Maven setup & SBOM
+      - name: Trivy FS scan (SCA)
         run: |
-          cd project
-          if [ -f pom.xml ]; then
-            mvn -q -DskipTests package || true
-            trivy sbom --format cyclonedx-json -o ../results/sbom_java.cdx.json .
-          fi
-          cd ..
+          mkdir -p results
+          echo '{"Results":[]}' > results/trivy_fs.json
+          trivy fs project \
+            --scanners vuln \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
+            --output results/trivy_fs.json || true
 
       ###########################################################################
-      # Trivy FS scan
+      # SBOM Scan (Grype)
       ###########################################################################
-      - name: Trivy FS scan
+      - name: SBOM Scan (Grype)
         run: |
-          if [ -d project ]; then
-            trivy fs project --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output results/trivy_fs.json || true
-          fi
+          mkdir -p results
+          echo "0 0 0 0" > results/sbom_counts.txt
+          echo "no_sbom" > results/sbom_status.txt
+          grype db update || true
+          L=0; M=0; H=0; C=0; STATUS="no_sbom"
+          for sb in $(find project -type f \( -iname "*sbom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.spdx.json" \)); do
+            TMP=$(mktemp)
+            grype sbom:"$sb" -o json > "$TMP" || continue
+            L=$((L+$(jq '[.matches[]? | select(.vulnerability.severity=="Low")] | length' "$TMP")))
+            M=$((M+$(jq '[.matches[]? | select(.vulnerability.severity=="Medium")] | length' "$TMP")))
+            H=$((H+$(jq '[.matches[]? | select(.vulnerability.severity=="High")] | length' "$TMP")))
+            C=$((C+$(jq '[.matches[]? | select(.vulnerability.severity=="Critical")] | length' "$TMP")))
+            rm -f "$TMP"
+            STATUS="valid_with_vuln"
+          done
+          echo "$L $M $H $C" > results/sbom_counts.txt
+          echo "$STATUS" > results/sbom_status.txt
 
       ###########################################################################
-      # Package results
+      # PACKAGE RESULTS
       ###########################################################################
       - name: Package results
         run: |
           SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')
-          zip -r "$SAFE_NAME.zip" results || true
+          export SAFE_NAME
+          zip -r "${SAFE_NAME}.zip" results
 
       - uses: actions/upload-artifact@v4
         with:
           name: repo-results-${{ matrix.repo }}
-          path: "${{ env.SAFE_NAME }}.zip"
+          path: "${SAFE_NAME}.zip"
 
   summarize:
     needs: scan_repo
@@ -137,15 +145,14 @@ jobs:
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
-          shopt -s globstar
-          for zipfile in all_results/**/*.zip; do
+          for zipfile in $(find all_results -name '*.zip'); do
             SAFE=$(basename "$zipfile" .zip)
-            mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
+            mkdir -p temp && unzip -o "$zipfile" -d temp >/dev/null
             # SCA counts
-            SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json || echo 0)
-            SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json || echo 0)
-            SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json || echo 0)
-            SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json || echo 0)
+            SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
+            SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
+            SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
+            SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
             # SBOM counts
             if [ -f temp/results/sbom_counts.txt ]; then
               read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt
