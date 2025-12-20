@@ -27,31 +27,31 @@ jobs:
           TOP_N: ${{ inputs.top_n }}
         run: |
           python3 <<'EOF'
-          import os, requests, json, urllib.parse, time
-          headers = {
-              "Authorization": f"token {os.environ['TOKEN']}",
-              "Accept": "application/vnd.github+json"
-          }
-          repos = []
-          page = 1
-          while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
-              url = (
-                  "https://api.github.com/search/repositories"
-                  f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
-                  "&sort=stars&order=desc&per_page=30&page=" + str(page)
-              )
-              r = requests.get(url, headers=headers)
-              if r.status_code != 200:
-                  break
-              for repo in r.json().get("items", []):
-                  repos.append(repo["full_name"])
-                  if len(repos) >= int(os.environ["TOP_N"]):
-                      break
-              page += 1
-              time.sleep(1)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"repos={json.dumps(repos)}\n")
-          EOF
+import os, requests, json, urllib.parse, time
+headers = {
+    "Authorization": f"token {os.environ['TOKEN']}",
+    "Accept": "application/vnd.github+json"
+}
+repos = []
+page = 1
+while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
+    url = (
+        "https://api.github.com/search/repositories"
+        f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
+        "&sort=stars&order=desc&per_page=30&page=" + str(page)
+    )
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        break
+    for repo in r.json().get("items", []):
+        repos.append(repo["full_name"])
+        if len(repos) >= int(os.environ["TOP_N"]):
+            break
+    page += 1
+    time.sleep(1)
+with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+    f.write(f"repos={json.dumps(repos)}\n")
+EOF
 
   scan_repo:
     needs: fetch_repos
@@ -100,16 +100,21 @@ jobs:
         run: |
           cd project
           if [ "${{ inputs.language }}" = "Java" ]; then
-            trivy fs ~/.m2/repository \
-              --format json \
-              --severity LOW,MEDIUM,HIGH,CRITICAL \
-              --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            if [ -d ~/.m2/repository ]; then
+              trivy fs ~/.m2/repository \
+                --format json \
+                --severity LOW,MEDIUM,HIGH,CRITICAL \
+                --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            else
+              echo '{"Results":[]}' > ../results/trivy_sca.json
+            fi
           else
             . .venv/bin/activate
             trivy fs .venv \
               --format json \
               --severity LOW,MEDIUM,HIGH,CRITICAL \
               --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+          fi
 
       - name: Generate SBOM
         run: |
@@ -125,8 +130,12 @@ jobs:
 
       - name: OWASP DepScan
         run: |
-          docker run --rm -v "${{ github.workspace }}/results":/results owasp/dep-scan:latest scan \
-            --input /results/sbom.cdx.json --format json --output /results/depscan.json || true
+          if docker pull owasp/dep-scan:latest; then
+            docker run --rm -v "${{ github.workspace }}/results":/results owasp/dep-scan:latest scan \
+              --input /results/sbom.cdx.json --format json --output /results/depscan.json || true
+          else
+            echo '{"Results":[]}' > results/depscan.json
+          fi
 
       - name: Build repo summary row
         run: |
