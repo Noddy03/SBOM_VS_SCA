@@ -17,7 +17,7 @@ permissions:
 
 jobs:
 ################################################################################
-# FETCH REPOSITORIES (LANGUAGE ONLY — NO FILTERING)
+# FETCH REPOSITORIES (LANGUAGE ONLY — DEBUG PRINT)
 ################################################################################
   fetch_repos:
     runs-on: ubuntu-latest
@@ -69,92 +69,78 @@ jobs:
               f.write("repos=" + json.dumps(repos) + "\n")
           EOF
 
+      - name: Show fetched repos
+        run: |
+          echo "=== Repositories fetched ==="
+          echo "${{ steps.fetch.outputs.repos }}"
+
 ################################################################################
-# SCAN REPOSITORIES (SINGLE JOB, LOOP BASED — NO MATRIX)
+# SCAN REPOSITORIES
 ################################################################################
   scan_repos:
     needs: fetch_repos
     runs-on: ubuntu-latest
     env:
       REPOS: ${{ needs.fetch_repos.outputs.repos }}
-
+      TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
     steps:
-      - name: Validate repos
+      - name: Print repos before scanning
         run: |
-          echo "Repos received:"
+          echo "=== Scanning these repositories ==="
           echo "$REPOS"
-          if ! echo "$REPOS" | jq -e '. | length > 0' >/dev/null; then
-            echo "❌ No repositories to scan"
-            exit 0
-          fi
 
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven
-          pip3 install --upgrade pip semgrep
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-venv
+          pip3 install --upgrade pip semgrep poetry
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
 
       - name: Scan loop
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p all_results
           echo "$REPOS" | jq -r '.[]' | while read repo; do
             SAFE=$(echo "$repo" | tr '/' '-')
             DIR="all_results/repo-results-$SAFE"
-            mkdir -p "$DIR"
+            mkdir -p "$DIR"   # Must exist before writing files
 
             echo "🔍 Scanning $repo"
 
             git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo project || continue
             cd project || continue
 
-            #######################################
             # Detect project type
-            #######################################
             IS_MAVEN=false
             IS_PYTHON=false
-
             [ -f pom.xml ] && IS_MAVEN=true
             [ -f requirements.txt ] || [ -f pyproject.toml ] && IS_PYTHON=true
 
-            #######################################
             # Build (best effort)
-            #######################################
-            if $IS_MAVEN; then
-              mvn -q -DskipTests package || true
-            fi
-
+            if $IS_MAVEN; then mvn -q -DskipTests package || true; fi
             if $IS_PYTHON; then
-              python3 -m pip install -r requirements.txt 2>/dev/null || true
+              python3 -m venv venv
+              source venv/bin/activate
+              pip install --upgrade pip
+              pip install -r requirements.txt 2>/dev/null || true
             fi
 
-            #######################################
-            # SNYK SCA
-            #######################################
-            snyk test --all-projects --json > "$DIR/sca.json" || echo '{"vulnerabilities":[]}' > "$DIR/sca.json"
+            # Snyk
+            snyk test --all-projects --json > "../$DIR/sca.json" || echo '{"vulnerabilities":[]}' > "../$DIR/sca.json"
 
-            #######################################
-            # SEMGREP
-            #######################################
-            semgrep --config p/security-audit --config p/owasp-top-ten --json > "$DIR/semgrep.json" || echo '{"results":[]}' > "$DIR/semgrep.json"
+            # Semgrep
+            semgrep --config p/security-audit --config p/owasp-top-ten --json > "../$DIR/semgrep.json" || echo '{"results":[]}' > "../$DIR/semgrep.json"
 
-            #######################################
-            # TRIVY SBOM
-            #######################################
-            trivy fs . --format json --output "$DIR/trivy.json" || echo '{}' > "$DIR/trivy.json"
+            # Trivy
+            trivy fs . --format json --output "../$DIR/trivy.json" || echo '{}' > "../$DIR/trivy.json"
 
-            #######################################
-            # OWASP DEP-SCAN (JAVA ONLY)
-            #######################################
+            # OWASP DepScan
             if $IS_MAVEN; then
-              java -jar ../dep-scan-cli.jar --scan . --format json --output "$DIR/dep-scan.json" || echo '{}' > "$DIR/dep-scan.json"
+              java -jar ../dep-scan-cli.jar --scan . --format json --output "../$DIR/dep-scan.json" || echo '{}' > "../$DIR/dep-scan.json"
             else
-              echo '{}' > "$DIR/dep-scan.json"
+              echo '{}' > "../$DIR/dep-scan.json"
             fi
 
             cd ..
