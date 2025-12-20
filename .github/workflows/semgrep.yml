@@ -87,7 +87,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq git unzip python3-pip openjdk-17-jdk maven
+          sudo apt-get install -y jq git unzip python3-pip openjdk-17-jdk maven uuid-runtime
 
           # Python security tools
           pip3 install pip-audit safety
@@ -159,9 +159,10 @@ jobs:
 ################################################################################
       - name: Build repo summary
         run: |
-          # sanitize repo name and create unique artifact name
+          # sanitize repo name and create unique artifact name using UUID
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          ARTIFACT_NAME="repo-summary-${SAFE}-${{ github.run_id }}-${{ matrix.repo_index }}"
+          UUID=$(uuidgen)
+          ARTIFACT_NAME="repo-summary-${SAFE}-${UUID}"
 
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_fs.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_fs.json)
