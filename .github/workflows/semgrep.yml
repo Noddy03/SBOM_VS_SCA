@@ -1,4 +1,4 @@
-name: Security Scan – Trivy SCA + SBOM + DepScan (Full Coverage)
+name: Security Scan – Trivy SCA + SBOM + DepScan (Full Coverage Fixed)
 
 on:
   workflow_dispatch:
@@ -98,17 +98,17 @@ jobs:
         if: contains(inputs.language, 'Java')
         run: |
           cd project
-          mvn -B -q -DskipTests dependency:go-offline dependency:copy-dependencies || true
+          mvn clean package -DskipTests || true
 
       - name: Resolve Python dependencies
         if: contains(inputs.language, 'Python')
         run: |
           cd project
           python3 -m venv .venv
-          . .venv/bin/activate
+          source .venv/bin/activate
           pip install --upgrade pip setuptools wheel
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
-          if [ -f pyproject.toml ]; then pip install . || true; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install .; fi
 
 ################################################################################
 # TRIVY DEPENDENCY SCA
@@ -117,15 +117,15 @@ jobs:
         run: |
           mkdir -p results
           if [[ "${{ inputs.language }}" == "Java" ]]; then
-            trivy fs project/target/dependency \
+            trivy fs project/target \
               --scanners vuln,license \
               --pkg-types library \
               --severity LOW,MEDIUM,HIGH,CRITICAL \
               --format json \
               --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
           else
-            . .venv/bin/activate
-            trivy fs .venv/lib/python*/site-packages \
+            source project/.venv/bin/activate
+            trivy fs project/.venv \
               --scanners vuln,license \
               --pkg-types library \
               --severity LOW,MEDIUM,HIGH,CRITICAL \
@@ -139,7 +139,7 @@ jobs:
       - name: Trivy Java Reachability
         if: contains(inputs.language, 'Java')
         run: |
-          trivy fs project \
+          trivy fs project/target \
             --scanners vuln \
             --reachability \
             --severity HIGH,CRITICAL \
@@ -152,10 +152,10 @@ jobs:
       - name: Generate SBOM (Syft – CycloneDX)
         run: |
           if [[ "${{ inputs.language }}" == "Java" ]]; then
-            syft project/target/dependency -o cyclonedx-json=results/sbom.syft.json || true
+            syft project/target -o cyclonedx-json=results/sbom.syft.json || true
           else
-            . .venv/bin/activate
-            syft .venv/lib/python*/site-packages -o cyclonedx-json=results/sbom.syft.json || true
+            source project/.venv/bin/activate
+            syft project/.venv -o cyclonedx-json=results/sbom.syft.json || true
           fi
 
 ################################################################################
