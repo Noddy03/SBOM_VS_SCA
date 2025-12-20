@@ -71,7 +71,6 @@ jobs:
               page += 1
               time.sleep(1)
 
-          # Ensure output is valid JSON
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
@@ -118,18 +117,20 @@ jobs:
           if [ "${{ inputs.language }}" == "Java" ]; then
             mvn -q -DskipTests dependency:resolve || true
           elif [ "${{ inputs.language }}" == "Python" ]; then
-            python3 -m pip install --upgrade pip
-            if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+            python3 -m pip install --upgrade --user pip
+            if [ -f requirements.txt ]; then
+              python3 -m pip install --user -r requirements.txt || true
+            fi
           fi
 
 ################################################################################
-# TRIVY DEPENDENCY SCA (FIXED FOR JAVA)
+# TRIVY DEPENDENCY SCA
 ################################################################################
       - name: Trivy Java Dependency SCA
         if: ${{ inputs.language == 'Java' }}
         run: |
           mkdir -p results
-          # Scan all pom.xml files in the project (handles multi-module)
+          # Scan all pom.xml files (multi-module)
           find project -name pom.xml -exec sh -c '
             FILE="$1"
             OUTPUT="results/$(echo "$FILE" | tr "/" "_")_sca.json"
@@ -140,26 +141,39 @@ jobs:
               --output "$OUTPUT" || echo "{\"Results\":[]}" > "$OUTPUT"
           ' sh {} \;
 
+      - name: Trivy Python Dependency SCA
+        if: ${{ inputs.language == 'Python' }}
+        run: |
+          mkdir -p results
+          trivy fs project \
+            --scanners vuln,config,secret \
+            --pkg-types library,os,application \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
+            --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
+
 ################################################################################
 # TRIVY SBOM GENERATION
 ################################################################################
       - name: Generate SBOM (CycloneDX)
         run: |
+          mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
 
 ################################################################################
-# TRIVY SBOM VULNERABILITY SCAN (ENHANCED)
+# TRIVY SBOM VULNERABILITY SCAN
 ################################################################################
       - name: Trivy SBOM Scan
         run: |
+          mkdir -p results
           trivy sbom results/sbom.cdx.json \
-            --vuln-type library,os \
+            --pkg-types library,os \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
             --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
 
 ################################################################################
-# OWASP DEP-SCAN (SBOM)
+# OWASP DEP-SCAN
 ################################################################################
       - name: OWASP DepScan
         run: |
@@ -175,12 +189,12 @@ jobs:
 ################################################################################
       - name: Build repo summary row
         run: |
-          # Merge all Java SCA results
+          # Aggregate Java SCA (handle Maven output arrays)
           if [ "${{ inputs.language }}" == "Java" ]; then
-            SCA_L=$(jq -s '[.[][]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/*_sca.json)
-            SCA_M=$(jq -s '[.[][]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/*_sca.json)
-            SCA_H=$(jq -s '[.[][]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/*_sca.json)
-            SCA_C=$(jq -s '[.[][]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/*_sca.json)
+            SCA_L=$(jq -s '[.[][]? | .Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/*_sca.json)
+            SCA_M=$(jq -s '[.[][]? | .Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/*_sca.json)
+            SCA_H=$(jq -s '[.[][]? | .Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/*_sca.json)
+            SCA_C=$(jq -s '[.[][]? | .Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/*_sca.json)
           else
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
