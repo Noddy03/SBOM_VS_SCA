@@ -40,7 +40,7 @@ jobs:
           if language == "java":
               files_to_check = ["pom.xml","build.gradle","build.gradle.kts"]
           elif language == "python":
-              files_to_check = ["requirements.txt","pyproject.toml","Pipfile"]
+              files_to_check = ["requirements.txt","pyproject.toml","Pipfile","setup.py"]
           else:
               files_to_check = []
           repos = []
@@ -102,7 +102,7 @@ jobs:
           mvn -q -DskipTests package || gradle build -x test || true
 
 ################################################################################
-# SNYK SCA – ROBUST FOR JAVA AND PYTHON
+# SNYK SCA – JAVA & PYTHON MAX DETECTION
 ################################################################################
       - name: Snyk SCA (robust)
         env:
@@ -112,7 +112,7 @@ jobs:
           cd project
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
 
-          # Java detection
+          # --- Java ---
           if [[ "$LANG_LOWER" == "java" ]]; then
             if [ -f "pom.xml" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
               snyk test --all-projects --scan-unmanaged --json > ../results/sca_raw.json || true
@@ -121,7 +121,7 @@ jobs:
             fi
           fi
 
-          # Python detection
+          # --- Python ---
           if [[ "$LANG_LOWER" == "python" ]]; then
             if [ -f "requirements.txt" ]; then
               snyk test --file=requirements.txt --scan-unmanaged --json > ../results/sca_raw.json || true
@@ -129,12 +129,14 @@ jobs:
               snyk test --file=pyproject.toml --scan-unmanaged --json > ../results/sca_raw.json || true
             elif [ -f "Pipfile" ]; then
               snyk test --file=Pipfile --scan-unmanaged --json > ../results/sca_raw.json || true
+            elif [ -f "setup.py" ]; then
+              snyk test --file=setup.py --scan-unmanaged --json > ../results/sca_raw.json || true
             else
               snyk test --all-projects --scan-unmanaged --json > ../results/sca_raw.json || true
             fi
           fi
 
-          # Normalize JSON to always have top-level vulnerabilities array
+          # --- Normalize JSON ---
           jq 'def extract_vulns:
                 if type=="array" then map(.vulnerabilities // []) | add
                 elif type=="object" then .vulnerabilities // []
@@ -236,7 +238,7 @@ jobs:
           for d in all_results/repo-results-*; do
             R=$(basename "$d" | sed 's/^repo-results-//')
 
-            # ----- SCA counts (robust) -----
+            # ----- SCA counts -----
             SC_FILE="$d/sca_cleaned.json"
             if [ -f "$SC_FILE" ]; then
               SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' "$SC_FILE" 2>/dev/null || echo 0)
