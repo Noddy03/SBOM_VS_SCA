@@ -73,8 +73,7 @@ jobs:
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       - name: Sanitize repo name
         id: sanitize
@@ -83,21 +82,16 @@ jobs:
           echo "safe=$SAFE" >> "$GITHUB_OUTPUT"
 
 ################################################################################
-# CREATE RESULTS FOLDER AND PLACEHOLDER FILES
-################################################################################
-      - name: Prepare results folder
-        run: |
-          mkdir -p results
-          touch results/trivy_sca.json results/sbom.cdx.json results/depscan.json
-
-################################################################################
-# SCAN JAVA MAVEN PROJECT
+# JAVA MAVEN SCAN
 ################################################################################
       - name: Scan Java Maven Project
         if: contains(inputs.language, 'Java')
         run: |
           cd project
-          mvn clean package -DskipTests dependency:copy-dependencies || true
+          # Skip Docker builds to prevent CI failures
+          mvn clean package -DskipTests -Pskip-docker dependency:copy-dependencies || true
+
+          mkdir -p results
 
           # Trivy SCA
           trivy fs target/dependency \
@@ -112,14 +106,14 @@ jobs:
 
           # DepScan
           docker run --rm \
-            -v "${{ github.workspace }}/results":/results \
+            -v "${{ github.workspace }}/project/results":/results \
             owasp/dep-scan:latest scan \
             --input /results/sbom.cdx.json \
             --format json \
             --output /results/depscan.json || echo '{}' > results/depscan.json
 
 ################################################################################
-# SCAN PYTHON PROJECT
+# PYTHON SCAN
 ################################################################################
       - name: Scan Python Project
         if: contains(inputs.language, 'Python')
@@ -130,6 +124,8 @@ jobs:
           pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f pyproject.toml ]; then pip install .; fi
+
+          mkdir -p results
 
           # Trivy SCA
           trivy fs .venv \
@@ -144,7 +140,7 @@ jobs:
 
           # DepScan
           docker run --rm \
-            -v "${{ github.workspace }}/results":/results \
+            -v "${{ github.workspace }}/project/results":/results \
             owasp/dep-scan:latest scan \
             --input /results/sbom.cdx.json \
             --format json \
@@ -155,15 +151,15 @@ jobs:
 ################################################################################
       - name: Build repo summary row
         run: |
-          SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
-          SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
-          SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
-          SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
+          SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' project/results/trivy_sca.json)
+          SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' project/results/trivy_sca.json)
+          SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' project/results/trivy_sca.json)
+          SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' project/results/trivy_sca.json)
 
-          SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/sbom.cdx.json 2>/dev/null || echo 0)
-          SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/sbom.cdx.json 2>/dev/null || echo 0)
-          SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/sbom.cdx.json 2>/dev/null || echo 0)
-          SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/sbom.cdx.json 2>/dev/null || echo 0)
+          SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' project/results/sbom.cdx.json 2>/dev/null || echo 0)
+          SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' project/results/sbom.cdx.json 2>/dev/null || echo 0)
+          SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' project/results/sbom.cdx.json 2>/dev/null || echo 0)
+          SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' project/results/sbom.cdx.json 2>/dev/null || echo 0)
 
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
 
