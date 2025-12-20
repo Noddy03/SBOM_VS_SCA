@@ -94,14 +94,12 @@ jobs:
           cd project
           if [ -f pom.xml ]; then
             mvn -q -B dependency:go-offline || true
-            # Generate CycloneDX SBOM
             mvn -q org.cyclonedx:cyclonedx-maven-plugin:makeBom -DoutputFormat=json || true
             if [ -f target/bom.json ]; then
               cp target/bom.json ../results/sbom.cdx.json
             fi
           fi
           cd ..
-          # Trivy filesystem scan
           trivy fs project --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
 
       # ---------------- PYTHON ----------------
@@ -112,10 +110,15 @@ jobs:
           python3 -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip setuptools wheel
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
-          # Generate CycloneDX SBOM
-          cyclonedx-py -o ../results/sbom.cdx.json
-          # Trivy SCA scan
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt || true
+            cyclonedx-py requirements -r requirements.txt -o ../results/sbom.cdx.json || echo '{"Results":[]}' > ../results/sbom.cdx.json
+          elif [ -d .venv ]; then
+            cyclonedx-py venv -p .venv -o ../results/sbom.cdx.json || echo '{"Results":[]}' > ../results/sbom.cdx.json
+          else
+            echo '{"Results":[]}' > ../results/sbom.cdx.json
+          fi
+          # Trivy filesystem scan
           trivy fs . --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           # Trivy scan installed packages
           trivy fs .venv/lib/python*/site-packages --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_sca_venv.json || echo '{"Results":[]}' > ../results/trivy_sca_venv.json
