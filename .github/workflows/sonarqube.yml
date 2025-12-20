@@ -1,4 +1,4 @@
-name: Security Scan – Cleaned SCA (All Severities) + Semgrep + Trivy SBOM
+name: Security Scan – SCA + Semgrep + SBOM
 
 on:
   workflow_dispatch:
@@ -14,9 +14,6 @@ permissions:
   contents: read
   security-events: write
 
-################################################################################
-# FETCH REPOS
-################################################################################
 jobs:
   fetch_repos:
     runs-on: ubuntu-latest
@@ -53,9 +50,6 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
-################################################################################
-# SCAN REPOS
-################################################################################
   scan_repo:
     needs: fetch_repos
     runs-on: ubuntu-latest
@@ -72,6 +66,7 @@ jobs:
           pip3 install semgrep safety pip-audit
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
 
       - name: Clone repo
         env:
@@ -85,81 +80,60 @@ jobs:
           mvn -q -DskipTests package || true
 
 ################################################################################
-# SCA – SNYK (FLATTEN)
+# SCA – Snyk cleaned
 ################################################################################
       - name: SCA – Snyk
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          snyk test \
-            --all-projects \
-            --detection-depth=15 \
-            --scan-unmanaged \
-            --json \
-            > results/sca_raw.json || true
-
-          jq '
-            if type=="array" then
-              map(.vulnerabilities // []) | add
-            else
-              .vulnerabilities // []
-            end
-            | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
-
-################################################################################
-# SCA – CLEANED (ALL SEVERITIES, NO DEDUP)
-################################################################################
+          snyk test --all-projects --detection-depth=15 --scan-unmanaged --json > results/sca_raw.json || true
+          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | {vulnerabilities: .}' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
       - name: SCA – Cleaned
         run: |
-          jq '
-            .vulnerabilities |=
-              map(
-                select(
-                  (.isIgnored | not)
-                  and (.isPatched | not)
-                  and (.packageName != null)
-                  and (.packageName != "")
-                  and (
-                    (.severity | ascii_downcase) == "low"
-                    or (.severity | ascii_downcase) == "medium"
-                    or (.severity | ascii_downcase) == "high"
-                    or (.severity | ascii_downcase) == "critical"
-                  )
-                )
-              )
-          ' results/sca.json > results/sca_cleaned.json
-
-################################################################################
-# PYTHON EXTRA SCA (OPTIONAL COMPLEMENT)
-################################################################################
-      - name: Python SCA – Safety + pip-audit
-        if: ${{ inputs.language == 'Python' }}
-        run: |
-          cd project
-          REQ=requirements.txt
-          [ -f pyproject.toml ] && poetry export -f requirements.txt --without-hashes -o req.txt && REQ=req.txt || true
-          safety check --file=$REQ --json > ../results/safety.json || echo '{"vulnerabilities":[]}' > ../results/safety.json
-          pip-audit -f json > ../results/pip_audit.json || echo '{"vulnerabilities":[]}' > ../results/pip_audit.json
+          jq '.vulnerabilities |= map(select((.isIgnored|not) and (.isPatched|not) and (.packageName!=null) and (.packageName!="") and ((.severity|ascii_downcase)=="low" or (.severity|ascii_downcase)=="medium" or (.severity|ascii_downcase)=="high" or (.severity|ascii_downcase)=="critical")))' results/sca.json > results/sca_cleaned.json
 
 ################################################################################
 # SEMGREP
 ################################################################################
       - name: Semgrep
         run: |
-          semgrep --config p/security-audit --config p/owasp-top-ten \
-            --json project > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config p/security-audit --config p/owasp-top-ten --json project > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
 ################################################################################
-# SBOM – TRIVY
+# TRIVY SBOM
 ################################################################################
       - name: Trivy SBOM
         run: |
-          trivy fs project --scanners vuln --format json > results/trivy.json || echo '{}' > results/trivy.json
+          trivy fs project --scanners vuln --format json --output results/trivy.json || echo '{}' > results/trivy.json
+          jq -r '[.Results[].Vulnerabilities[]?] | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/trivy.json > results/trivy_counts.json || echo '{}' > results/trivy_counts.json
 
 ################################################################################
-# UPLOAD ARTIFACT (SAFE NAME)
+# OWASP DEP-SCAN
+################################################################################
+      - name: OWASP DepScan
+        run: |
+          java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || echo '{"vulnerabilities":[]}' > results/dep-scan.json
+          jq '[.vulnerabilities[]? | group_by(.severity) | map({(.[0].severity): length}) | add] | add' results/dep-scan.json > results/dep_counts.json || echo '{}' > results/dep_counts.json
+
+################################################################################
+# MERGE SBOM COUNTS
+################################################################################
+      - name: Merge SBOM counts
+        run: |
+          TL=$(jq '.LOW // 0' results/trivy_counts.json)
+          TM=$(jq '.MEDIUM // 0' results/trivy_counts.json)
+          TH=$(jq '.HIGH // 0' results/trivy_counts.json)
+          TC=$(jq '.CRITICAL // 0' results/trivy_counts.json)
+          DL=$(jq '.LOW // 0' results/dep_counts.json)
+          DM=$(jq '.MEDIUM // 0' results/dep_counts.json)
+          DH=$(jq '.HIGH // 0' results/dep_counts.json)
+          DC=$(jq '.CRITICAL // 0' results/dep_counts.json)
+          echo "$((TL+DL)),$((TM+DM)),$((TH+DH)),$((TC+DC))" > results/sbom_counts.txt
+          echo "generated" > results/sbom_status.txt
+
+################################################################################
+# UPLOAD ARTIFACT
 ################################################################################
       - name: Upload results
         run: |
@@ -183,8 +157,7 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,total_sca" > summary.csv
-
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           for d in all_results/*; do
             R=$(basename "$d")
 
@@ -193,8 +166,10 @@ jobs:
             SH=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="high")]|length' $d/sca_cleaned.json 2>/dev/null || echo 0)
             SC=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="critical")]|length' $d/sca_cleaned.json 2>/dev/null || echo 0)
 
-            TOTAL=$((SL+SM+SH+SC))
-            echo "$R,$SL,$SM,$SH,$SC,$TOTAL" >> summary.csv
+            IFS=',' read SB_L SB_M SB_H SB_C < $d/sbom_counts.txt
+
+            TOTAL=$((SL+SM+SH+SC+SB_L+SB_M+SB_H+SB_C))
+            echo "$R,$SL,$SM,$SH,$SC,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
           done
 
       - uses: actions/upload-artifact@v4
