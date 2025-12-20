@@ -23,7 +23,7 @@ jobs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl unzip
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
 
       - id: set_output
         env:
@@ -58,15 +58,16 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip curl maven gradle python3-venv python3-pip
+          sudo apt-get install -y jq git unzip curl maven gradle openjdk-17-jdk python3-venv python3-pip
           # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          # Install Dependency-Check
+          # Install Dependency-Check safely
           DC_VERSION="8.5.0"
-          DC_ZIP="/tmp/dependency-check.zip"
-          curl -L -o "$DC_ZIP" "https://github.com/jeremylong/DependencyCheck/releases/download/v$DC_VERSION/dependency-check-$DC_VERSION-release.zip"
-          unzip -q "$DC_ZIP" -d /tmp
-          chmod +x /tmp/dependency-check/bin/dependency-check.sh
+          DC_DIR="/tmp/dependency-check"
+          curl -L -o /tmp/dependency-check.zip \
+            "https://github.com/jeremylong/DependencyCheck/releases/download/v$DC_VERSION/dependency-check-$DC_VERSION-release.zip"
+          unzip -q /tmp/dependency-check.zip -d "$DC_DIR"
+          chmod +x "$DC_DIR/dependency-check/bin/dependency-check.sh"
 
       - name: Clone repository
         env:
@@ -81,7 +82,7 @@ jobs:
       ###########################################################################
       # TRIVY FILESYSTEM SCAN (SCA)
       ###########################################################################
-      - name: Trivy FS scan
+      - name: Trivy FS scan (SCA)
         run: |
           mkdir -p results
           trivy fs project \
@@ -96,17 +97,12 @@ jobs:
       - name: Dependency-Check SBOM scan
         run: |
           mkdir -p results
-          /tmp/dependency-check/bin/dependency-check.sh \
+          # Run dependency-check on project
+          /tmp/dependency-check/dependency-check/bin/dependency-check.sh \
             --project "${{ matrix.repo }}" \
             --scan project \
-            --format JSON \
-            --out results/dependency-check.json || echo '{"dependencies":[]}' > results/dependency-check.json
-          # Count vulnerabilities by severity
-          L=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="Low")] | length' results/dependency-check.json)
-          M=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="Medium")] | length' results/dependency-check.json)
-          H=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="High")] | length' results/dependency-check.json)
-          C=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="Critical")] | length' results/dependency-check.json)
-          echo "$L,$M,$H,$C" > results/depscan_counts.txt
+            --format "JSON" \
+            --out results || echo '{"dependencies":[]}' > results/dependency-check.json
 
       ###########################################################################
       # PACKAGE RESULTS
@@ -136,19 +132,25 @@ jobs:
           for zipfile in all_results/**/*.zip; do
             SAFE=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
-            # SCA counts
+
+            # Trivy SCA counts
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
+
             # Dependency-Check counts
-            if [ -f temp/results/depscan_counts.txt ]; then
-              read DEP_L DEP_M DEP_H DEP_C < temp/results/depscan_counts.txt
+            if [ -f temp/results/dependency-check.json ]; then
+              DC_L=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="Low")] | length' temp/results/dependency-check.json)
+              DC_M=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="Medium")] | length' temp/results/dependency-check.json)
+              DC_H=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="High")] | length' temp/results/dependency-check.json)
+              DC_C=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="Critical")] | length' temp/results/dependency-check.json)
             else
-              DEP_L=0; DEP_M=0; DEP_H=0; DEP_C=0
+              DC_L=0; DC_M=0; DC_H=0; DC_C=0
             fi
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+DEP_L+DEP_M+DEP_H+DEP_C))
-            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$DEP_L,$DEP_M,$DEP_H,$DEP_C,$TOTAL" >> summary.csv
+
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+DC_L+DC_M+DC_H+DC_C))
+            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$DC_L,$DC_M,$DC_H,$DC_C,$TOTAL" >> summary.csv
             rm -rf temp
           done
 
