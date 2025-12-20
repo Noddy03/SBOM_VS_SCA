@@ -34,7 +34,7 @@ jobs:
           }
           language = os.environ["LANG"].lower()
           top_n = int(os.environ["TOP_N"])
-          files_to_check = {"java": ["pom.xml"], "python": ["requirements.txt", "pyproject.toml"]}.get(language, [])
+          files_to_check = {"java": ["pom.xml", "build.gradle"], "python": ["requirements.txt", "pyproject.toml"]}.get(language, [])
           repos, page = [], 1
           while len(repos) < top_n and page <= 10:
               url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(language)}&sort=stars&order=desc&per_page=30&page={page}"
@@ -89,31 +89,31 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          snyk test \
-            --all-projects \
-            --file=requirements.txt \
-            --file=pyproject.toml \
-            --dev \
-            --detection-depth=50 \
-            --scan-unmanaged \
-            --prune-repeated-subdependencies=false \
-            --exclude=test,tests,target,build,node_modules,__pycache__ \
-            --json > results/sca_raw.json || true
-          jq '
-            if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end
-            | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca_cleaned.json
+          LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
+          if [ "$LANG_LOWER" = "java" ]; then
+            FILES=$(find project -maxdepth 2 -type f \( -name "pom.xml" -o -name "build.gradle" \))
+            if [ -z "$FILES" ]; then FILES="project"; fi
+            snyk test --all-projects --detection-depth=50 --scan-unmanaged --prune-repeated-subdependencies=false --exclude=test,tests,target,build --json $FILES > results/sca_raw.json || true
+          elif [ "$LANG_LOWER" = "python" ]; then
+            FILES=""
+            [ -f project/requirements.txt ] && FILES="$FILES --file=project/requirements.txt"
+            [ -f project/pyproject.toml ] && FILES="$FILES --file=project/pyproject.toml"
+            snyk test --all-projects $FILES --dev --detection-depth=50 --scan-unmanaged --prune-repeated-subdependencies=false --exclude=test,tests,build,__pycache__ --json > results/sca_raw.json || true
+          else
+            snyk test --all-projects --json > results/sca_raw.json || true
+          fi
+          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | { vulnerabilities: . }' results/sca_raw.json > results/sca_cleaned.json
 
       - name: Semgrep
         run: |
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
-          semgrep \
-            --config p/security-audit \
-            --config p/owasp-top-ten \
-            --config p/$LANG_LOWER \
-            --config https://semgrep.dev/p/python/ci-cd-security \
-            --timeout 600 \
-            --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+          CONFIGS="p/security-audit p/owasp-top-ten"
+          if [ "$LANG_LOWER" = "python" ]; then
+            CONFIGS="$CONFIGS p/python https://semgrep.dev/p/python/ci-cd-security"
+          elif [ "$LANG_LOWER" = "java" ]; then
+            CONFIGS="$CONFIGS p/java"
+          fi
+          semgrep --config $CONFIGS --timeout 600 --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       - name: Trivy SBOM
         run: |
