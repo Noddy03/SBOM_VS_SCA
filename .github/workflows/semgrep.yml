@@ -58,28 +58,28 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip curl maven gradle default-jdk python3-venv python3-pip docker.io
-          # Add current user to docker group
-          sudo usermod -aG docker $USER || true
+          sudo apt-get install -y jq git unzip curl maven gradle default-jdk python3-venv python3-pip wget
           # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          # Pull OWASP Dependency-Check Docker image
-          docker pull ghcr.io/owasp/dependency-check:latest || true
+          # Install OWASP Dependency-Check CLI
+          wget https://github.com/jeremylong/DependencyCheck/releases/download/v8.1.2/dependency-check-8.1.2-release.zip -O /tmp/dependency-check.zip
+          unzip /tmp/dependency-check.zip -d /tmp
+          chmod +x /tmp/dependency-check/bin/dependency-check.sh
 
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Build project (optional)
+      - name: Build project (optional for Java)
         run: |
           cd project
           mvn -q -DskipTests package || gradle build -x test || true
 
       ###########################################################################
-      # TRIVY FILESYSTEM SCAN (SCA)
+      # Trivy filesystem scan (SCA)
       ###########################################################################
-      - name: Trivy FS scan (SCA)
+      - name: Trivy FS scan
         run: |
           mkdir -p results
           trivy fs project \
@@ -89,16 +89,19 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # OWASP DEPENDENCY CHECK (DepScan)
+      # OWASP Dependency-Check scan (DepScan)
       ###########################################################################
-      - name: DepScan (OWASP Dependency-Check)
+      - name: DepScan
         run: |
           mkdir -p results
-          docker run --rm -v $PWD/project:/src -v $PWD/results:/report ghcr.io/owasp/dependency-check:latest \
-            --project "${{ matrix.repo }}" --scan /src --format JSON --out /report || echo '{"dependencies":[]}' > results/depscan.json
+          /tmp/dependency-check/bin/dependency-check.sh \
+            --project "${{ matrix.repo }}" \
+            --scan project \
+            --format JSON \
+            --out results || echo '{"dependencies":[]}' > results/depscan.json
 
       ###########################################################################
-      # PACKAGE RESULTS
+      # Package results
       ###########################################################################
       - name: Package results
         run: |
@@ -119,9 +122,6 @@ jobs:
         with:
           path: all_results
 
-      ###########################################################################
-      # BUILD SUMMARY CSV
-      ###########################################################################
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,depscan_low,depscan_medium,depscan_high,depscan_critical,total" > summary.csv
@@ -129,22 +129,26 @@ jobs:
           for zipfile in all_results/**/*.zip; do
             SAFE=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
-            # SCA counts
+
+            # Trivy SCA counts
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
+
             # DepScan counts
             if [ -f temp/results/depscan.json ]; then
-              DEP_L=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="LOW")] | length' temp/results/depscan.json)
-              DEP_M=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' temp/results/depscan.json)
-              DEP_H=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="HIGH")] | length' temp/results/depscan.json)
-              DEP_C=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' temp/results/depscan.json)
+              DEPSCAN_L=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="LOW")] | length' temp/results/depscan.json)
+              DEPSCAN_M=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' temp/results/depscan.json)
+              DEPSCAN_H=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="HIGH")] | length' temp/results/depscan.json)
+              DEPSCAN_C=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' temp/results/depscan.json)
             else
-              DEP_L=0; DEP_M=0; DEP_H=0; DEP_C=0
+              DEPSCAN_L=0; DEPSCAN_M=0; DEPSCAN_H=0; DEPSCAN_C=0
             fi
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+DEP_L+DEP_M+DEP_H+DEP_C))
-            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$DEP_L,$DEP_M,$DEP_H,$DEP_C,$TOTAL" >> summary.csv
+
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+DEPSCAN_L+DEPSCAN_M+DEPSCAN_H+DEPSCAN_C))
+            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$DEPSCAN_L,$DEPSCAN_M,$DEPSCAN_H,$DEPSCAN_C,$TOTAL" >> summary.csv
+
             rm -rf temp
           done
 
