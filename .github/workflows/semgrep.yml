@@ -94,7 +94,7 @@ jobs:
           if [ -f pom.xml ]; then
             mvn -q -B dependency:go-offline || true
 
-            # Generate CycloneDX SBOM (native Maven)
+            # Generate CycloneDX SBOM
             mvn -q org.cyclonedx:cyclonedx-maven-plugin:2.7.9:makeBom \
               -DskipTests \
               -DincludeLicenseText=false \
@@ -106,7 +106,7 @@ jobs:
           fi
           cd ..
 
-          # Filesystem SCA (kept as fallback)
+          # Filesystem SCA scan fallback
           trivy fs project \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
@@ -185,7 +185,8 @@ jobs:
           SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json 2>/dev/null || echo 0)
           SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sbom_vuln.json 2>/dev/null || echo 0)
 
-          TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
+          # Unique total CVEs (avoid double counting)
+          TOTAL=$(jq -s '[.[].Results[]?.Vulnerabilities[]?.VulnerabilityID] | unique | length' results/trivy_sca.json results/trivy_sbom_vuln.json)
 
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
