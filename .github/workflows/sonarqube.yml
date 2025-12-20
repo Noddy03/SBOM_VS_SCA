@@ -1,4 +1,4 @@
-name: Security Scan – Snyk + Semgrep + Trivy SBOM + OWASP DepScan
+name: Security Scan – Snyk + Safety + Semgrep + Trivy SBOM + OWASP DepScan
 
 on:
   workflow_dispatch:
@@ -86,7 +86,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git curl unzip maven gradle openjdk-17-jdk
-          pip3 install semgrep
+          pip3 install semgrep safety
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
 
@@ -102,9 +102,9 @@ jobs:
           mvn -q -DskipTests package || gradle build -x test || true
 
 ################################################################################
-# SNYK SCA – JAVA & PYTHON MAX DETECTION
+# SNYK SCA – JAVA & PYTHON
 ################################################################################
-      - name: Snyk SCA (robust)
+      - name: Snyk SCA
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
@@ -112,7 +112,6 @@ jobs:
           cd project
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
 
-          # --- Java ---
           if [[ "$LANG_LOWER" == "java" ]]; then
             if [ -f "pom.xml" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
               snyk test --all-projects --scan-unmanaged --json > ../results/sca_raw.json || true
@@ -121,7 +120,6 @@ jobs:
             fi
           fi
 
-          # --- Python ---
           if [[ "$LANG_LOWER" == "python" ]]; then
             if [ -f "requirements.txt" ]; then
               snyk test --file=requirements.txt --scan-unmanaged --json > ../results/sca_raw.json || true
@@ -136,13 +134,43 @@ jobs:
             fi
           fi
 
-          # --- Normalize JSON ---
           jq 'def extract_vulns:
                 if type=="array" then map(.vulnerabilities // []) | add
                 elif type=="object" then .vulnerabilities // []
                 else []
                 end;
               {vulnerabilities: extract_vulns}' ../results/sca_raw.json > ../results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > ../results/sca_cleaned.json
+
+################################################################################
+# PYTHON SAFETY SCA
+################################################################################
+      - name: Python SCA – Safety
+        if: ${{ inputs.language == 'Python' }}
+        run: |
+          mkdir -p results
+          cd project
+          pip3 install safety
+
+          if [ -f "requirements.txt" ]; then
+            REQ_FILE="requirements.txt"
+          elif [ -f "Pipfile" ]; then
+            pipenv lock -r > pip_requirements.txt
+            REQ_FILE="pip_requirements.txt"
+          elif [ -f "pyproject.toml" ]; then
+            poetry export -f requirements.txt --without-hashes -o pyproject_requirements.txt || true
+            REQ_FILE="pyproject_requirements.txt"
+          elif [ -f "setup.py" ]; then
+            pip3 install setuptools wheel
+            python3 setup.py install --user
+            pip freeze > setup_requirements.txt
+            REQ_FILE="setup_requirements.txt"
+          else
+            echo "" > empty_requirements.txt
+            REQ_FILE="empty_requirements.txt"
+          fi
+
+          safety check --file=$REQ_FILE --json > ../results/safety_raw.json || echo '{"vulnerabilities":[]}' > ../results/safety_raw.json
+          jq '{vulnerabilities: [.vulnerabilities[]?]}' ../results/safety_raw.json > ../results/safety_cleaned.json || echo '{"vulnerabilities":[]}' > ../results/safety_cleaned.json
 
 ################################################################################
 # SEMGREP
@@ -174,13 +202,7 @@ jobs:
       - name: OWASP DepScan
         run: |
           mkdir -p results
-          if curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar; then
-            echo "Downloaded dep-scan-cli.jar successfully"
-          else
-            echo '{}' > results/dep-scan_filtered.json
-            exit 0
-          fi
-
+          curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
           if [ -f dep-scan-cli.jar ]; then
             java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
             if [ -f results/dep-scan.json ]; then
@@ -238,15 +260,28 @@ jobs:
           for d in all_results/repo-results-*; do
             R=$(basename "$d" | sed 's/^repo-results-//')
 
-            # ----- SCA counts -----
+            # ----- Snyk + Safety counts -----
             SC_FILE="$d/sca_cleaned.json"
+            SAF_FILE="$d/safety_cleaned.json"
+            SL=0; SM=0; SH=0; SC=0
+
             if [ -f "$SC_FILE" ]; then
               SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' "$SC_FILE" 2>/dev/null || echo 0)
               SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' "$SC_FILE" 2>/dev/null || echo 0)
               SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' "$SC_FILE" 2>/dev/null || echo 0)
               SC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' "$SC_FILE" 2>/dev/null || echo 0)
-            else
-              SL=0; SM=0; SH=0; SC=0
+            fi
+
+            if [ -f "$SAF_FILE" ]; then
+              SL_SAFE=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' "$SAF_FILE" 2>/dev/null || echo 0)
+              SM_SAFE=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' "$SAF_FILE" 2>/dev/null || echo 0)
+              SH_SAFE=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' "$SAF_FILE" 2>/dev/null || echo 0)
+              SC_SAFE=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' "$SAF_FILE" 2>/dev/null || echo 0)
+
+              SL=$((SL + SL_SAFE))
+              SM=$((SM + SM_SAFE))
+              SH=$((SH + SH_SAFE))
+              SC=$((SC + SC_SAFE))
             fi
 
             # ----- Semgrep counts -----
@@ -275,7 +310,6 @@ jobs:
             fi
 
             TOTAL=$((SL+SM+SH+SC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
-
             echo "$R,$SL,$SM,$SH,$SC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
           done
 
