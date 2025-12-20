@@ -1,4 +1,4 @@
-name: Security Scan – Trivy SCA + SBOM (Java & Python)
+name: Security Scan – Java & Python (Trivy + SBOM + Semgrep)
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
           TOP_N: ${{ inputs.top_n }}
         run: |
           python3 <<'EOF'
-          import os, requests, json, urllib.parse, time
+          import os, requests, json, time
 
           lang = os.environ["LANG"].lower()
           if lang == "java":
@@ -46,11 +46,7 @@ jobs:
           page = 1
 
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
-              url = (
-                  "https://api.github.com/search/repositories"
-                  f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
-                  "&sort=stars&order=desc&per_page=30&page=" + str(page)
-              )
+              url = f"https://api.github.com/search/repositories?q=language:{lang}&sort=stars&order=desc&per_page=30&page={page}"
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
                   break
@@ -92,13 +88,12 @@ jobs:
           pip3 install pip-audit safety
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
-          curl -sSfL https://semgrep.dev/install.sh | bash
+          curl -fsSL https://semgrep.dev/install.sh | bash
 
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
 ################################################################################
 # TRIVY FS (SCA)
@@ -106,16 +101,13 @@ jobs:
       - name: Trivy FS scan
         run: |
           mkdir -p results
-          trivy fs project \
-            --scanners vuln \
-            --severity LOW,MEDIUM,HIGH,CRITICAL \
-            --format json \
-            --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
+          trivy fs project --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
 ################################################################################
-# SBOM GENERATION + SCAN (TRIVY)
+# SBOM + SBOM SCAN (KEY FIX)
 ################################################################################
-      - name: Trivy SBOM + SBOM scan
+      - name: Generate & Scan SBOM
         run: |
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy sbom results/sbom.cdx.json \
@@ -124,15 +116,29 @@ jobs:
             --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
 
 ################################################################################
+# PYTHON EXTRA SCANS (NO BUILDS)
+################################################################################
+      - name: Python dependency scans
+        if: inputs.language == 'Python'
+        run: |
+          cd project
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt --format json > ../results/pip_audit.json || echo '[]' > ../results/pip_audit.json
+            safety check -r requirements.txt --json --full-report > ../results/safety.json || echo '[]' > ../results/safety.json
+          else
+            echo '[]' > ../results/pip_audit.json
+            echo '[]' > ../results/safety.json
+          fi
+
+################################################################################
 # SEMGREP
 ################################################################################
       - name: Semgrep
         run: |
-          semgrep --config p/ci --json project \
-            > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config p/ci --json project > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
 ################################################################################
-# BUILD PER-REPO SUMMARY
+# SUMMARY ROW
 ################################################################################
       - name: Build repo summary
         run: |
@@ -149,7 +155,6 @@ jobs:
           SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/sbom_vuln.json)
 
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
-
           echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" > repo_summary.csv
 
       - uses: actions/upload-artifact@v4
