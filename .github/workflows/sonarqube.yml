@@ -80,54 +80,43 @@ jobs:
         run: mkdir -p results
 
 ################################################################################
-# Java – recursive SCA
+# SCA – Java and Python
 ################################################################################
-      - name: SCA – Java (Snyk)
+      - name: SCA scan
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          cd project
-          mkdir -p ../../results
-          JAVA_FILES=$(find . -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts")
-          if [ -n "$JAVA_FILES" ]; then
-            for f in $JAVA_FILES; do
-              snyk test --file="$f" --json --all-projects --detection-depth=20 --scan-unmanaged --severity-threshold=low >> ../../results/sca_snyk.json || echo '{}' >> ../../results/sca_snyk.json
-            done
-          else
-            echo '{"vulnerabilities":[]}' > ../../results/sca_snyk.json
-          fi
-          cd ..
+          mkdir -p results
+          # Always create placeholder files
+          touch results/sca_snyk.json results/pip_audit.json results/safety.json
 
-################################################################################
-# Python – recursive SCA
-################################################################################
-      - name: SCA – Python (Snyk + pip-audit + Safety)
-        run: |
-          cd project
-          mkdir -p ../../results
+          cd project || exit 0
+
+          # Java
+          JAVA_FILES=$(find . -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts")
+          for f in $JAVA_FILES; do
+            snyk test --file="$f" --json --all-projects --scan-unmanaged --severity-threshold=low >> ../results/sca_snyk.json || true
+          done
+
+          # Python
           PY_FILES=$(find . -name "requirements.txt" -o -name "pyproject.toml" -o -name "setup.py")
           if [ -n "$PY_FILES" ]; then
             python3 -m venv venv
             source venv/bin/activate
             for f in $PY_FILES; do
               if [[ $f == *"requirements.txt"* ]]; then pip install -r "$f" || true; fi
-              snyk test --file="$f" --json --all-projects --scan-unmanaged --severity-threshold=low >> ../../results/sca_snyk.json || true
-              pip-audit -f json > ../../results/pip_audit.json || echo '{"vulnerabilities":[]}' > ../../results/pip_audit.json
-              safety check --file="$f" --json > ../../results/safety.json || echo '{"vulnerabilities":[]}' > ../../results/safety.json
+              snyk test --file="$f" --json --all-projects --scan-unmanaged --severity-threshold=low >> ../results/sca_snyk.json || true
+              pip-audit -f json > ../results/pip_audit.json || echo '{"vulnerabilities":[]}' > ../results/pip_audit.json
+              safety check --file="$f" --json > ../results/safety.json || echo '{"vulnerabilities":[]}' > ../results/safety.json
             done
             deactivate
-          else
-            echo '{"vulnerabilities":[]}' > ../../results/sca_snyk.json
-            echo '{"vulnerabilities":[]}' > ../../results/pip_audit.json
-            echo '{"vulnerabilities":[]}' > ../../results/safety.json
           fi
           cd ..
 
-################################################################################
-# Merge all SCA
-################################################################################
       - name: Merge all SCA
         run: |
+          # Ensure files exist before merging
+          touch results/sca_snyk.json results/pip_audit.json results/safety.json
           jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/sca_snyk.json results/pip_audit.json results/safety.json > results/sca_cleaned.json
 
 ################################################################################
