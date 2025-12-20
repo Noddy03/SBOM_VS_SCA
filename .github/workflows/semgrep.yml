@@ -96,8 +96,8 @@ jobs:
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
-          # Semgrep (fixed: installs semgrep-core + wrapper)
-          curl -sSfL https://raw.githubusercontent.com/returntocorp/semgrep/master/install.sh | sudo sh
+          # Semgrep (2025 official install)
+          curl -sSfL https://packages.returntocorp.com/install.sh | sudo sh
 
       - name: Clone repo
         env:
