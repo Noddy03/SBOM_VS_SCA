@@ -67,7 +67,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-venv python3-pip
+          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-venv python3-pip docker.io
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
 
       - name: Clone repo
@@ -86,13 +86,19 @@ jobs:
           mkdir -p results
           cd project
           if [ "${{ inputs.language }}" = "Java" ]; then
-            mvn -B -q dependency:go-offline || true
+            if [ -f pom.xml ]; then
+              mvn -B -q dependency:go-offline || true
+            else
+              echo "No pom.xml found, skipping Maven."
+            fi
           else
             python3 -m venv .venv
             . .venv/bin/activate
             pip install --upgrade pip setuptools wheel
             if [ -f requirements.txt ]; then
               pip install -r requirements.txt || true
+            else
+              echo "No requirements.txt found, skipping Python deps."
             fi
           fi
 
@@ -100,10 +106,14 @@ jobs:
         run: |
           cd project
           if [ "${{ inputs.language }}" = "Java" ]; then
-            trivy fs ~/.m2/repository \
-              --format json \
-              --severity LOW,MEDIUM,HIGH,CRITICAL \
-              --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            if [ -d ~/.m2/repository ]; then
+              trivy fs ~/.m2/repository \
+                --format json \
+                --severity LOW,MEDIUM,HIGH,CRITICAL \
+                --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            else
+              echo '{"Results":[]}' > ../results/trivy_sca.json
+            fi
           else
             . .venv/bin/activate
             trivy fs .venv \
