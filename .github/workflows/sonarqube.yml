@@ -89,7 +89,6 @@ jobs:
           pip3 install semgrep
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
 
       - name: Clone repo
         env:
@@ -167,15 +166,33 @@ jobs:
           ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
 
 ################################################################################
-# OWASP DEP-SCAN – HIGH CONFIDENCE FILTER
+# OWASP DEP-SCAN – ROBUST WITH JAR CHECK
 ################################################################################
       - name: OWASP DepScan
         run: |
           mkdir -p results
-          java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
-          jq '
-            .vulnerabilities |= map(select(.confidence // "HIGH" == "HIGH"))
-          ' results/dep-scan.json > results/dep-scan_filtered.json || cp results/dep-scan.json results/dep-scan_filtered.json
+          # Attempt to download dep-scan-cli.jar
+          if curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar; then
+            echo "Downloaded dep-scan-cli.jar successfully"
+          else
+            echo "Failed to download dep-scan-cli.jar, skipping DepScan"
+            echo '{}' > results/dep-scan_filtered.json
+            exit 0
+          fi
+
+          # Run DepScan only if JAR exists
+          if [ -f dep-scan-cli.jar ]; then
+            java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
+            if [ -f results/dep-scan.json ]; then
+              jq '
+                .vulnerabilities |= map(select(.confidence // "HIGH" == "HIGH"))
+              ' results/dep-scan.json > results/dep-scan_filtered.json || cp results/dep-scan.json results/dep-scan_filtered.json
+            else
+              echo '{}' > results/dep-scan_filtered.json
+            fi
+          else
+            echo '{}' > results/dep-scan_filtered.json
+          fi
 
 ################################################################################
 # MERGE SBOM COUNTS
