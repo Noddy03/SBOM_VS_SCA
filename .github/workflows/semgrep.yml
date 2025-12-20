@@ -89,12 +89,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq git unzip python3-pip openjdk-17-jdk maven
 
-          # Python security tools (FIXED)
-          pip3 install pip-audit safety semgrep
+          # Python security tools
+          pip3 install pip-audit safety
 
           # Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
+
+          # Semgrep (fixed: installs semgrep-core + wrapper)
+          curl -sSfL https://raw.githubusercontent.com/returntocorp/semgrep/master/install.sh | sudo sh
 
       - name: Clone repo
         env:
