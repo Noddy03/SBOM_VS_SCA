@@ -75,18 +75,19 @@ jobs:
         run: mkdir -p project/results
 
 ################################################################################
-# JAVA MAVEN SCAN
+# JAVA MAVEN SCAN (improved)
 ################################################################################
       - name: Java Maven Trivy Scan
         if: contains(inputs.language, 'Java')
         run: |
           cd project
           if [ -f pom.xml ]; then
-            mvn dependency:resolve -DskipTests || true
-            # SCA scan
-            trivy maven --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
-            # SBOM scan
-            trivy maven --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
+            # Download all dependencies including transitive
+            mvn clean install -DskipTests -DskipITs || true
+            # Scan the project directory
+            trivy fs . --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
+            # Generate SBOM
+            trivy fs . --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
           else
             echo '{"Results":[]}' > results/trivy_sca.json
             echo '{}' > results/sbom.cdx.json
