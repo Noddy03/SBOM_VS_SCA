@@ -59,8 +59,9 @@ jobs:
               page += 1
               time.sleep(1)
           
+          # always write a valid JSON array to GitHub output
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"repos={json.dumps(repos)}\n")
+              f.write(f"repos={json.dumps(repos or [])}\n")
           PYTHON
 
       - name: Run fetch_repos.py
@@ -72,12 +73,12 @@ jobs:
 
   scan_repo:
     needs: fetch_repos
-    if: ${{ needs.fetch_repos.outputs.repos != '[]' }}
+    if: ${{ needs.fetch_repos.outputs.repos != '[]' && needs.fetch_repos.outputs.repos != '' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
+        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos || '[]') }}
     continue-on-error: true
 
     steps:
