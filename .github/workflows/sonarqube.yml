@@ -27,41 +27,45 @@ jobs:
           TOP_N: ${{ inputs.top_n }}
         run: |
           python3 <<'EOF'
-          import os, requests, json, urllib.parse, time
-          headers = {
-              "Authorization": f"token {os.environ['TOKEN']}",
-              "Accept": "application/vnd.github+json"
-          }
-          language = os.environ["LANG"].lower()
-          top_n = int(os.environ["TOP_N"])
-          if language == "java":
-              files_to_check = ["pom.xml"]
-          elif language == "python":
-              files_to_check = ["requirements.txt","pyproject.toml","Pipfile.lock","poetry.lock"]
-          else:
-              files_to_check = []
-          
-          repos = []
-          page = 1
-          while len(repos) < top_n and page <= 10:
-              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(language)}&sort=stars&order=desc&per_page=30&page={page}"
-              r = requests.get(url, headers=headers)
-              if r.status_code != 200:
-                  break
-              for repo in r.json().get("items", []):
-                  for f in files_to_check:
-                      check = f"https://api.github.com/repos/{repo['full_name']}/contents/{f}"
-                      if requests.get(check, headers=headers).status_code == 200:
-                          repos.append(repo["full_name"])
-                          break
-                  if len(repos) >= top_n:
-                      break
-              page += 1
-              time.sleep(1)
-          
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"repos={json.dumps(repos)}\n")
-          EOF
+import os, requests, json, urllib.parse, time
+
+headers = {
+    "Authorization": f"token {os.environ['TOKEN']}",
+    "Accept": "application/vnd.github+json"
+}
+
+language = os.environ["LANG"].lower()
+top_n = int(os.environ["TOP_N"])
+
+if language == "java":
+    files_to_check = ["pom.xml"]
+elif language == "python":
+    files_to_check = ["requirements.txt","pyproject.toml","Pipfile.lock","poetry.lock"]
+else:
+    files_to_check = []
+
+repos = []
+page = 1
+
+while len(repos) < top_n and page <= 10:
+    url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(language)}&sort=stars&order=desc&per_page=30&page={page}"
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        break
+    for repo in r.json().get("items", []):
+        for f in files_to_check:
+            check = f"https://api.github.com/repos/{repo['full_name']}/contents/{f}"
+            if requests.get(check, headers=headers).status_code == 200:
+                repos.append(repo["full_name"])
+                break
+        if len(repos) >= top_n:
+            break
+    page += 1
+    time.sleep(1)
+
+with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+    f.write(f"repos={json.dumps(repos)}\n")
+EOF
 
   scan_repo:
     needs: fetch_repos
