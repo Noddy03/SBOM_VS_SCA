@@ -58,7 +58,9 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip curl maven gradle default-jdk python3-venv python3-pip docker
+          sudo apt-get install -y jq git unzip curl maven gradle default-jdk python3-venv python3-pip docker.io
+          # Add current user to docker group
+          sudo usermod -aG docker $USER || true
           # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           # Pull OWASP Dependency-Check Docker image
@@ -73,13 +75,6 @@ jobs:
         run: |
           cd project
           mvn -q -DskipTests package || gradle build -x test || true
-          # Python environment
-          if [ -f requirements.txt ]; then
-            python3 -m venv .venv
-            source .venv/bin/activate
-            pip install --upgrade pip setuptools wheel
-            pip install -r requirements.txt || true
-          fi
 
       ###########################################################################
       # TRIVY FILESYSTEM SCAN (SCA)
@@ -87,31 +82,20 @@ jobs:
       - name: Trivy FS scan (SCA)
         run: |
           mkdir -p results
-          echo '{"Results":[]}' > results/trivy_fs.json
           trivy fs project \
             --scanners vuln \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
-            --output results/trivy_fs.json || true
+            --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # DEPENDENCY-CHECK (SBOM) SCAN
+      # OWASP DEPENDENCY CHECK (DepScan)
       ###########################################################################
-      - name: Dependency-Check Scan (SBOM)
+      - name: DepScan (OWASP Dependency-Check)
         run: |
           mkdir -p results
-          echo "0 0 0 0" > results/sbom_counts.txt
-          echo "no_sbom" > results/sbom_status.txt
-          docker run --rm -v "$PWD/project:/src" -v "$PWD/results:/results" ghcr.io/owasp/dependency-check:latest \
-            --scan /src --format JSON --out /results/depscan.json || true
-          if [ -f results/depscan.json ]; then
-            L=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan.json)
-            M=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/depscan.json)
-            H=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/depscan.json)
-            C=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan.json)
-            echo "$L $M $H $C" > results/sbom_counts.txt
-            echo "valid_with_vuln" > results/sbom_status.txt
-          fi
+          docker run --rm -v $PWD/project:/src -v $PWD/results:/report ghcr.io/owasp/dependency-check:latest \
+            --project "${{ matrix.repo }}" --scan /src --format JSON --out /report || echo '{"dependencies":[]}' > results/depscan.json
 
       ###########################################################################
       # PACKAGE RESULTS
@@ -119,13 +103,13 @@ jobs:
       - name: Package results
         run: |
           SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')
-          export SAFE_NAME
-          zip -r "${SAFE_NAME}.zip" results || true
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+          zip -r "$SAFE_NAME.zip" results
 
       - uses: actions/upload-artifact@v4
         with:
-          name: repo-results-${{ matrix.repo }}
-          path: "${SAFE_NAME}.zip"
+          name: repo-results-${{ env.SAFE_NAME }}
+          path: "${{ env.SAFE_NAME }}.zip"
 
   summarize:
     needs: scan_repo
@@ -140,23 +124,27 @@ jobs:
       ###########################################################################
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
-          for zipfile in $(find all_results -name '*.zip'); do
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,depscan_low,depscan_medium,depscan_high,depscan_critical,total" > summary.csv
+          shopt -s globstar
+          for zipfile in all_results/**/*.zip; do
             SAFE=$(basename "$zipfile" .zip)
-            mkdir -p temp && unzip -o "$zipfile" -d temp >/dev/null
+            mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
             # SCA counts
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
-            # SBOM counts
-            if [ -f temp/results/sbom_counts.txt ]; then
-              read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt
+            # DepScan counts
+            if [ -f temp/results/depscan.json ]; then
+              DEP_L=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="LOW")] | length' temp/results/depscan.json)
+              DEP_M=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' temp/results/depscan.json)
+              DEP_H=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="HIGH")] | length' temp/results/depscan.json)
+              DEP_C=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' temp/results/depscan.json)
             else
-              SB_L=0; SB_M=0; SB_H=0; SB_C=0
+              DEP_L=0; DEP_M=0; DEP_H=0; DEP_C=0
             fi
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
-            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+DEP_L+DEP_M+DEP_H+DEP_C))
+            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$DEP_L,$DEP_M,$DEP_H,$DEP_C,$TOTAL" >> summary.csv
             rm -rf temp
           done
 
