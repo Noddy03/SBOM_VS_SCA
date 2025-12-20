@@ -1,4 +1,4 @@
-name: Security Scan – Java & Python SCA + SBOM
+name: Security Scan – Java & Python SCA + SBOM + Semgrep
 
 on:
   workflow_dispatch:
@@ -77,8 +77,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip python3-pip openjdk-17-jdk maven docker.io
-          pip3 install pip-audit safety
+          sudo apt-get install -y jq git unzip python3-pip openjdk-17-jdk maven
+          pip3 install pip-audit safety semgrep
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
@@ -113,26 +113,32 @@ jobs:
           source .venv/bin/activate
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f pyproject.toml ]; then pip install build[deps]; fi
-          # pip-audit
           pip-audit --format json --output ../results/pip_audit.json || echo '[]' > ../results/pip_audit.json
-          # safety
           if [ -f requirements.txt ]; then
             safety check -r requirements.txt --json --full-report > ../results/safety.json || echo '[]' > ../results/safety.json
           else
             echo '[]' > ../results/safety.json
           fi
-          # Trivy FS Python scan for extra coverage
           trivy fs project --scanners vuln --vuln-type python --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_python.json || echo '{"Results":[]}' > ../results/trivy_python.json
+
+      - name: Semgrep scan
+        run: |
+          semgrep --config p/ci --json project > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       - name: Build repo summary
         run: |
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          echo "SAFE_REPO=$SAFE" >> $GITHUB_ENV
-
+          echo "$SAFE" > results/repo_name.txt
+          
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_fs.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_fs.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_fs.json)
           SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_fs.json)
+
+          SEM_L=$(jq '[.results[]? | select(.extra.severity//""|ascii_upcase)=="INFO"] | length' results/semgrep.json)
+          SEM_M=$(jq '[.results[]? | select(.extra.severity//""|ascii_upcase)=="WARNING"] | length' results/semgrep.json)
+          SEM_H=$(jq '[.results[]? | select(.extra.severity//""|ascii_upcase)=="ERROR"] | length' results/semgrep.json)
+          SEM_C=$SEM_H
 
           if [ "${{ inputs.language }}" = "Java" ]; then
             SB_L=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan.json)
@@ -140,7 +146,6 @@ jobs:
             SB_H=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/depscan.json)
             SB_C=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan.json)
           else
-            # combine pip-audit, safety, and trivy python results
             jq -s 'flatten | unique_by(.id)' results/pip_audit.json results/safety.json results/trivy_python.json > results/python_sbom_combined.json
             SB_L=$(jq '[.[] | select(.severity=="LOW")] | length' results/python_sbom_combined.json)
             SB_M=$(jq '[.[] | select(.severity=="MEDIUM")] | length' results/python_sbom_combined.json)
@@ -148,12 +153,12 @@ jobs:
             SB_C=$(jq '[.[] | select(.severity=="CRITICAL")] | length' results/python_sbom_combined.json)
           fi
 
-          TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
-          echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" > repo_summary.csv
+          TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C+SEM_L+SEM_M+SEM_H+SEM_C))
+          echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" > repo_summary.csv
 
       - uses: actions/upload-artifact@v4
         with:
-          name: repo-${{ env.SAFE_REPO }}
+          name: repo-${{ matrix.repo }}
           path: repo_summary.csv
 
   summary:
@@ -166,7 +171,7 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           find rows -name "*.csv" -exec cat {} \; >> summary.csv
 
       - uses: actions/upload-artifact@v4
