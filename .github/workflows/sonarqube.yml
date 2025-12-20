@@ -159,11 +159,15 @@ jobs:
           trivy fs project --scanners vuln --format json > results/trivy.json || echo '{}' > results/trivy.json
 
 ################################################################################
-# UPLOAD
+# UPLOAD ARTIFACT (SAFE NAME)
 ################################################################################
+      - name: Upload results
+        run: |
+          SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
       - uses: actions/upload-artifact@v4
         with:
-          name: repo-results-${{ matrix.repo }}
+          name: repo-results-${{ env.SAFE_NAME }}
           path: results
 
 ################################################################################
