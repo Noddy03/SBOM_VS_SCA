@@ -1,4 +1,4 @@
-name: Security Scan – Snyk + Safety + Semgrep + Trivy SBOM + OWASP DepScan
+name: Security Scan – Snyk + Safety + pip-audit + Semgrep + Trivy SBOM + OWASP DepScan
 
 on:
   workflow_dispatch:
@@ -86,7 +86,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git curl unzip maven gradle openjdk-17-jdk
-          pip3 install semgrep safety
+          pip3 install semgrep safety pip-audit
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
 
@@ -147,10 +147,7 @@ jobs:
       - name: Python SCA – Safety
         if: ${{ inputs.language == 'Python' }}
         run: |
-          mkdir -p results
           cd project
-          pip3 install safety
-
           if [ -f "requirements.txt" ]; then
             REQ_FILE="requirements.txt"
           elif [ -f "Pipfile" ]; then
@@ -171,6 +168,16 @@ jobs:
 
           safety check --file=$REQ_FILE --json > ../results/safety_raw.json || echo '{"vulnerabilities":[]}' > ../results/safety_raw.json
           jq '{vulnerabilities: [.vulnerabilities[]?]}' ../results/safety_raw.json > ../results/safety_cleaned.json || echo '{"vulnerabilities":[]}' > ../results/safety_cleaned.json
+
+################################################################################
+# PYTHON SCA – pip-audit
+################################################################################
+      - name: Python SCA – pip-audit
+        if: ${{ inputs.language == 'Python' }}
+        run: |
+          cd project
+          pip-audit -f json > ../results/pip_audit.json || echo '{"vulnerabilities":[]}' > ../results/pip_audit.json
+          jq '{vulnerabilities: [.vulnerabilities[]?]}' ../results/pip_audit.json > ../results/pip_audit_cleaned.json || echo '{"vulnerabilities":[]}' > ../results/pip_audit_cleaned.json
 
 ################################################################################
 # SEMGREP
@@ -260,29 +267,24 @@ jobs:
           for d in all_results/repo-results-*; do
             R=$(basename "$d" | sed 's/^repo-results-//')
 
-            # ----- Snyk + Safety counts -----
+            # ----- Snyk + Safety + pip-audit counts -----
             SC_FILE="$d/sca_cleaned.json"
             SAF_FILE="$d/safety_cleaned.json"
+            PIP_FILE="$d/pip_audit_cleaned.json"
             SL=0; SM=0; SH=0; SC=0
 
-            if [ -f "$SC_FILE" ]; then
-              SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' "$SC_FILE" 2>/dev/null || echo 0)
-              SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' "$SC_FILE" 2>/dev/null || echo 0)
-              SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' "$SC_FILE" 2>/dev/null || echo 0)
-              SC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' "$SC_FILE" 2>/dev/null || echo 0)
-            fi
-
-            if [ -f "$SAF_FILE" ]; then
-              SL_SAFE=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' "$SAF_FILE" 2>/dev/null || echo 0)
-              SM_SAFE=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' "$SAF_FILE" 2>/dev/null || echo 0)
-              SH_SAFE=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' "$SAF_FILE" 2>/dev/null || echo 0)
-              SC_SAFE=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' "$SAF_FILE" 2>/dev/null || echo 0)
-
-              SL=$((SL + SL_SAFE))
-              SM=$((SM + SM_SAFE))
-              SH=$((SH + SH_SAFE))
-              SC=$((SC + SC_SAFE))
-            fi
+            for F in "$SC_FILE" "$SAF_FILE" "$PIP_FILE"; do
+              if [ -f "$F" ]; then
+                SL_TMP=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' "$F" 2>/dev/null || echo 0)
+                SM_TMP=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' "$F" 2>/dev/null || echo 0)
+                SH_TMP=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' "$F" 2>/dev/null || echo 0)
+                SC_TMP=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' "$F" 2>/dev/null || echo 0)
+                SL=$((SL + SL_TMP))
+                SM=$((SM + SM_TMP))
+                SH=$((SH + SH_TMP))
+                SC=$((SC + SC_TMP))
+              fi
+            done
 
             # ----- Semgrep counts -----
             SEM_FILE="$d/semgrep.json"
