@@ -108,8 +108,8 @@ jobs:
             snyk test --all-projects --detection-depth=20 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
           fi
           cd ..
-          # Flatten all vulnerabilities safely
-          jq '[.. | objects | .vulnerabilities? // empty | .[]]' results/sca_raw.json > results/sca_cleaned.json
+          # Flatten all vulnerabilities safely for Java and Python, deduplicate
+          jq '[.projects[]?.vulnerabilities[]? // .vulnerabilities[]?] | unique_by(.id, .packageName, .version, .severity)' results/sca_raw.json > results/sca_cleaned.json
 
       - name: Semgrep
         run: |
