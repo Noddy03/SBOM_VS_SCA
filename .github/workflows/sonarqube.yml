@@ -71,9 +71,7 @@ jobs:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
-    continue-on-error: true
-    timeout-minutes: 10
-
+    
     steps:
       - name: Install tools
         run: |
@@ -135,7 +133,7 @@ jobs:
           snyk test \
             --all-projects \
             --scan-unmanaged \
-            --detection-depth=40 \
+            --detection-depth=50 \
             --json \
             --skip-unresolved \
             > results/sca_raw.json || echo "Snyk scan failed or timed out"
