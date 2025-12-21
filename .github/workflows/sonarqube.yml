@@ -28,10 +28,7 @@ jobs:
         run: |
           python3 <<'EOF'
           import os, requests, json, urllib.parse, time
-          headers = {
-              "Authorization": f"token {os.environ['TOKEN']}",
-              "Accept": "application/vnd.github+json"
-          }
+          headers = {"Authorization": f"token {os.environ['TOKEN']}", "Accept": "application/vnd.github+json"}
           language = os.environ["LANG"].lower()
           top_n = int(os.environ["TOP_N"])
           if language == "java":
@@ -43,11 +40,7 @@ jobs:
           repos = []
           page = 1
           while len(repos) < top_n and page <= 10:
-              url = (
-                  f"https://api.github.com/search/repositories"
-                  f"?q=language:{urllib.parse.quote(language)}"
-                  "&sort=stars&order=desc&per_page=30&page=" + str(page)
-              )
+              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(language)}&sort=stars&order=desc&per_page=30&page={page}"
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
                   break
@@ -112,8 +105,8 @@ jobs:
             snyk test --all-projects --detection-depth=20 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
           fi
           cd ..
-          # Fix SCA cleaning
-          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | {vulnerabilities: .}' results/sca_raw.json > results/sca_cleaned.json
+          # Fix: flatten all vulnerabilities into array
+          jq '[.. | objects | .vulnerabilities? // empty | .[]]' results/sca_raw.json > results/sca_cleaned.json
 
       - name: Semgrep
         run: |
@@ -126,7 +119,9 @@ jobs:
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
+          # Aggregate vulnerabilities
           jq '[.Results[].Vulnerabilities[]?] | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          # Aggregate licenses
           jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
       - name: OWASP DepScan
@@ -148,7 +143,7 @@ jobs:
       - name: Set artifact name
         id: set_artifact
         run: |
-          ARTIFACT_NAME=$(echo "${{ matrix.repo }}" | sed 's/[\/]/_/g')_$(date +%s)
+          ARTIFACT_NAME=$(echo "${{ matrix.repo }}" | sed 's#[/:]#_#g')_$(date +%s)
           echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
 
       - name: Upload results
@@ -168,8 +163,8 @@ jobs:
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
-          for d in all_results/repo-results-*; do
-            R=$(basename "$d" | sed 's/^repo-results-//; s/_/\//g')
+          for d in all_results/*; do
+            R=$(basename "$d" | sed 's/_/\\//g')
             SCAL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
             SCAM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
             SCAH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
@@ -191,10 +186,11 @@ jobs:
       - name: Build summary_licenses.csv
         run: |
           echo "repo,license_name,count" > summary_licenses.csv
-          for d in all_results/repo-results-*; do
-            R=$(basename "$d" | sed 's/^repo-results-//')
+          for d in all_results/*; do
+            R=$(basename "$d" | sed 's/_/\\//g')
             if [ -f "$d/licenses_tmp.json" ]; then
-              jq -r 'to_entries[] | [.key,.value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | while IFS=, read license count; do
+              jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
+              while IFS=',' read -r license count; do
                 license=$(echo $license | tr -d '"')
                 echo "$R,$license,$count" >> summary_licenses.csv
               done
