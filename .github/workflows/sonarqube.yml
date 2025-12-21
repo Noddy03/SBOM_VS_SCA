@@ -34,7 +34,6 @@ jobs:
           }
           language = os.environ["LANG"].lower()
           top_n = int(os.environ["TOP_N"])
-          # Include all common dependency files
           files_to_check = {
               "java": ["pom.xml", "build.gradle"],
               "python": ["requirements.txt", "pyproject.toml", "Pipfile", "poetry.lock"]
@@ -47,7 +46,6 @@ jobs:
                   break
               for repo in r.json().get("items", []):
                   for f in files_to_check:
-                      # Check root and src/ folder
                       check_urls = [
                           f"https://api.github.com/repos/{repo['full_name']}/contents/{f}",
                           f"https://api.github.com/repos/{repo['full_name']}/contents/src/{f}"
@@ -77,7 +75,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip maven gradle openjdk-17-jdk python3-venv python3-pip
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk python3-pip
           pip3 install semgrep
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
@@ -88,79 +86,35 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Build (optional, Java only)
-        run: |
-          LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
-          if [ "$LANG_LOWER" = "java" ]; then
-              cd project || exit
-              mvn -DskipTests package || true
-              gradle assemble -x test || true
-          fi
-
-      - name: Python venv setup (Python only)
-        run: |
-          LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
-          if [ "$LANG_LOWER" = "python" ]; then
-              python3 -m venv .venv
-              source .venv/bin/activate
-              pip install --upgrade pip setuptools wheel
-              [ -f project/requirements.txt ] && pip install -r project/requirements.txt
-              [ -f project/pyproject.toml ] && pip install -e project
-              [ -f project/Pipfile ] && pip install pipenv && pipenv install --dev --system
-              [ -f project/poetry.lock ] && pip install poetry && poetry install --no-root
-          fi
-
-      - name: Snyk SCA (deep discovery)
+      - name: Snyk SCA (scan only, no build)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
-          if [ "$LANG_LOWER" = "java" ]; then
-            FILES=$(find project -maxdepth 2 -type f \( -name "pom.xml" -o -name "build.gradle" \))
-            [ -z "$FILES" ] && FILES="project"
-            snyk test --all-projects --detection-depth=50 --scan-unmanaged --prune-repeated-subdependencies=false --exclude=test,tests,target,build --json $FILES > results/sca_raw.json || echo '{"vulnerabilities":[]}' > results/sca_raw.json
-          elif [ "$LANG_LOWER" = "python" ]; then
-            snyk test --all-projects --dev --scan-unmanaged --prune-repeated-subdependencies=false --exclude=test,tests,build,__pycache__ --json > results/sca_raw.json || echo '{"vulnerabilities":[]}' > results/sca_raw.json
-          else
-            snyk test --all-projects --json > results/sca_raw.json || echo '{"vulnerabilities":[]}' > results/sca_raw.json
-          fi
+          snyk test --all-projects --scan-unmanaged --prune-repeated-subdependencies=false --exclude=test,tests,target,build,__pycache__ --json > results/sca_raw.json || echo '{"vulnerabilities":[]}' > results/sca_raw.json
           jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | { vulnerabilities: . }' results/sca_raw.json > results/sca_cleaned.json
 
       - name: Semgrep
         run: |
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
           CONFIGS="p/security-audit p/owasp-top-ten"
-          [ "$LANG_LOWER" = "python" ] && CONFIGS="$CONFIGS p/python https://semgrep.dev/p/python/ci-cd-security"
+          [ "$LANG_LOWER" = "python" ] && CONFIGS="$CONFIGS p/python"
           [ "$LANG_LOWER" = "java" ] && CONFIGS="$CONFIGS p/java"
           semgrep --config $CONFIGS --timeout 600 --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       - name: Trivy SBOM
         run: |
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
-          trivy fs project --scanners vuln,misconfig,secret,license \
-            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
-            --ignore-unfixed \
-            --format json --output results/sbom_vuln.json || true
-          jq -r '
-            [.Results[].Vulnerabilities[]?] |
-            group_by(.Severity) |
-            map({(.[0].Severity): length}) |
-            add
-          ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          trivy fs project --scanners vuln,misconfig,secret,license --format json --output results/sbom_vuln.json || true
+          jq -r '[.Results[].Vulnerabilities[]?] | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
 
       - name: OWASP DepScan
         run: |
-          java -jar dep-scan-cli.jar \
-            --scan project \
-            --format json \
-            --fail-on-high \
-            --exclude target,build,node_modules,__pycache__ \
-            --output results/dep-scan.json || true
+          java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
 
       - name: Merge SBOM counts
         run: |
-          TL=$(( $(jq '.LOW // 0 + .UNKNOWN // 0' results/trivy_tmp.json) ))
+          TL=$(jq '.LOW // 0' results/trivy_tmp.json)
           TM=$(jq '.MEDIUM // 0' results/trivy_tmp.json)
           TH=$(jq '.HIGH // 0' results/trivy_tmp.json)
           TC=$(jq '.CRITICAL // 0' results/trivy_tmp.json)
@@ -175,7 +129,6 @@ jobs:
         run: |
           SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
           echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
-
       - uses: actions/upload-artifact@v4
         with:
           name: repo-results-${{ env.SAFE_NAME }}
