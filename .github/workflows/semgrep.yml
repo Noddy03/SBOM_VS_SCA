@@ -109,21 +109,23 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          if [ "${{ inputs.language }}" == "Python" ]; then
-            FILES=""
+          if [ "${{ inputs.language }}" == "Java" ]; then
+            trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+          elif [ "${{ inputs.language }}" == "Python" ]; then
+            FILE=""
             for f in requirements.txt pyproject.toml setup.py; do
               if [ -f "$f" ]; then
-                FILES="$FILES $f"
+                FILE=$f
+                break
               fi
             done
-            if [ -n "$FILES" ]; then
-              trivy fs $FILES --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            if [ -n "$FILE" ]; then
+              trivy fs "$FILE" --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
             else
               echo '{"Results":[]}' > ../results/trivy_sca.json
             fi
-          else
-            trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
+
 
       - name: Generate SBOM (CycloneDX)
         run: |
