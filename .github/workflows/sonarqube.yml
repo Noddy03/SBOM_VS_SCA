@@ -146,27 +146,27 @@ jobs:
       ###########################################################################
       - name: SCA - Cleaned (SBOM aligned)
         run: |
-          # Ensure results directory exists
           mkdir -p results
           jq '
             .vulnerabilities |= map(
               select(
                 ((.isIgnored // false) | not)
                 and ((.isPatched // false) | not)
-                and (.packageName != null)
-                and (.packageName != "")
+                and ((.packageName // .name) != null)
+                and ((.packageName // .name) != "")
               )
             )
           ' results/sca.json > results/sca_tmp.json
           jq '
             .vulnerabilities |= unique_by(
-              (.packageName // "")
+              ((.packageName // .name) // "")
               + ":" + (.version // "unknown")
               + ":" + (.severity // "")
               + ":" + (.id // .title // "")
             )
           ' results/sca_tmp.json > results/sca_cleaned.json
           rm -f results/sca_tmp.json
+
 
       - name: Semgrep
         run: |
