@@ -26,47 +26,37 @@ jobs:
           LANG: ${{ inputs.language }}
           TOP_N: ${{ inputs.top_n }}
         run: |
+          python3 <<'EOF'
           import os, requests, json, urllib.parse, time
-
-          headers = {
-              "Authorization": f"token {os.environ['TOKEN']}",
-              "Accept": "application/vnd.github+json"
-          }
-
+          headers = {"Authorization": f"token {os.environ['TOKEN']}", "Accept": "application/vnd.github+json"}
           repos = []
           page = 1
-          top_n = int(os.environ["TOP_N"])
-          language = os.environ["LANG"]
-
-          while len(repos) < top_n and page <= 10:
-              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(language)}&sort=stars&order=desc&per_page=30&page={page}"
+          while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
+              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page=30&page={page}"
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
                   break
               for repo in r.json().get("items", []):
-                  files_to_check = []
-                  if language.lower() == "java":
-                      files_to_check = ["pom.xml"]
-                  elif language.lower() == "python":
-                      files_to_check = ["requirements.txt", "pyproject.toml", "setup.py"]
-
+                  files = []
+                  if os.environ["LANG"].lower() == "java":
+                      files = ["pom.xml"]
+                  elif os.environ["LANG"].lower() == "python":
+                      files = ["requirements.txt", "pyproject.toml", "setup.py"]
                   found = False
-                  for f in files_to_check:
+                  for f in files:
                       check_url = f"https://api.github.com/repos/{repo['full_name']}/contents/{f}"
                       if requests.get(check_url, headers=headers).status_code == 200:
                           found = True
                           break
-
                   if found:
                       repos.append(repo["full_name"])
-                      if len(repos) >= top_n:
+                      if len(repos) >= int(os.environ["TOP_N"]):
                           break
-
               page += 1
               time.sleep(1)
-
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"repos={json.dumps(repos)}\n")
+          EOF
 
   scan_repo:
     needs: fetch_repos
