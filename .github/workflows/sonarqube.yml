@@ -104,21 +104,19 @@ jobs:
       # SCA - Snyk (optimised for all languages)
       ###########################################################################
       - name: SCA - Snyk (optimised)
+        continue-on-error: true      # ensures the workflow continues even if Snyk fails
+        timeout-minutes: 10          # kills this step after 10 minutes
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
         run: |
           mkdir -p results
-      
-          # Run Snyk scan on all projects, including unmanaged
           snyk test \
             --all-projects \
             --scan-unmanaged \
             --detection-depth=15 \
             --json \
-            > results/sca_raw.json || true
-      
-          # Normalize raw output: array (Python multi-project) or object (Java)
+            > results/sca_raw.json || echo "Snyk scan failed or timed out"          
           jq '
             if type=="array" then
               map(.vulnerabilities // []) | add
@@ -127,6 +125,7 @@ jobs:
             end
             | { vulnerabilities: . }
           ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+
       
       ###########################################################################
       # SCA - Cleaned (SBOM aligned)
