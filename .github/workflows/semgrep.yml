@@ -72,9 +72,10 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-pip
+          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-pip python3-venv
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
+
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -94,16 +95,24 @@ jobs:
             mvn -q -DskipTests dependency:resolve || true
           fi
 
-      - name: Install Python dependencies (Python only)
+      - name: Setup Python environment and install dependencies (Python only)
         if: ${{ inputs.language == 'Python' }}
         run: |
           cd project
-          for f in requirements.txt pyproject.toml setup.py; do
-            if [ -f "$f" ]; then
-              pip install -r requirements.txt || true
-              break
-            fi
-          done
+          python3 -m venv venv
+          source venv/bin/activate
+          # Install dependencies safely
+          if [ -f requirements.txt ]; then
+            pip install --upgrade pip
+            pip install --ignore-requires-python -r requirements.txt || true
+          elif [ -f pyproject.toml ]; then
+            pip install --upgrade pip
+            pip install --ignore-requires-python poetry || true
+            poetry install || true
+          elif [ -f setup.py ]; then
+            pip install --upgrade pip
+            pip install --ignore-requires-python . || true
+          deactivate
 
       - name: Trivy Dependency SCA
         run: |
@@ -112,21 +121,11 @@ jobs:
           if [ "${{ inputs.language }}" == "Java" ]; then
             trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           elif [ "${{ inputs.language }}" == "Python" ]; then
-            TMP_ENV=$(mktemp -d)
-            python3 -m venv $TMP_ENV
-            source $TMP_ENV/bin/activate
-            if [ -f requirements.txt ]; then
-              pip install -r requirements.txt
-            elif [ -f pyproject.toml ]; then
-              pip install poetry
-              poetry install --no-root
-            fi
-            # Scan installed packages
-            trivy fs $TMP_ENV/lib/python*/site-packages --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            # Activate venv and scan installed deps
+            source venv/bin/activate
+            trivy fs . --format json --scanners vuln --ignore-unfixed --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
             deactivate
           fi
-
-
 
       - name: Generate SBOM (CycloneDX)
         run: |
@@ -142,12 +141,6 @@ jobs:
             echo '{"Results":[]}' > results/trivy_sbom_vuln.json
           fi
 
-      - name: Trivy License Scan
-        run: |
-          mkdir -p results
-          cd project
-          trivy fs . --format json --scanners license --output ../results/trivy_license.json || echo '{"Results":[]}' > ../results/trivy_license.json
-
       - name: Build repo summary row
         run: |
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
@@ -162,10 +155,12 @@ jobs:
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
 
-          # Build license summary for this repo
-          echo "repo,package,license" > license_summary.csv
-          jq -r '.Results[]?.Components[]? | [.Name, .License] | @csv' results/trivy_license.json | \
-            sed "s/^/$(echo "${{ steps.sanitize.outputs.safe }}"),/" >> license_summary.csv
+      - name: Trivy License Scan
+        run: |
+          cd project
+          mkdir -p results
+          trivy fs . --format json --scanners license --output ../results/trivy_license.json || echo '{"Results":[]}' > ../results/trivy_license.json
+          jq -r '.Results[].Licenses[]?.Name' ../results/trivy_license.json | sort | uniq > ../results/license_summary.csv
 
       - name: Upload repo summary
         uses: actions/upload-artifact@v4
@@ -177,7 +172,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: license-summary-${{ steps.sanitize.outputs.safe }}
-          path: license_summary.csv
+          path: results/license_summary.csv
 
   build_summary:
     needs: scan_repo
@@ -196,8 +191,12 @@ jobs:
           path: summary.csv
       - name: Build final license_summary.csv
         run: |
-          echo "repo,package,license" > license_summary.csv
-          find rows -name license_summary.csv -exec tail -n +2 {} \; >> license_summary.csv
+          echo "repo,licenses" > license_summary.csv
+          for file in $(find rows -name license-summary-*.csv); do
+            REPO=$(basename $file | sed 's/license-summary-//;s/.csv//')
+            LICENSES=$(paste -sd';' $file)
+            echo "$REPO,\"$LICENSES\"" >> license_summary.csv
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: license-summary
