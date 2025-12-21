@@ -120,7 +120,7 @@ jobs:
           snyk test \
             --all-projects \
             --scan-unmanaged \
-            --detection-depth=15 \
+            --detection-depth=40 \
             --json \
             --skip-unresolved \
             > results/sca_raw.json || echo "Snyk scan failed or timed out"          
