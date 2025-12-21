@@ -1,4 +1,4 @@
-name: Security Scan – Trivy SCA + SBOM + DepScan + Licenses
+name: Security Scan – Trivy SCA + SBOM + DepScan
 
 on:
   workflow_dispatch:
@@ -110,24 +110,26 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          if [ "${{ inputs.language }}" == "Java" ] || [ "${{ inputs.language }}" == "Python" ]; then
-            trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+          trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+
+      - name: Trivy License Scan
+        run: |
+          cd project
+          trivy fs . --format json --scanners license --output ../results/trivy_license.json || echo '{"Results":[]}' > ../results/trivy_license.json
 
       - name: Generate SBOM (CycloneDX)
         run: |
           mkdir -p results
           cd project
-          trivy fs . --format cyclonedx-json --output ../results/sbom.cdx.json || true
+          trivy fs . --format cyclonedx --output ../results/sbom.cdx.json || echo '{"components":[]}' > ../results/sbom.cdx.json
 
       - name: Trivy SBOM Scan
         run: |
-          trivy sbom results/sbom.cdx.json --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
-
-      - name: Trivy License Scan
-        run: |
-          mkdir -p results
-          cd project
-          trivy fs . --format json --scanners license --output ../results/trivy_license.json || echo '{"Results":[]}' > ../results/trivy_license.json
+          if [ -f results/sbom.cdx.json ]; then
+            trivy sbom results/sbom.cdx.json --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
+          else
+            echo '{"Results":[]}' > results/trivy_sbom_vuln.json
+          fi
 
       - name: Build repo summary row
         run: |
@@ -143,11 +145,10 @@ jobs:
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
 
-      - name: Build license summary
-        run: |
+          # Aggregate licenses
+          LICENSES=$(jq -r '.Results[].Licenses[]?.Name // "Unknown"' results/trivy_license.json | sort | uniq -c | awk '{print $2","$1}' | tr '\n' ',' | sed 's/,$//')
           echo "repo,licenses" > license_summary.csv
-          LICENSES=$(jq -r '[.Results[]?.Licenses[]? | .Name] | join(";")' results/trivy_license.json)
-          echo "${{ steps.sanitize.outputs.safe }},\"$LICENSES\"" >> license_summary.csv
+          echo "${{ steps.sanitize.outputs.safe }},$LICENSES" >> license_summary.csv
 
       - name: Upload repo summary
         uses: actions/upload-artifact@v4
