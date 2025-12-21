@@ -74,12 +74,13 @@ jobs:
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
     continue-on-error: true
+
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle
-          pip3 install semgrep
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle python3-venv
+          pip3 install --upgrade semgrep
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
@@ -131,7 +132,12 @@ jobs:
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy fs project --scanners vuln --format json --output results/sbom_vuln.json || true
-          jq '[.Results[].Vulnerabilities[]?] | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          jq '
+            [.Results[].Vulnerabilities[]?] |
+            group_by(.Severity) |
+            map({(.[0].Severity): length}) |
+            add
+          ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
 
       - name: OWASP DepScan
         run: |
@@ -150,10 +156,12 @@ jobs:
           echo "$((TL+DL)),$((TM+DM)),$((TH+DH)),$((TC+DC))" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
 
-      - name: Upload results
-        uses: actions/upload-artifact@v4
+      - name: Set artifact name
+        run: echo "ARTIFACT_NAME=$(echo '${{ matrix.repo }}' | sed 's|/|_|g')" >> $GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo.replace('/', '_') }}
+          name: ${{ env.ARTIFACT_NAME }}
           path: results
 
   summarize:
@@ -167,8 +175,8 @@ jobs:
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
-          for d in all_results/repo-results-*; do
-            R=$(basename "$d" | sed 's/^repo-results-//')
+          for d in all_results/*; do
+            R=$(basename "$d" | sed 's|_|/|g')
             SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' $d/sca_cleaned.json)
             SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' $d/sca_cleaned.json)
             SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' $d/sca_cleaned.json)
