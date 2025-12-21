@@ -85,8 +85,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip maven gradle openjdk-17-jdk python3-pip
-          pip3 install --upgrade pip
+          sudo apt-get install -y jq git curl unzip maven gradle openjdk-17-jdk
           pip3 install semgrep
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
@@ -95,43 +94,39 @@ jobs:
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
-
-      - name: Prepare results folder
-        run: mkdir -p results
-
-      - name: Build / Skip for Java
         run: |
-          if [ "${{ inputs.language }}" = "Java" ]; then
-            echo "Skipping build and SCA for Java to avoid JDK mismatch"
-          else
-            cd project
-            pip3 install --upgrade pip setuptools wheel || true
-            pip3 install . || true
-          fi
+          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
 ################################################################################
-# SNYK SCA
+# SCA BUILD & SCAN (fixed)
 ################################################################################
-      - name: Snyk SCA
-        if: ${{ inputs.language != 'Java' }}
+      - name: Snyk SCA (deep discovery)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          for f in project/requirements.txt project/pyproject.toml; do
-            if [ -f "$f" ]; then
-              snyk test --file="$f" --json > results/sca_raw.json || true
-            fi
-          done
-          jq '
-            if type=="array" then
-              map(.vulnerabilities // []) | add
-            else
-              .vulnerabilities // []
-            end
-            | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca_cleaned.json
+          echo "[]" > results/sca_raw.json
+          
+          if [ "${{ inputs.language }}" = "Python" ]; then
+            # Find all dependency files recursively
+            DEP_FILES=$(find project -name "requirements.txt" -o -name "pyproject.toml")
+            for f in $DEP_FILES; do
+              echo "Scanning $f..."
+              snyk test --file="$f" --json --all-projects --detection-depth=20 --scan-unmanaged \
+                --prune-repeated-subdependencies=false >> results/sca_raw.json || true
+            done
+          else
+            # Java: scan each Maven/Gradle submodule if pom.xml/build.gradle exists
+            MODULES=$(find project -name "pom.xml" -o -name "build.gradle" | xargs -n1 dirname | sort -u)
+            for mod in $MODULES; do
+              echo "Scanning $mod..."
+              snyk test --all-projects --detection-depth=20 --scan-unmanaged \
+                --prune-repeated-subdependencies=false --json --project-name="$(basename $mod)" "$mod" >> results/sca_raw.json || true
+            done
+          fi
+
+          # Merge JSON arrays
+          jq -s '[.[][]?.vulnerabilities // []] | {vulnerabilities: .}' results/sca_raw.json > results/sca_cleaned.json
 
 ################################################################################
 # SEMGREP
@@ -210,14 +205,14 @@ jobs:
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           for d in all_results/repo-results-*; do
             R=$(basename "$d" | sed 's/^repo-results-//')
-            SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
-            SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
-            SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
-            SC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
-            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' $d/semgrep.json 2>/dev/null || echo 0)
-            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' $d/semgrep.json 2>/dev/null || echo 0)
-            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' $d/semgrep.json 2>/dev/null || echo 0)
-            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' $d/semgrep.json 2>/dev/null || echo 0)
+            SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' $d/sca_cleaned.json)
+            SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' $d/sca_cleaned.json)
+            SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' $d/sca_cleaned.json)
+            SC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' $d/sca_cleaned.json)
+            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' $d/semgrep.json)
+            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' $d/semgrep.json)
+            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' $d/semgrep.json)
+            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' $d/semgrep.json)
             IFS=',' read SB_L SB_M SB_H SB_C < $d/sbom_counts.txt
             STATUS=$(cat $d/sbom_status.txt)
             TOTAL=$((SL+SM+SH+SC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
