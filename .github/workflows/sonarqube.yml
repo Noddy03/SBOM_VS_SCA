@@ -69,6 +69,7 @@ jobs:
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
     continue-on-error: true
+
     steps:
       - name: Install tools
         run: |
@@ -84,136 +85,113 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      ###############################################################################
-      # Java Maven SCA
-      ###############################################################################
-      - name: SCA - Java Maven (Snyk)
+      - name: Install Java dependencies (Maven)
         if: ${{ inputs.language == 'Java' }}
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          mkdir -p results
           cd project
-          snyk test \
-            --all-projects \
-            --maven-aggregate-projects \
-            --detection-depth=20 \
-            --json \
-            --fail-fast=false \
-            > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
+          mvn dependency:resolve
           cd ..
-          # Flatten vulnerabilities safely
-          jq '
-            if type=="array" then
-              map(.vulnerabilities // []) | add
-            elif has("vulnerabilities") then
-              .vulnerabilities
-            else
-              []
-            end
-            | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
-          # Clean SCA
-          jq '
-            .vulnerabilities |= map(
-              select(
-                (.isIgnored | not)
-                and (.isPatched | not)
-                and (.packageName != null)
-                and (.packageName != "")
-              )
-            )
-          ' results/sca.json > results/sca_tmp.json
-          jq '
-            .vulnerabilities |= unique_by(
-              (.packageName // "")
-              + ":" + (.version // "unknown")
-              + ":" + (.severity // "")
-              + ":" + (.id // .title // "")
-            )
-          ' results/sca_tmp.json > results/sca_cleaned.json
-          rm -f results/sca_tmp.json
 
-      ###############################################################################
-      # Python SCA
-      ###############################################################################
-      - name: SCA - Python (Snyk)
+      - name: Install Python dependencies
         if: ${{ inputs.language == 'Python' }}
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          mkdir -p results
           cd project
           python3 -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install . || true; fi
-          snyk test \
-            --all-projects \
-            --detection-depth=20 \
-            --json \
-            > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
           cd ..
-          # Flatten vulnerabilities safely
+
+      ###########################################################################
+      # SCA - Java Maven
+      ###########################################################################
+      - name: SCA - Java Maven
+        if: ${{ inputs.language == 'Java' }}
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+        run: |
+          mkdir -p results
+          cd project
+          snyk test --maven-aggregate-projects --detection-depth=20 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
+          cd ..
           jq '
-            if type=="array" then
-              map(.vulnerabilities // []) | add
-            elif has("vulnerabilities") then
-              .vulnerabilities
-            else
-              []
-            end
+            if type=="array" then map(.vulnerabilities // []) | add
+            else .vulnerabilities // [] end
             | { vulnerabilities: . }
           ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
-          # Clean SCA
+
+      ###########################################################################
+      # SCA - Python
+      ###########################################################################
+      - name: SCA - Python
+        if: ${{ inputs.language == 'Python' }}
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+        run: |
+          mkdir -p results
+          cd project
+          snyk test --all-projects --detection-depth=20 --scan-unmanaged --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
+          cd ..
+          jq '
+            if type=="array" then map(.vulnerabilities // []) | add
+            else .vulnerabilities // [] end
+            | { vulnerabilities: . }
+          ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+
+      ###########################################################################
+      # SCA - Cleaned (minimal)
+      ###########################################################################
+      - name: SCA - Cleaned (minimal)
+        run: |
           jq '
             .vulnerabilities |= map(
               select(
-                (.isIgnored | not)
-                and (.isPatched | not)
-                and (.packageName != null)
-                and (.packageName != "")
+                (.isIgnored // false | not)
+                and (.isPatched // false | not)
               )
             )
-          ' results/sca.json > results/sca_tmp.json
-          jq '
-            .vulnerabilities |= unique_by(
-              (.packageName // "")
-              + ":" + (.version // "unknown")
-              + ":" + (.severity // "")
-              + ":" + (.id // .title // "")
-            )
-          ' results/sca_tmp.json > results/sca_cleaned.json
-          rm -f results/sca_tmp.json
+          ' results/sca.json > results/sca_cleaned.json
 
-      ###############################################################################
-      # Semgrep, Trivy, DepScan, SBOM as before
-      ###############################################################################
+      ###########################################################################
+      # Semgrep
+      ###########################################################################
       - name: Semgrep
         run: |
           mkdir -p results
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
           semgrep --config p/security-audit --config p/owasp-top-ten --config p/$LANG_LOWER --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
+      ###########################################################################
+      # Trivy SBOM + deduplicated vulnerabilities
+      ###########################################################################
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
-          # Deduplicate vulnerabilities by pkg + version + severity
-          jq '[.Results[].Vulnerabilities[]?] | unique_by((.PkgName // "") + ":" + (.InstalledVersion // "unknown") + ":" + (.Severity // "") + ":" + (.VulnerabilityID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          # Deduplicate vulnerabilities
+          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + ":" + (.Version // "" ) + ":" + (.Severity // ""))' results/sbom_vuln.json > results/trivy_tmp.json || echo '[]' > results/trivy_tmp.json
+          # Aggregate counts
+          jq 'group_by(.Severity) | map({(.[0].Severity): length}) | add' results/trivy_tmp.json > results/trivy_counts.json || echo '{}' > results/trivy_counts.json
+          # Aggregate licenses
           jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
+      ###########################################################################
+      # OWASP DepScan
+      ###########################################################################
       - name: OWASP DepScan
         run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
 
+      ###########################################################################
+      # Merge SBOM counts
+      ###########################################################################
       - name: Merge SBOM counts
         run: |
-          TL=$(jq '.LOW // 0' results/trivy_tmp.json)
-          TM=$(jq '.MEDIUM // 0' results/trivy_tmp.json)
-          TH=$(jq '.HIGH // 0' results/trivy_tmp.json)
-          TC=$(jq '.CRITICAL // 0' results/trivy_tmp.json)
+          TL=$(jq '.LOW // 0' results/trivy_counts.json)
+          TM=$(jq '.MEDIUM // 0' results/trivy_counts.json)
+          TH=$(jq '.HIGH // 0' results/trivy_counts.json)
+          TC=$(jq '.CRITICAL // 0' results/trivy_counts.json)
           DL=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/dep-scan.json 2>/dev/null || echo 0)
           DM=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/dep-scan.json 2>/dev/null || echo 0)
           DH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/dep-scan.json 2>/dev/null || echo 0)
@@ -221,6 +199,9 @@ jobs:
           echo "$((TL+DL)),$((TM+DM)),$((TH+DH)),$((TC+DC))" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
 
+      ###########################################################################
+      # Set artifact name and upload
+      ###########################################################################
       - name: Set artifact name
         id: set_artifact
         run: |
