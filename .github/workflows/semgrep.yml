@@ -118,15 +118,31 @@ jobs:
         run: |
           mkdir -p results
           cd project
+      
           if [ "${{ inputs.language }}" == "Java" ]; then
             if [ -f pom.xml ]; then
-              trivy fs pom.xml --format json --scanners vuln --ignore-unfixed --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+              # Resolve and copy dependencies to a local folder
+              mvn -q -DskipTests dependency:resolve dependency:copy-dependencies -DoutputDirectory=target/dependency || true
+              
+              # Scan dependencies if they exist, fallback to pom.xml
+              if [ -d target/dependency ] && [ "$(ls -A target/dependency)" ]; then
+                trivy fs target/dependency --format json --scanners vuln --ignore-unfixed --output ../results/trivy_sca.json \
+                || echo '{"Results":[]}' > ../results/trivy_sca.json
+              else
+                trivy fs pom.xml --format json --scanners vuln --ignore-unfixed --output ../results/trivy_sca.json \
+                || echo '{"Results":[]}' > ../results/trivy_sca.json
+              fi
+            else
+              echo '{"Results":[]}' > ../results/trivy_sca.json
             fi
+      
           elif [ "${{ inputs.language }}" == "Python" ]; then
             source venv/bin/activate
-            trivy fs . --format json --scanners vuln --ignore-unfixed --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            trivy fs . --format json --scanners vuln --ignore-unfixed --output ../results/trivy_sca.json \
+            || echo '{"Results":[]}' > ../results/trivy_sca.json
             deactivate
           fi
+
 
 
       - name: Generate SBOM (CycloneDX)
