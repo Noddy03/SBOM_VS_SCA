@@ -14,9 +14,6 @@ permissions:
   contents: read
   security-events: write
 
-################################################################################
-# FETCH REPOS
-################################################################################
 jobs:
   fetch_repos:
     runs-on: ubuntu-latest
@@ -38,7 +35,7 @@ jobs:
           language = os.environ["LANG"].lower()
           top_n = int(os.environ["TOP_N"])
           if language == "java":
-              files_to_check = ["pom.xml", "build.gradle"]
+              files_to_check = ["pom.xml"]
           elif language == "python":
               files_to_check = ["requirements.txt", "pyproject.toml"]
           else:
@@ -68,9 +65,6 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
-################################################################################
-# SCAN REPOS
-################################################################################
   scan_repo:
     needs: fetch_repos
     if: ${{ needs.fetch_repos.outputs.repos != '[]' }}
@@ -94,45 +88,43 @@ jobs:
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-################################################################################
-# SCA BUILD & SCAN (fixed)
-################################################################################
+      - name: Build (best effort)
+        run: |
+          if [ "${{ inputs.language }}" = "Java" ]; then
+            cd project
+            mvn -q -DskipTests package || echo "Skipping build due to JDK mismatch"
+            gradle build -x test || echo "Skipping Gradle build"
+          else
+            cd project
+            echo "Skipping build for non-Java projects"
+          fi
+
       - name: Snyk SCA (deep discovery)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          echo "[]" > results/sca_raw.json
-          
-          if [ "${{ inputs.language }}" = "Python" ]; then
-            # Find all dependency files recursively
-            DEP_FILES=$(find project -name "requirements.txt" -o -name "pyproject.toml")
-            for f in $DEP_FILES; do
-              echo "Scanning $f..."
-              snyk test --file="$f" --json --all-projects --detection-depth=20 --scan-unmanaged \
-                --prune-repeated-subdependencies=false >> results/sca_raw.json || true
-            done
-          else
-            # Java: scan each Maven/Gradle submodule if pom.xml/build.gradle exists
-            MODULES=$(find project -name "pom.xml" -o -name "build.gradle" | xargs -n1 dirname | sort -u)
-            for mod in $MODULES; do
-              echo "Scanning $mod..."
-              snyk test --all-projects --detection-depth=20 --scan-unmanaged \
-                --prune-repeated-subdependencies=false --json --project-name="$(basename $mod)" "$mod" >> results/sca_raw.json || true
-            done
-          fi
+          snyk test \
+            --all-projects \
+            --detection-depth=20 \
+            --scan-unmanaged \
+            --prune-repeated-subdependencies=false \
+            --exclude=test,tests,target,build \
+            --json > results/sca_raw.json || echo '{"vulnerabilities":[]}' > results/sca_raw.json
+          jq '
+            if type=="array" then
+              map(.vulnerabilities // []) | add
+            else
+              .vulnerabilities // []
+            end
+            | { vulnerabilities: . }
+          ' results/sca_raw.json > results/sca_cleaned.json
 
-          # Merge JSON arrays
-          jq -s '[.[][]?.vulnerabilities // []] | {vulnerabilities: .}' results/sca_raw.json > results/sca_cleaned.json
-
-################################################################################
-# SEMGREP
-################################################################################
       - name: Semgrep
         run: |
+          mkdir -p results
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
           semgrep \
             --config p/security-audit \
@@ -140,11 +132,9 @@ jobs:
             --config p/$LANG_LOWER \
             --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-################################################################################
-# TRIVY SBOM
-################################################################################
       - name: Trivy SBOM
         run: |
+          mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy fs project --scanners vuln --format json --output results/sbom_vuln.json || true
           jq -r '
@@ -154,16 +144,9 @@ jobs:
             add
           ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
 
-################################################################################
-# OWASP DEP-SCAN
-################################################################################
       - name: OWASP DepScan
-        run: |
-          java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
+        run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
 
-################################################################################
-# MERGE SBOM COUNTS
-################################################################################
       - name: Merge SBOM counts
         run: |
           TL=$(jq '.LOW // 0' results/trivy_tmp.json)
@@ -177,9 +160,6 @@ jobs:
           echo "$((TL+DL)),$((TM+DM)),$((TH+DH)),$((TC+DC))" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
 
-################################################################################
-# UPLOAD RESULTS
-################################################################################
       - name: Upload results
         run: |
           SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
@@ -189,9 +169,6 @@ jobs:
           name: repo-results-${{ env.SAFE_NAME }}
           path: results
 
-################################################################################
-# SUMMARY
-################################################################################
   summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
@@ -205,14 +182,16 @@ jobs:
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           for d in all_results/repo-results-*; do
             R=$(basename "$d" | sed 's/^repo-results-//')
-            SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' $d/sca_cleaned.json)
-            SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' $d/sca_cleaned.json)
-            SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' $d/sca_cleaned.json)
-            SC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' $d/sca_cleaned.json)
-            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' $d/semgrep.json)
-            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' $d/semgrep.json)
-            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' $d/semgrep.json)
-            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' $d/semgrep.json)
+            SL=$(jq 'if .vulnerabilities then [.vulnerabilities[]? | select(.severity=="low")] | length else 0 end' $d/sca_cleaned.json)
+            SM=$(jq 'if .vulnerabilities then [.vulnerabilities[]? | select(.severity=="medium")] | length else 0 end' $d/sca_cleaned.json)
+            SH=$(jq 'if .vulnerabilities then [.vulnerabilities[]? | select(.severity=="high")] | length else 0 end' $d/sca_cleaned.json)
+            SC=$(jq 'if .vulnerabilities then [.vulnerabilities[]? | select(.severity=="critical")] | length else 0 end' $d/sca_cleaned.json)
+
+            SEM_L=$(jq 'if .results then [.results[]? | select(.extra.severity=="INFO")] | length else 0 end' $d/semgrep.json)
+            SEM_M=$(jq 'if .results then [.results[]? | select(.extra.severity=="WARNING")] | length else 0 end' $d/semgrep.json)
+            SEM_H=$(jq 'if .results then [.results[]? | select(.extra.severity=="ERROR")] | length else 0 end' $d/semgrep.json)
+            SEM_C=$(jq 'if .results then [.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length else 0 end' $d/semgrep.json)
+
             IFS=',' read SB_L SB_M SB_H SB_C < $d/sbom_counts.txt
             STATUS=$(cat $d/sbom_status.txt)
             TOTAL=$((SL+SM+SH+SC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
