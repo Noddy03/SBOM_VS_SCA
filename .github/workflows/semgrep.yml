@@ -119,12 +119,15 @@ jobs:
           mkdir -p results
           cd project
           if [ "${{ inputs.language }}" == "Java" ]; then
-            trivy fs . --format json --scanners vuln --ignore-unfixed --maven-goals "dependency:list" --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            if [ -f pom.xml ]; then
+              trivy fs pom.xml --format json --scanners vuln --ignore-unfixed --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            fi
           elif [ "${{ inputs.language }}" == "Python" ]; then
             source venv/bin/activate
             trivy fs . --format json --scanners vuln --ignore-unfixed --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
             deactivate
           fi
+
 
       - name: Generate SBOM (CycloneDX)
         run: |
