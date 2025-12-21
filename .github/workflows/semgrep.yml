@@ -101,19 +101,6 @@ jobs:
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
           echo "safe=$SAFE" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve Java dependencies per POM
-        if: ${{ inputs.language == 'Java' }}
-        run: |
-          cd project
-          find . -name "pom.xml" -exec mvn -f {} -q -DskipTests dependency:resolve \; || true
-
-      - name: Resolve Python dependencies
-        if: ${{ inputs.language == 'Python' }}
-        run: |
-          cd project
-          python3 -m pip install --upgrade --user pip
-          find . -name "requirements.txt" -exec python3 -m pip install --user -r {} \; || true
-
       - name: Trivy Java SCA
         if: ${{ inputs.language == 'Java' }}
         run: |
@@ -132,11 +119,15 @@ jobs:
         if: ${{ inputs.language == 'Python' }}
         run: |
           mkdir -p results
-          find . -name "requirements.txt" -exec trivy pip -r {} \
-            --scanners vuln \
-            --severity LOW,MEDIUM,HIGH,CRITICAL \
-            --format json \
-            --output results/trivy_sca.json \; || echo '{"Results":[]}' > results/trivy_sca.json
+          if find . -name "requirements.txt" | grep -q .; then
+            find . -name "requirements.txt" -exec trivy pip -r {} \
+              --scanners vuln \
+              --severity LOW,MEDIUM,HIGH,CRITICAL \
+              --format json \
+              --output results/trivy_sca.json \;
+          else
+            echo '{"Results":[]}' > results/trivy_sca.json
+          fi
 
       - name: Generate SBOM
         run: |
