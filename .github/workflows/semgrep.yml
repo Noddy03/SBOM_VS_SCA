@@ -132,7 +132,10 @@ jobs:
       - name: Semgrep
         run: |
           mkdir -p results
-          semgrep --config p/security-audit --config p/owasp-top-ten --config p/${{ inputs.language | toLowerCase }} --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config p/security-audit \
+                  --config p/owasp-top-ten \
+                  --config p/${{ inputs.language.toLower() }} \
+                  --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       # ---------------- SBOM - DEPSCAN ----------------
       - name: OWASP DepScan SBOM Scan
