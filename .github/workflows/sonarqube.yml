@@ -79,10 +79,16 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Build (best effort)
+      - name: Build (best effort, Java only)
         run: |
-          cd project
-          mvn -q -DskipTests package || gradle build -x test || true
+          LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
+          if [ "$LANG_LOWER" = "java" ]; then
+              cd project || exit
+              # Maven: fallback to Java 17, skip tests
+              mvn -q -DskipTests -Dmaven.compiler.source=17 -Dmaven.compiler.target=17 package || true
+              # Gradle: assemble only, skip tests
+              gradle assemble -x test || true
+          fi
 
       - name: Snyk SCA (deep discovery)
         env:
@@ -118,7 +124,7 @@ jobs:
       - name: Trivy SBOM
         run: |
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
-          trivy fs project --scanners vuln,config,secret,license \
+          trivy fs project --scanners vuln,misconfig,secret,license \
             --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
             --ignore-unfixed \
             --format json --output results/sbom_vuln.json || true
