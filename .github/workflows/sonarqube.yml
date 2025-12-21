@@ -32,7 +32,7 @@ jobs:
           language = os.environ["LANG"].lower()
           top_n = int(os.environ["TOP_N"])
           if language == "java":
-              files_to_check = ["pom.xml"]  # Only Maven projects
+              files_to_check = ["pom.xml"]
           elif language == "python":
               files_to_check = ["requirements.txt", "pyproject.toml"]
           else:
@@ -72,8 +72,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven
-          pip3 install semgrep
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-venv
+          pip3 install semgrep snyk
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
@@ -83,45 +83,34 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Build / Resolve Maven dependencies
+      - name: Java Maven SCA
         if: ${{ inputs.language == 'Java' }}
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
+          mkdir -p results
           cd project
-          mvn -q -DskipTests dependency:resolve || true
+          mvn -q -DskipTests dependency:resolve || echo "Maven dependencies failed, continuing"
+          snyk test --all-projects --json > ../results/sca_raw_java.json || echo '{}' > ../results/sca_raw_java.json
+          cd ..
+          # Flatten vulnerabilities safely
+          jq '[.. | objects | .vulnerabilities? // empty | .[] | .severity |= ascii_downcase]' results/sca_raw_java.json > results/sca_cleaned_java.json
 
-      - name: Python deps (best effort)
+      - name: Python SCA
         if: ${{ inputs.language == 'Python' }}
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
+          mkdir -p results
           cd project
           python3 -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install . || true; fi
-
-      - name: Snyk SCA
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
-        run: |
-          mkdir -p results
-          cd project
-          if [ "${{ inputs.language }}" = "Java" ]; then
-            snyk test --all-projects --detection-depth=20 --json > ../results/sca_raw.json || true
-          else
-            snyk test --all-projects --detection-depth=20 --json > ../results/sca_raw.json || true
-          fi
+          snyk test --all-projects --json > ../results/sca_raw_python.json || echo '{}' > ../results/sca_raw_python.json
           cd ..
-
-          # Flatten all vulnerabilities from Snyk JSON and normalize severity
-          jq '
-            [
-              .vulnerabilities[]?,
-              .issues.vulnerabilities[]?,
-              .projects[]?.vulnerabilities[]?,
-              .projects[]?.issues.vulnerabilities[]?
-            ]
-            | map(.severity |= ascii_downcase)
-          ' results/sca_raw.json > results/sca_cleaned.json
+          jq '[.. | objects | .vulnerabilities? // empty | .[] | .severity |= ascii_downcase]' results/sca_raw_python.json > results/sca_cleaned_python.json
 
       - name: Semgrep
         run: |
@@ -186,14 +175,28 @@ jobs:
           for d in all_results/*; do
             R=$(basename "$d")
             R=${R//_//}
-            SCAL=$(jq '[.[] | select(.severity=="low")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SCAM=$(jq '[.[] | select(.severity=="medium")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SCAH=$(jq '[.[] | select(.severity=="high")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SCAC=$(jq '[.[] | select(.severity=="critical")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+            # Merge Java and Python SCA cleaned
+            SCAL=$(jq '[.[] | select(.severity=="low")] | length' "$d/sca_cleaned_java.json" 2>/dev/null || echo 0)
+            SCAL_PY=$(jq '[.[] | select(.severity=="low")] | length' "$d/sca_cleaned_python.json" 2>/dev/null || echo 0)
+            SCAL=$((SCAL + SCAL_PY))
+
+            SCAM=$(jq '[.[] | select(.severity=="medium")] | length' "$d/sca_cleaned_java.json" 2>/dev/null || echo 0)
+            SCAM_PY=$(jq '[.[] | select(.severity=="medium")] | length' "$d/sca_cleaned_python.json" 2>/dev/null || echo 0)
+            SCAM=$((SCAM + SCAM_PY))
+
+            SCAH=$(jq '[.[] | select(.severity=="high")] | length' "$d/sca_cleaned_java.json" 2>/dev/null || echo 0)
+            SCAH_PY=$(jq '[.[] | select(.severity=="high")] | length' "$d/sca_cleaned_python.json" 2>/dev/null || echo 0)
+            SCAH=$((SCAH + SCAH_PY))
+
+            SCAC=$(jq '[.[] | select(.severity=="critical")] | length' "$d/sca_cleaned_java.json" 2>/dev/null || echo 0)
+            SCAC_PY=$(jq '[.[] | select(.severity=="critical")] | length' "$d/sca_cleaned_python.json" 2>/dev/null || echo 0)
+            SCAC=$((SCAC + SCAC_PY))
+
             SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
             SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
             SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
             SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+
             if [ -f "$d/sbom_counts.txt" ]; then
               IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
             else
