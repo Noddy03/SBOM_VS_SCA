@@ -104,8 +104,6 @@ jobs:
       # SCA - Snyk (optimised for all languages)
       ###########################################################################
       - name: SCA - Snyk (optimised)
-        continue-on-error: true      # ensures the workflow continues even if Snyk fails
-        timeout-minutes: 10          # kills this step after 10 minutes
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
