@@ -110,8 +110,25 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-
+          # Scan only dependency files for SCA
+          if [ "${{ inputs.language }}" == "Java" ]; then
+            # Scan pom.xml
+            if [ -f pom.xml ]; then
+              trivy fs pom.xml --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            else
+              echo '{"Results":[]}' > ../results/trivy_sca.json
+            fi
+          elif [ "${{ inputs.language }}" == "Python" ]; then
+            DEPFILES=""
+            for f in requirements.txt pyproject.toml setup.py; do
+              [ -f "$f" ] && DEPFILES="$DEPFILES $f"
+            done
+            if [ ! -z "$DEPFILES" ]; then
+              trivy fs $DEPFILES --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            else
+              echo '{"Results":[]}' > ../results/trivy_sca.json
+            fi
+          fi
       - name: Trivy License Scan
         run: |
           cd project
@@ -121,11 +138,13 @@ jobs:
         run: |
           mkdir -p results
           cd project
+          # SBOM scans the full project
           trivy fs . --format cyclonedx --output ../results/sbom.cdx.json || echo '{"components":[]}' > ../results/sbom.cdx.json
 
       - name: Trivy SBOM Scan
         run: |
           if [ -f results/sbom.cdx.json ]; then
+            # Scan SBOM for vulnerabilities separately
             trivy sbom results/sbom.cdx.json --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
           else
             echo '{"Results":[]}' > results/trivy_sbom_vuln.json
