@@ -189,13 +189,11 @@ jobs:
 # UPLOAD RESULTS
 ################################################################################
       - name: Upload results
-        run: |
-          ARTIFACT_NAME=$(echo "${{ matrix.repo }}" | sed 's/\//_/g')
-          echo "Uploading artifact as $ARTIFACT_NAME"
-          actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4
         with:
-          name: $ARTIFACT_NAME
+          name: ${{ matrix.repo || '' | replace('/', '_') }}
           path: results
+
 
 ################################################################################
 # SUMMARY
