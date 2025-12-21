@@ -242,11 +242,17 @@ jobs:
           echo "repo,license_name,count" > summary_licenses.csv
           for d in all_results/repo-results-*; do
             R=$(basename "$d" | sed 's/^repo-results-//')
-            jq -r 'to_entries[] | "\(.key),\(.value)"' $d/licenses_tmp.json | while IFS= read -r line; do
-              LICENSE=$(echo $line | cut -d',' -f1)
-              COUNT=$(echo $line | cut -d',' -f2)
-              echo "$R,$LICENSE,$COUNT" >> summary_licenses.csv
-            done
+            if [ -f "$d/sbom_vuln.json" ]; then
+              # Extract licenses, default to empty array if missing
+              jq -r '.Results[].Licenses[]? | [.Name] | @csv' "$d/sbom_vuln.json" 2>/dev/null | \
+              sort | uniq -c | while read -r count license; do
+                # Remove quotes from CSV
+                license=$(echo $license | tr -d '"')
+                echo "$R,$license,$count" >> summary_licenses.csv
+              done
+            fi
+          done
+
 
       - uses: actions/upload-artifact@v4
         with:
