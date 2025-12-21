@@ -92,8 +92,8 @@ jobs:
         run: |
           cd project
           if [ -f pom.xml ]; then
-            mvn -q -DskipTests dependency:resolve || true
-          fi
+            # Fully resolve dependencies in local Maven cache
+            mvn -B dependency:go-offline || true
 
       - name: Setup Python environment (Python only)
         if: ${{ inputs.language == 'Python' }}
@@ -118,25 +118,22 @@ jobs:
         run: |
           mkdir -p results
           cd project
-      
+
           if [ "${{ inputs.language }}" == "Java" ]; then
             if [ -f pom.xml ]; then
-              # Scan pom.xml directly using Trivy with Maven dependency tree
+              # Scan pom.xml with resolved dependencies
               trivy fs pom.xml \
                 --format json \
                 --scanners vuln \
                 --ignore-unfixed \
-                --maven-goals "dependency:tree" \
+                --maven-goals "dependency:list" \
                 --output ../results/trivy_sca.json \
               || echo '{"Results":[]}' > ../results/trivy_sca.json
             else
-              # No pom.xml, produce empty result
               echo '{"Results":[]}' > ../results/trivy_sca.json
-            fi
-      
+
           elif [ "${{ inputs.language }}" == "Python" ]; then
             source venv/bin/activate
-            # Scan the installed Python packages in the repo
             trivy fs . \
               --format json \
               --scanners vuln \
@@ -144,10 +141,6 @@ jobs:
               --output ../results/trivy_sca.json \
             || echo '{"Results":[]}' > ../results/trivy_sca.json
             deactivate
-          fi
-
-
-
 
       - name: Generate SBOM (CycloneDX)
         run: |
@@ -161,7 +154,6 @@ jobs:
             trivy sbom results/sbom.cdx.json --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
           else
             echo '{"Results":[]}' > results/trivy_sbom_vuln.json
-          fi
 
       - name: Trivy License Scan
         run: |
