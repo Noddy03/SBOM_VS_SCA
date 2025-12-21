@@ -15,6 +15,9 @@ permissions:
   security-events: write
 
 jobs:
+# =========================================================
+# FETCH REPOSITORIES (UNCHANGED – WORKING)
+# =========================================================
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -60,6 +63,9 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
+# =========================================================
+# SCAN EACH REPOSITORY
+# =========================================================
   scan_repo:
     needs: fetch_repos
     if: needs.fetch_repos.outputs.repos != '[]'
@@ -89,7 +95,7 @@ jobs:
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
           echo "safe=$SAFE" >> "$GITHUB_OUTPUT"
 
-      # ---------------- JAVA ----------------
+# ---------------- JAVA ----------------
       - name: Resolve Maven dependencies (Java)
         if: ${{ inputs.language == 'Java' }}
         run: |
@@ -98,7 +104,7 @@ jobs:
             mvn -B -q dependency:go-offline || true
           fi
 
-      # ---------------- PYTHON ----------------
+# ---------------- PYTHON ----------------
       - name: Setup Python (Python)
         if: ${{ inputs.language == 'Python' }}
         uses: actions/setup-python@v4
@@ -124,7 +130,7 @@ jobs:
 
           deactivate
 
-      # ---------------- SCA ----------------
+# ---------------- SCA ----------------
       - name: Trivy Dependency SCA
         run: |
           mkdir -p results
@@ -153,7 +159,7 @@ jobs:
               deactivate
           fi
 
-      # ---------------- SBOM ----------------
+# ---------------- SBOM ----------------
       - name: Generate SBOM
         run: |
           mkdir -p results
@@ -166,18 +172,46 @@ jobs:
             --format json \
             --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
 
-      # ---------------- SUMMARY ----------------
+# ---------------- SUMMARY PER REPO ----------------
       - name: Build repo summary
         run: |
-          jq -r '
-            def c(s): [.Results[]?.Vulnerabilities[]? | select(.Severity==s)] | length;
-            "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total",
-            "${{ steps.sanitize.outputs.safe }}," +
-            ([c("LOW"),c("MEDIUM"),c("HIGH"),c("CRITICAL")] | map(tostring) | join(",")) + "," +
-            ([.Results[]?.Vulnerabilities[]? | .Severity] | length | tostring)
-          ' results/trivy_sca.json > repo_summary.csv
+          SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
+          SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
+          SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
+          SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
+
+          SB_L=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sbom_vuln.json)
+          SB_M=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sbom_vuln.json)
+          SB_H=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json)
+          SB_C=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sbom_vuln.json)
+
+          TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
+
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
+          echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
 
       - uses: actions/upload-artifact@v4
         with:
           name: repo-summary-${{ steps.sanitize.outputs.safe }}
           path: repo_summary.csv
+
+# =========================================================
+# GLOBAL SUMMARY
+# =========================================================
+  build_summary:
+    needs: scan_repo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: rows
+
+      - name: Build global summary.csv
+        run: |
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          find rows -name repo_summary.csv -exec tail -n +2 {} \; >> summary.csv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-summary
+          path: summary.csv
