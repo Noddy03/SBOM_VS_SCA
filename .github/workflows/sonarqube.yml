@@ -67,6 +67,7 @@ jobs:
     needs: fetch_repos
     if: ${{ needs.fetch_repos.outputs.repos != '[]' }}
     runs-on: ubuntu-latest
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
