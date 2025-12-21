@@ -4,17 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: 'Select the language to scan'
+        description: 'Choose language to scan'
         required: true
-        default: "Java"
-        type: choice
-        options:
-          - Java
-          - Python
+        default: 'Java'
       top_n:
-        description: 'Number of top repositories to fetch'
+        description: 'Number of repositories to scan'
         required: false
-        default: "5"
+        default: '5'
 
 permissions:
   contents: read
@@ -25,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.fetch.outputs.repos }}
+    timeout-minutes: 10
     steps:
       - id: fetch
         env:
@@ -81,8 +78,12 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle python3-venv
-          pip3 install semgrep snyk
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle nodejs npm
+          pip3 install --upgrade pip
+          pip3 install semgrep
+          npm install -g snyk
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
 
       - name: Clone repo
         env:
@@ -99,25 +100,71 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install . || true; fi
 
-      - name: SCA - Snyk (optimised)
+      ###########################################################################
+      # SCA - Snyk for Java Maven
+      ###########################################################################
+      - name: SCA - Java Maven
+        if: ${{ inputs.language == 'Java' }}
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
-          SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
         run: |
           mkdir -p results
           cd project
-          if [ "${{ inputs.language }}" = "Java" ]; then
-            snyk test --all-projects --maven-aggregate-projects --detection-depth=15 --scan-unmanaged --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
-          else
-            snyk test --all-projects --detection-depth=15 --scan-unmanaged --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
-          fi
+          snyk test --maven-aggregate-projects --detection-depth=15 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
           cd ..
-          # Minimal aggressive cleaning
           jq '
-            .vulnerabilities // []
-            | map(select((.isIgnored | not) and (.isPatched | not)))
+            if type=="array" then
+              map(.vulnerabilities // []) | add
+            else
+              .vulnerabilities // []
+            end
             | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca_cleaned.json
+          ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+      ###########################################################################
+      # SCA - Python
+      ###########################################################################
+      - name: SCA - Python
+        if: ${{ inputs.language == 'Python' }}
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+        run: |
+          mkdir -p results
+          cd project
+          snyk test --all-projects --detection-depth=15 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
+          cd ..
+          jq '
+            if type=="array" then
+              map(.vulnerabilities // []) | add
+            else
+              .vulnerabilities // []
+            end
+            | { vulnerabilities: . }
+          ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+
+      ###########################################################################
+      # SCA - Cleaned (SBOM aligned)
+      ###########################################################################
+      - name: SCA - Cleaned (SBOM aligned)
+        run: |
+          jq '
+            .vulnerabilities |= map(
+              select(
+                (.isIgnored | not)
+                and (.isPatched | not)
+                and (.packageName != null)
+                and (.packageName != "")
+              )
+            )
+          ' results/sca.json > results/sca_tmp.json
+          jq '
+            .vulnerabilities |= unique_by(
+              (.packageName // "")
+              + ":" + (.version // "unknown")
+              + ":" + (.severity // "")
+              + ":" + (.id // .title // "")
+            )
+          ' results/sca_tmp.json > results/sca_cleaned.json
+          rm -f results/sca_tmp.json
 
       - name: Semgrep
         run: |
@@ -130,8 +177,7 @@ jobs:
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
-          # Remove duplicates in SBOM vulnerabilities
-          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + ":" + (.Severity // "") + ":" + (.VulnerabilityID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + .Severity + (.VulnID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
           jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
       - name: OWASP DepScan
@@ -175,6 +221,7 @@ jobs:
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           for d in all_results/*; do
             R=$(basename "$d")
+            R=${R//_//}
             SCAL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
             SCAM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
             SCAH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
@@ -198,6 +245,7 @@ jobs:
           echo "repo,license_name,count" > summary_licenses.csv
           for d in all_results/*; do
             R=$(basename "$d")
+            R=${R//_//}
             if [ -f "$d/licenses_tmp.json" ]; then
               jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
               while IFS=',' read -r license count; do
