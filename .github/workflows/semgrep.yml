@@ -37,7 +37,6 @@ jobs:
               if r.status_code != 200:
                   break
               for repo in r.json().get("items", []):
-                  # Check for dependency files
                   files = []
                   if os.environ["LANG"].lower() == "java":
                       files = ["pom.xml"]
@@ -111,19 +110,21 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          if [ "${{ inputs.language }}" == "Java" ] || [ "${{ inputs.language }}" == "Python" ]; then
-            trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-          fi
+          trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
 
       - name: Generate SBOM (CycloneDX)
         run: |
           mkdir -p results
           cd project
-          trivy fs . --format cyclonedx-json --output ../results/sbom.cdx.json || true
+          trivy fs . --format cyclonedx --output ../results/sbom.cdx.json || echo '{"components":[]}' > ../results/sbom.cdx.json
 
       - name: Trivy SBOM Scan
         run: |
-          trivy sbom results/sbom.cdx.json --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
+          if [ -f results/sbom.cdx.json ]; then
+            trivy sbom results/sbom.cdx.json --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
+          else
+            echo '{"Results":[]}' > results/trivy_sbom_vuln.json
+          fi
 
       - name: Build repo summary row
         run: |
