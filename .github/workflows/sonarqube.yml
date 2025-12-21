@@ -32,7 +32,7 @@ jobs:
           language = os.environ["LANG"].lower()
           top_n = int(os.environ["TOP_N"])
           if language == "java":
-              files_to_check = ["pom.xml", "build.gradle"]
+              files_to_check = ["pom.xml"]  # Only Maven projects
           elif language == "python":
               files_to_check = ["requirements.txt", "pyproject.toml"]
           else:
@@ -72,7 +72,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven
           pip3 install semgrep
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
@@ -83,14 +83,11 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Build / Resolve Java dependencies
+      - name: Build / Resolve Maven dependencies
         if: ${{ inputs.language == 'Java' }}
         run: |
           cd project
-          if [ -f mvnw ]; then ./mvnw -q -DskipTests dependency:resolve || true
-          elif [ -f pom.xml ]; then mvn -q -DskipTests dependency:resolve || true
-          elif [ -f gradlew ]; then ./gradlew dependencies || true
-          fi
+          mvn -q -DskipTests dependency:resolve || true
 
       - name: Python deps (best effort)
         if: ${{ inputs.language == 'Python' }}
