@@ -146,11 +146,13 @@ jobs:
       ###########################################################################
       - name: SCA - Cleaned (SBOM aligned)
         run: |
+          # Ensure results directory exists
+          mkdir -p results
           jq '
             .vulnerabilities |= map(
               select(
-                (.isIgnored | not)
-                and (.isPatched | not)
+                ((.isIgnored // false) | not)
+                and ((.isPatched // false) | not)
                 and (.packageName != null)
                 and (.packageName != "")
               )
