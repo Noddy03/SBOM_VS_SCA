@@ -1,27 +1,30 @@
-name: Security Scan – Trivy SCA + SBOM + License
+name: Security Scan – Trivy SCA + SBOM + OWASP DepScan + Licenses
 
 on:
   workflow_dispatch:
     inputs:
       language:
+        description: 'Choose language to scan'
         required: true
-        default: "Java"
+        default: 'Java'
       top_n:
+        description: 'Number of repositories to scan'
         required: false
-        default: "5"
+        default: '5'
 
 permissions:
   contents: read
   security-events: write
 
 jobs:
-# =========================================================
-# FETCH REPOSITORIES (UNCHANGED – WORKING)
-# =========================================================
+  # =========================================================
+  # FETCH REPOSITORIES
+  # =========================================================
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.fetch.outputs.repos }}
+    timeout-minutes: 10
     steps:
       - id: fetch
         env:
@@ -63,156 +66,132 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
-# =========================================================
-# SCAN EACH REPOSITORY
-# =========================================================
+  # =========================================================
+  # SCAN EACH REPOSITORY
+  # =========================================================
   scan_repo:
     needs: fetch_repos
     if: needs.fetch_repos.outputs.repos != '[]'
     runs-on: ubuntu-latest
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
-    continue-on-error: true
 
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk maven python3-pip
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sudo sh -s -- -b /usr/local/bin
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-pip
+          pip3 install --upgrade pip
+          pip3 install semgrep
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
 
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Sanitize repo name
-        id: sanitize
-        run: |
-          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          echo "safe=$SAFE" >> "$GITHUB_OUTPUT"
-
-# ---------------- JAVA ----------------
-      - name: Resolve Maven dependencies (Java)
+      # ---------------- JAVA ----------------
+      - name: Resolve Java dependencies
         if: ${{ inputs.language == 'Java' }}
         run: |
           cd project
-          if [ -f pom.xml ]; then
-            mvn -B -q dependency:go-offline || true
-          fi
+          if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
 
-# ---------------- PYTHON ----------------
-      - name: Setup Python (Python)
-        if: ${{ inputs.language == 'Python' }}
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.12"
-
-      - name: Install Python dependencies
+      # ---------------- PYTHON ----------------
+      - name: Resolve Python dependencies
         if: ${{ inputs.language == 'Python' }}
         run: |
           cd project
-          python -m venv venv
-          source venv/bin/activate
-          pip install --upgrade pip
-
-          if [ -f requirements.txt ]; then
-              pip install -r requirements.txt || true
-          elif [ -f pyproject.toml ]; then
-              pip install poetry
-              poetry install --no-root || true
-          elif [ -f setup.py ]; then
-              pip install . || true
-          fi
-
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip setuptools wheel
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          if [ -f pyproject.toml ]; then pip install . || true; fi
           deactivate
 
-# ---------------- SCA ----------------
+      # ---------------- SCA - Trivy ----------------
       - name: Trivy Dependency SCA
         run: |
           mkdir -p results
           cd project
-
-          if [ "${{ inputs.language }}" = "Java" ]; then
-              if [ -f pom.xml ]; then
-                  trivy fs pom.xml \
-                    --scanners vuln \
-                    --format json \
-                    --ignore-unfixed \
-                    --output ../results/trivy_sca.json \
-                  || echo '{"Results":[]}' > ../results/trivy_sca.json
-              else
-                  echo '{"Results":[]}' > ../results/trivy_sca.json
-              fi
-
-          elif [ "${{ inputs.language }}" = "Python" ]; then
-              source venv/bin/activate
-              trivy fs . \
-                --scanners vuln \
-                --format json \
-                --ignore-unfixed \
-                --output ../results/trivy_sca.json \
-              || echo '{"Results":[]}' > ../results/trivy_sca.json
-              deactivate
+          if [ -f pom.xml ]; then
+            trivy fs pom.xml --scanners vuln --format json --ignore-unfixed --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+          elif [ -f requirements.txt ] || [ -f pyproject.toml ]; then
+            source .venv/bin/activate
+            trivy fs . --scanners vuln --format json --ignore-unfixed --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            deactivate
+          else
+            echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
 
-# ---------------- SBOM ----------------
-      - name: Generate SBOM
+      # ---------------- SEMGREP ----------------
+      - name: Semgrep
         run: |
           mkdir -p results
-          cd project
-          trivy fs . --format cyclonedx --output ../results/sbom.cdx.json || true
+          semgrep --config p/security-audit --config p/owasp-top-ten --config p/${{ inputs.language | toLowerCase }} --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-      - name: Trivy SBOM Scan
+      # ---------------- SBOM - DEPSCAN ----------------
+      - name: OWASP DepScan SBOM Scan
         run: |
-          trivy sbom results/sbom.cdx.json \
-            --format json \
-            --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
+          mkdir -p results
+          java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || echo '{"vulnerabilities":[]}' > results/dep-scan.json
+          DL=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          DM=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          DH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          DC=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          echo "$DL,$DM,$DH,$DC" > results/sbom_counts.txt
+          echo "generated" > results/sbom_status.txt
 
-# ---------------- SUMMARY PER REPO ----------------
-      - name: Build repo summary
+      - name: Set artifact name
+        id: set_artifact
         run: |
-          # -------- SCA (unchanged, occurrence-based) --------
-          SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
-          SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
-          SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
-          SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
-      
-          # -------- SBOM (UNIQUE CVEs) --------
-          SB_L=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="LOW") | .VulnerabilityID] | unique | length' results/trivy_sbom_vuln.json)
-          SB_M=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="MEDIUM") | .VulnerabilityID] | unique | length' results/trivy_sbom_vuln.json)
-          SB_H=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="HIGH") | .VulnerabilityID] | unique | length' results/trivy_sbom_vuln.json)
-          SB_C=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="CRITICAL") | .VulnerabilityID] | unique | length' results/trivy_sbom_vuln.json)
-      
-          TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
-      
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
-          echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
-      
+          ARTIFACT_NAME=$(echo "${{ matrix.repo }}" | sed 's#[/:]#_#g')_$(date +%s)
+          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload results
+        uses: actions/upload-artifact@v4
         with:
-          name: repo-summary-${{ steps.sanitize.outputs.safe }}
-          path: repo_summary.csv
+          name: ${{ steps.set_artifact.outputs.artifact_name }}
+          path: results
 
-# =========================================================
-# GLOBAL SUMMARY
-# =========================================================
+  # =========================================================
+  # GLOBAL SUMMARY
+  # =========================================================
   build_summary:
     needs: scan_repo
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: rows
+          path: all_results
 
-      - name: Build global summary.csv
+      - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
-          find rows -name repo_summary.csv -exec tail -n +2 {} \; >> summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
+          for d in all_results/*; do
+            R=$(basename "$d")
+            R=${R//_//}
+            SCAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+            SCAM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+            SCAH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+            SCAC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            if [ -f "$d/sbom_counts.txt" ]; then
+              IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
+            else
+              SB_L=0; SB_M=0; SB_H=0; SB_C=0
+            fi
+            STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
+            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
+            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
+          done
 
       - uses: actions/upload-artifact@v4
         with:
