@@ -1,4 +1,4 @@
-name: Security Scan – Trivy SCA + SBOM + DepScan
+name: Security Scan – Trivy SCA + SBOM + DepScan + License Scan
 
 on:
   workflow_dispatch:
@@ -27,36 +27,36 @@ jobs:
           TOP_N: ${{ inputs.top_n }}
         run: |
           python3 <<'EOF'
-          import os, requests, json, urllib.parse, time
-          headers = {"Authorization": f"token {os.environ['TOKEN']}", "Accept": "application/vnd.github+json"}
-          repos = []
-          page = 1
-          while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
-              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page=30&page={page}"
-              r = requests.get(url, headers=headers)
-              if r.status_code != 200:
-                  break
-              for repo in r.json().get("items", []):
-                  files = []
-                  if os.environ["LANG"].lower() == "java":
-                      files = ["pom.xml"]
-                  elif os.environ["LANG"].lower() == "python":
-                      files = ["requirements.txt", "pyproject.toml", "setup.py"]
-                  found = False
-                  for f in files:
-                      check_url = f"https://api.github.com/repos/{repo['full_name']}/contents/{f}"
-                      if requests.get(check_url, headers=headers).status_code == 200:
-                          found = True
-                          break
-                  if found:
-                      repos.append(repo["full_name"])
-                      if len(repos) >= int(os.environ["TOP_N"]):
-                          break
-              page += 1
-              time.sleep(1)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"repos={json.dumps(repos)}\n")
-          EOF
+import os, requests, json, urllib.parse, time
+headers = {"Authorization": f"token {os.environ['TOKEN']}", "Accept": "application/vnd.github+json"}
+repos = []
+page = 1
+while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
+    url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page=30&page={page}"
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        break
+    for repo in r.json().get("items", []):
+        files = []
+        if os.environ["LANG"].lower() == "java":
+            files = ["pom.xml"]
+        elif os.environ["LANG"].lower() == "python":
+            files = ["requirements.txt", "pyproject.toml", "setup.py"]
+        found = False
+        for f in files:
+            check_url = f"https://api.github.com/repos/{repo['full_name']}/contents/{f}"
+            if requests.get(check_url, headers=headers).status_code == 200:
+                found = True
+                break
+        if found:
+            repos.append(repo["full_name"])
+            if len(repos) >= int(os.environ["TOP_N"]):
+                break
+    page += 1
+    time.sleep(1)
+with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+    f.write(f"repos={json.dumps(repos)}\n")
+EOF
 
   scan_repo:
     needs: fetch_repos
@@ -72,7 +72,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-pip maven
+          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-pip
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
@@ -93,6 +93,7 @@ jobs:
           cd project
           if [ -f pom.xml ]; then
             mvn -q -DskipTests dependency:resolve || true
+          fi
 
       - name: Install Python dependencies (Python only)
         if: ${{ inputs.language == 'Python' }}
@@ -109,18 +110,7 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          if [ "${{ inputs.language }}" == "Java" ] && [ -f pom.xml ]; then
-            trivy fs . --format json --scanners vuln --ignore-unfixed --dependency-list pom.xml --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-          elif [ "${{ inputs.language }}" == "Python" ]; then
-            for f in requirements.txt pyproject.toml setup.py; do
-              if [ -f "$f" ]; then
-                trivy fs . --format json --scanners vuln --ignore-unfixed --dependency-list "$f" --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-                break
-              fi
-            done
-          else
-            echo '{"Results":[]}' > ../results/trivy_sca.json
-          fi
+          trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
 
       - name: Generate SBOM (CycloneDX)
         run: |
@@ -140,24 +130,29 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          trivy fs . --format json --scanners license --output ../results/trivy_licenses.json || echo '{"Results":[]}' > ../results/trivy_licenses.json
+          trivy fs . --format json --scanners license --output ../results/trivy_license.json || echo '{"Results":[]}' > ../results/trivy_license.json
 
       - name: Build repo summary row
         run: |
+          # SCA
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
           SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
+          # SBOM
           SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sbom_vuln.json)
           SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sbom_vuln.json)
           SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json)
           SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sbom_vuln.json)
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
-          # Write SCA + SBOM summary
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
-          # Write license summary
-          jq -r '.Results[]?.Licenses[]? | [.Name] | @csv' results/trivy_licenses.json > license_summary.csv
+
+      - name: Build license summary row
+        run: |
+          LIC=$(jq -r '[.Results[]?.Licenses[]? | .Name] | join(";")' results/trivy_license.json)
+          echo "repo,licenses" > license_summary.csv
+          echo "${{ steps.sanitize.outputs.safe }},\"$LIC\"" >> license_summary.csv
 
       - name: Upload repo summary
         uses: actions/upload-artifact@v4
@@ -182,18 +177,15 @@ jobs:
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           find rows -name repo_summary.csv -exec tail -n +2 {} \; >> summary.csv
+      - name: Build final license_summary.csv
+        run: |
+          echo "repo,licenses" > license_summary.csv
+          find rows -name license_summary.csv -exec tail -n +2 {} \; >> license_summary.csv
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
           path: summary.csv
-      - name: Build final license_summary.csv
-        run: |
-          echo "repo,license" > license_summary.csv
-          find rows -name license_summary.csv | while read f; do
-            REPO=$(basename "$f" .csv)
-            awk -v repo="$REPO" '{print repo "," $0}' "$f"
-          done >> license_summary.csv
       - uses: actions/upload-artifact@v4
         with:
-          name: licenses-summary
+          name: license-summary
           path: license_summary.csv
