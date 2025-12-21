@@ -105,7 +105,7 @@ jobs:
             snyk test --all-projects --detection-depth=20 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
           fi
           cd ..
-          # Fix: flatten all vulnerabilities into array recursively
+          # Flatten all vulnerabilities recursively and normalize severities
           jq '[.. | .vulnerabilities? // empty | .[] | .severity |= ascii_downcase]' results/sca_raw.json > results/sca_cleaned.json
 
       - name: Semgrep
