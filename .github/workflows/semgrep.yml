@@ -112,19 +112,20 @@ jobs:
           if [ "${{ inputs.language }}" == "Java" ]; then
             trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           elif [ "${{ inputs.language }}" == "Python" ]; then
-            FILE=""
-            for f in requirements.txt pyproject.toml setup.py; do
-              if [ -f "$f" ]; then
-                FILE=$f
-                break
-              fi
-            done
-            if [ -n "$FILE" ]; then
-              trivy fs "$FILE" --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-            else
-              echo '{"Results":[]}' > ../results/trivy_sca.json
+            TMP_ENV=$(mktemp -d)
+            python3 -m venv $TMP_ENV
+            source $TMP_ENV/bin/activate
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt
+            elif [ -f pyproject.toml ]; then
+              pip install poetry
+              poetry install --no-root
             fi
+            # Scan installed packages
+            trivy fs $TMP_ENV/lib/python*/site-packages --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            deactivate
           fi
+
 
 
       - name: Generate SBOM (CycloneDX)
