@@ -131,19 +131,12 @@ jobs:
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
           mkdir -p results
-          cd project
-          source .venv/bin/activate || true
-          trivy fs . --scanners vuln,license --format cyclonedx --output ../results/sbom_with_vulns.cdx.json || true
-          trivy fs . --scanners vuln,license --format json --output ../results/sbom_vuln.json || true
-          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + .Severity + (.VulnID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' ../results/sbom_vuln.json > ../results/trivy_tmp.json || echo '{}' > ../results/trivy_tmp.json
-          jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' ../results/sbom_vuln.json > ../results/licenses_tmp.json || echo '{}' > ../results/licenses_tmp.json
-          deactivate || true
-
-      # ---------------- SBOM - OWASP DepScan ----------------
+          trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
+          trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
+          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + .Severity + (.VulnID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
       - name: OWASP DepScan
-        run: |
-          java -jar dep-scan-cli.jar --sbom results/sbom_with_vulns.cdx.json --format json --output results/dep-scan.json || echo '{"vulnerabilities":[]}' > results/dep-scan.json
-
+        run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
       # ---------------- Merge SBOM counts ----------------
       - name: Merge SBOM counts
         run: |
