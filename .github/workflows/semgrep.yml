@@ -17,9 +17,9 @@ permissions:
   security-events: write
 
 jobs:
-  # =========================================================
-  # FETCH REPOSITORIES
-  # =========================================================
+# =========================================================
+# FETCH REPOSITORIES
+# =========================================================
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -66,9 +66,9 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
-  # =========================================================
-  # SCAN EACH REPOSITORY
-  # =========================================================
+# =========================================================
+# SCAN EACH REPOSITORY
+# =========================================================
   scan_repo:
     needs: fetch_repos
     if: needs.fetch_repos.outputs.repos != '[]'
@@ -93,14 +93,14 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      # ---------------- JAVA ----------------
+# ---------------- JAVA ----------------
       - name: Resolve Java dependencies
         if: ${{ inputs.language == 'Java' }}
         run: |
           cd project
           if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
 
-      # ---------------- PYTHON ----------------
+# ---------------- PYTHON ----------------
       - name: Resolve Python dependencies
         if: ${{ inputs.language == 'Python' }}
         run: |
@@ -112,7 +112,7 @@ jobs:
           if [ -f pyproject.toml ]; then pip install . || true; fi
           deactivate
 
-      # ---------------- SCA - Trivy ----------------
+# ---------------- SCA - Trivy ----------------
       - name: Trivy Dependency SCA
         run: |
           mkdir -p results
@@ -127,13 +127,13 @@ jobs:
             echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
 
-      # ---------------- SBOM + VULNS + LICENSES ----------------
+# ---------------- SBOM + VULNS + LICENSES ----------------
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
-          # Use the existing sbom_vuln.json
           trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
+
           jq '
             [
               .Results[].Vulnerabilities[]?
@@ -148,44 +148,50 @@ jobs:
             | map({(.[0].Severity): length})
             | add
           ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+
           jq '[.Results[].Licenses[]?]
               | group_by(.LicenseName)
               | map({(.[0].LicenseName): length})
               | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
-    
-          # ---------------- VEX FROM SBOM ----------------
-            # ---------------- VEX FROM SBOM ----------------
+# ---------------- VEX FROM SBOM (FIXED) ----------------
       - name: Generate VEX from SBOM
         run: |
           mkdir -p results
-          # Use the vulnerability-enriched SBOM for VEX generation
-          trivy sbom --vex --format cyclonedx ./project --output results/vex.cdx.json
+          trivy sbom \
+            results/sbom.cdx.json \
+            --vex \
+            --scanners vuln \
+            --format cyclonedx \
+            --output results/vex.cdx.json || true
 
       - name: Summarize VEX states
         run: |
-          # Generate JSON with CVE, severity, and state
-          jq '[.components[]?.vulnerabilities[]? | {cve: .id, severity: .severity, state: .analysis.state}]' results/vex.cdx.json > results/vex_summary.json || echo '[]' > results/vex_summary.json
-          # Generate CSV for easy inspection
-          jq -r '.[] | [.cve, .severity, .state] | @csv' results/vex_summary.json > results/vex_summary.csv || echo '' > results/vex_summary.csv
+          jq '[.components[]?.vulnerabilities[]?
+            | {cve: .id, severity: .severity, state: .analysis.state}
+          ]' results/vex.cdx.json > results/vex_summary.json || echo '[]' > results/vex_summary.json
 
-      
+          jq -r '.[] | [.cve, .severity, .state] | @csv' \
+            results/vex_summary.json > results/vex_summary.csv || true
 
-      # ---------------- OWASP DepScan ----------------
+# ---------------- OWASP DepScan ----------------
       - name: OWASP DepScan
-        run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
+        run: |
+          java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
 
-      # ---------------- Merge SBOM counts ----------------
+# ---------------- MERGE COUNTS ----------------
       - name: Merge SBOM counts
         run: |
           TL=$(jq '.LOW // 0' results/trivy_tmp.json)
           TM=$(jq '.MEDIUM // 0' results/trivy_tmp.json)
           TH=$(jq '.HIGH // 0' results/trivy_tmp.json)
           TC=$(jq '.CRITICAL // 0' results/trivy_tmp.json)
+
           DL=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/dep-scan.json 2>/dev/null || echo 0)
           DM=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/dep-scan.json 2>/dev/null || echo 0)
           DH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/dep-scan.json 2>/dev/null || echo 0)
           DC=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+
           echo "$((TL+DL)),$((TM+DM)),$((TH+DH)),$((TC+DC))" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
 
@@ -201,9 +207,9 @@ jobs:
           name: ${{ steps.set_artifact.outputs.artifact_name }}
           path: results
 
-  # =========================================================
-  # GLOBAL SUMMARY
-  # =========================================================
+# =========================================================
+# GLOBAL SUMMARY
+# =========================================================
   build_summary:
     needs: scan_repo
     runs-on: ubuntu-latest
@@ -216,29 +222,21 @@ jobs:
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,vex_affected,vex_not_affected,vex_fixed,vex_under_investigation,sbom_status,total" > summary.csv
           for d in all_results/*; do
-            R=$(basename "$d")
-            R=${R//_//}
-            
-            # Trivy SCA counts
+            R=$(basename "$d"); R=${R//_//}
             SCAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
             SCAM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
             SCAH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
             SCAC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            
-            # SBOM counts
+
             IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt" 2>/dev/null || echo "0,0,0,0"
-            
-            # VEX counts from JSON
+
             VA=$(jq '[.[] | select(.state=="AFFECTED")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
             VN=$(jq '[.[] | select(.state=="NOT_AFFECTED")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
             VF=$(jq '[.[] | select(.state=="FIXED")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
             VU=$(jq '[.[] | select(.state=="UNDER_INVESTIGATION")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            
+
             STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
-            
-            # Total vulnerabilities
             TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C+VA+VN+VF+VU))
-            
             echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$VA,$VN,$VF,$VU,$STATUS,$TOTAL" >> summary.csv
           done
 
@@ -251,10 +249,9 @@ jobs:
         run: |
           echo "repo,license_name,count" > summary_licenses.csv
           for d in all_results/*; do
-            R=$(basename "$d")
-            R=${R//_//}
+            R=$(basename "$d"); R=${R//_//}
             if [ -f "$d/licenses_tmp.json" ]; then
-              jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
+              jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" | \
               while IFS=',' read -r license count; do
                 license=$(echo $license | tr -d '"')
                 echo "$R,$license,$count" >> summary_licenses.csv
