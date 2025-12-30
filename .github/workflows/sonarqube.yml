@@ -297,40 +297,28 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,vex_affected,vex_not_affected,vex_fixed,vex_under_investigation,sbom_status,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,vex_affected,vex_not_affected,vex_fixed,vex_under_investigation,sbom_status,total" > summary.csv
           for d in all_results/*; do
             R=$(basename "$d")
             R=${R//_//}
-            SCAL=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "low")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SCAM=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "medium")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SCAH=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "high")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SCAC=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "critical")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SEM_FILE="$d/semgrep_cleaned.json"
-            if [ ! -f "$SEM_FILE" ]; then
-              echo '{"results":[]}' > "$SEM_FILE"
-            fi
-            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' "$SEM_FILE" 2>/dev/null || echo 0)
-            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' "$SEM_FILE" 2>/dev/null || echo 0)
-            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' "$SEM_FILE" 2>/dev/null || echo 0)
-            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' "$SEM_FILE" 2>/dev/null || echo 0)
+            SCAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+            SCAM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+            SCAH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+            SCAC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
             if [ -f "$d/sbom_counts.txt" ]; then
               IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
             else
               SB_L=0; SB_M=0; SB_H=0; SB_C=0
             fi
-            # VEX summary
-            if [ -f "$d/vex_summary.json" ]; then
-              VEX_A=$(jq '.AFFECTED // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
-              VEX_NA=$(jq '.NOT_AFFECTED // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
-              VEX_F=$(jq '.FIXED // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
-              VEX_UI=$(jq '.UNDER_INVESTIGATION // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            else
-              VEX_A=0; VEX_NA=0; VEX_F=0; VEX_UI=0
-            fi
+            VA=$(jq '.affected // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VN=$(jq '.not_affected // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VF=$(jq '.fixed // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VU=$(jq '.under_investigation // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
             STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
-            TOTAL=$((SCAL+SCAM+SCAH+SCAC + SEM_L+SEM_M+SEM_H+SEM_C + SB_L+SB_M+SB_H+SB_C + VEX_A+VEX_NA+VEX_F+VEX_UI))
-            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$VEX_A,$VEX_NA,$VEX_F,$VEX_UI,$STATUS,$TOTAL" >> summary.csv
+            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C+VA+VN+VF+VU))
+            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$VA,$VN,$VF,$VU,$STATUS,$TOTAL" >> summary.csv
           done
+
 
       - name: Build summary_licenses.csv
         run: |
