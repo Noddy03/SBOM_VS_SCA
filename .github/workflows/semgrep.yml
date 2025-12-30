@@ -152,11 +152,11 @@ jobs:
               | map({(.[0].LicenseName): length})
               | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
-      # ---------------- VEX - CycloneDX ----------------
-      - name: Trivy CycloneDX VEX
+      # ---------------- VEX FROM SBOM ----------------
+      - name: Generate VEX from SBOM
         run: |
           mkdir -p results
-          trivy fs project --format cyclonedx --vex --output results/vex.cdx.json || echo '{}' > results/vex.cdx.json
+          trivy sbom --vex --format cyclonedx --input results/sbom.cdx.json --output results/vex.cdx.json || echo '{}' > results/vex.cdx.json
 
       - name: Summarize VEX states
         run: |
