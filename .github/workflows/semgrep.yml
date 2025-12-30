@@ -154,11 +154,32 @@ jobs:
               | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
       # ---------------- VEX SUMMARY FROM SBOM_VULN.JSON ----------------
-      - name: Generate VEX summary
+          # ---------------- VEX FROM SBOM ----------------
+      - name: Generate VEX from SBOM
         run: |
           mkdir -p results
-          jq '[.Results[].Vulnerabilities[]? | {cve: .VulnerabilityID, severity: .Severity, state: .Status}]' results/sbom_vuln.json > results/vex_summary.json || echo '[]' > results/vex_summary.json
+          # Generate VEX using Trivy from SBOM
+          trivy sbom --vex --format cyclonedx --input results/sbom.cdx.json --output results/vex.cdx.json || echo '{}' > results/vex.cdx.json
+
+      - name: Summarize VEX states
+        run: |
+          # Extract CVE, severity, and state from SBOM vulnerabilities that exist in components
+          jq '[.components[]?.vulnerabilities[]? 
+                | {cve: .id, severity: .severity, state: .analysis.state}
+              ] 
+              | unique_by(.cve + .severity + .state)
+          ' results/vex.cdx.json > results/vex_summary.json || echo '[]' > results/vex_summary.json
+
+          # Count occurrences for each VEX state
+          VA=$(jq '[.[] | select(.state=="AFFECTED")] | length' results/vex_summary.json)
+          VN=$(jq '[.[] | select(.state=="NOT_AFFECTED")] | length' results/vex_summary.json)
+          VF=$(jq '[.[] | select(.state=="FIXED")] | length' results/vex_summary.json)
+          VU=$(jq '[.[] | select(.state=="UNDER_INVESTIGATION")] | length' results/vex_summary.json)
+
+          # Output CSV for inspection
           jq -r '.[] | [.cve, .severity, .state] | @csv' results/vex_summary.json > results/vex_summary.csv || echo '' > results/vex_summary.csv
+          
+          echo "VEX counts - AFFECTED: $VA, NOT_AFFECTED: $VN, FIXED: $VF, UNDER_INVESTIGATION: $VU"
 
       # ---------------- OWASP DepScan ----------------
       - name: OWASP DepScan
@@ -207,17 +228,27 @@ jobs:
           for d in all_results/*; do
             R=$(basename "$d")
             R=${R//_//}
+            
+            # Trivy SCA counts
             SCAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
             SCAM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
             SCAH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
             SCAC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+            
+            # SBOM counts
             IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt" 2>/dev/null || echo "0,0,0,0"
-            VA=$(jq '[.[] | select(.state=="fixed" or .state=="affected")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VN=$(jq '[.[] | select(.state=="not_affected")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VF=$(jq '[.[] | select(.state=="fixed")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VU=$(jq '[.[] | select(.state=="under_investigation")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            
+            # VEX counts from JSON
+            VA=$(jq '[.[] | select(.state=="AFFECTED")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VN=$(jq '[.[] | select(.state=="NOT_AFFECTED")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VF=$(jq '[.[] | select(.state=="FIXED")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VU=$(jq '[.[] | select(.state=="UNDER_INVESTIGATION")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            
             STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
+            
+            # Total vulnerabilities
             TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C+VA+VN+VF+VU))
+            
             echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$VA,$VN,$VF,$VU,$STATUS,$TOTAL" >> summary.csv
           done
 
