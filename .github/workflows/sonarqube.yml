@@ -273,6 +273,22 @@ jobs:
           ' results/vex.cdx.json > results/vex_enriched.cdx.json
           mv results/vex_enriched.cdx.json results/vex.cdx.json
 
+      ###########################################################################
+# Re-summarize VEX AFTER CodeQL enrichment (CRITICAL FIX)
+###########################################################################
+      - name: Rebuild VEX summary after CodeQL
+        run: |
+          jq '
+            [
+              .components[]?.vulnerabilities[]?.analysis.state
+              // "UNSPECIFIED"
+            ]
+            | group_by(.)
+            | map({(.[0]): length})
+            | add
+          ' results/vex.cdx.json > results/vex_summary.json
+
+
 
       - name: Merge SBOM counts
         run: |
@@ -313,10 +329,17 @@ jobs:
           for d in all_results/*; do
             R=$(basename "$d")
             R=${R//_//}
-            SCAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            SCAM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            SCAH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            SCAC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+            if [ -f "$d/sca_cleaned.json" ]; then
+              SCAL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' "$d/sca_cleaned.json")
+              SCAM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' "$d/sca_cleaned.json")
+              SCAH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' "$d/sca_cleaned.json")
+              SCAC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' "$d/sca_cleaned.json")
+            else
+              SCAL=0
+              SCAM=0
+              SCAH=0
+              SCAC=0
+            fi
             if [ -f "$d/sbom_counts.txt" ]; then
               IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
             else
@@ -327,9 +350,10 @@ jobs:
             VF=$(jq '.FIXED // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
             VU=$(jq '.UNDER_INVESTIGATION // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
             STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
-            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C+VA+VN+VF+VU))
+            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C+VA+VN+VF+VU))  
             echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$VA,$VN,$VF,$VU,$STATUS,$TOTAL" >> summary.csv
           done
+
 
       - name: Build summary_licenses.csv
         run: |
