@@ -154,12 +154,12 @@ jobs:
           set -e
           mkdir -p results
           IS_PYTHON=false
-          IS_JAVA=false
+          IS_JAVA=false    
           if [ -f project/pom.xml ]; then
               IS_JAVA=true
           elif [ -f project/requirements.txt ] || [ -f project/.venv/bin/activate ]; then
               IS_PYTHON=true
-          fi
+          fi      
           if [ "$IS_JAVA" = true ]; then
               echo "Detected Java project → generating SBOM"
               cd project
@@ -170,31 +170,34 @@ jobs:
               else
                   cd ..
                   [ -f results/bom.json ] && mv results/bom.json results/sbom.cdx.json
-              fi
+              fi      
           elif [ "$IS_PYTHON" = true ]; then
               echo "Detected Python project → generating SBOM"
-              pip install --user cyclonedx-bom
+              pip install --user cyclonedx-bom     
               if [ -f project/requirements.txt ]; then
-                  cyclonedx-py requirements -r project/requirements.txt -o results/sbom.cdx.json
+                  cyclonedx-py -o results/sbom.cdx.json --requirements project/requirements.txt
               elif [ -f project/.venv/bin/activate ]; then
-                  cyclonedx-py venv -p project/.venv -o results/sbom.cdx.json
-              fi
+                  cyclonedx-py -o results/sbom.cdx.json venv -p project/.venv
+              fi      
           else
               echo "Unknown project type → Trivy FS fallback"
               trivy fs project --format cyclonedx --output results/sbom.cdx.json || echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
-          fi
+          fi      
+          # Trivy Vulnerability Scan
           trivy sbom results/sbom.cdx.json --scanners vuln --format json --ignore-unfixed --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
           jq '[.Results[].Vulnerabilities[]?] 
               | unique_by(.PkgName + .Severity + (.VulnID // "")) 
               | group_by(.Severity) 
               | map({(.[0].Severity): length}) 
-              | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+              | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json      
+          # Trivy License Scan
           trivy sbom results/sbom.cdx.json --scanners license --format json --output results/trivy_license.json || echo '{}' > results/trivy_license.json
           jq '[.Results[].Licenses[]?] 
               | group_by(.) 
               | map({(.[0].License): length}) 
-              | add' results/trivy_license.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
-          osv-scanner --sbom results/sbom.cdx.json --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json    
+              | add' results/trivy_license.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json      
+          # OSV Scan
+          osv-scanner --sbom results/sbom.cdx.json --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json          
           echo "SBOM, Trivy, and OSV scans complete ✅"
 
             
