@@ -148,21 +148,43 @@ jobs:
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
           semgrep --config p/security-audit --config p/owasp-top-ten --config p/$LANG_LOWER --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-      - name: Trivy SBOM + vulnerabilities + licenses
+          # ---------------- SBOM + Trivy + OSV ----------------
+      - name: SBOM, Trivy vulnerabilities & licenses, OSV
         run: |
           mkdir -p results
-          trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
-          trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
-          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + .Severity + (.VulnID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
-          jq '
-            [.components[]? | select(.licenses != null) | .licenses[].license.id]
-            | group_by(.)
-            | map({(.[0]): length})
-            | add
-          ' results/sbom.cdx.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
-      - name: OSV-Scanner
-        run: |
+          # -------------------- Determine dependency path --------------------
+          DEP_PATH="project"
+          if [ -f project/pom.xml ]; then
+            # Java: resolve dependencies and copy to target/deps
+            cd project
+            mvn -B dependency:copy-dependencies -DoutputDirectory=target/deps || true
+            DEP_PATH="project/target/deps"
+            cd ..
+          elif [ -f project/.venv/bin/activate ]; then
+            # Python: use virtualenv site-packages
+            DEP_PATH="project/.venv"
+          fi
+
+          # -------------------- Generate SBOM --------------------
+          trivy fs "$DEP_PATH" --format cyclonedx --output results/sbom.cdx.json || true
+
+          # -------------------- Trivy vulnerabilities --------------------
+          trivy fs "$DEP_PATH" --scanners vuln --format json --ignore-unfixed --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
+          jq '[.Results[].Vulnerabilities[]?] 
+              | unique_by(.PkgName + .Severity + (.VulnID // "")) 
+              | group_by(.Severity) 
+              | map({(.[0].Severity): length}) 
+              | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+
+          # -------------------- Trivy licenses --------------------
+          trivy fs "$DEP_PATH" --scanners license --format json --output results/trivy_license.json || echo '{}' > results/trivy_license.json
+          jq '[.Results[].Licenses[]?] 
+              | group_by(.) 
+              | map({(.[0].License): length}) 
+              | add' results/trivy_license.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
+
+          # -------------------- OSV-Scanner --------------------
           osv-scanner --sbom results/sbom.cdx.json --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
 
             
