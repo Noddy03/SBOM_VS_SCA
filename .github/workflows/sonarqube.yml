@@ -162,8 +162,9 @@ jobs:
             DEP_PATH="project/target/deps"
             cd ..
           elif [ -f project/.venv/bin/activate ]; then
-            # Python: use virtualenv site-packages
-            DEP_PATH="project/.venv"
+            # Python: activate venv and get site-packages
+            source project/.venv/bin/activate
+            DEP_PATH="$(python -c 'import site; print(site.getsitepackages()[0])')"
           fi
 
           # -------------------- Generate SBOM --------------------
@@ -186,6 +187,11 @@ jobs:
 
           # -------------------- OSV-Scanner --------------------
           osv-scanner --sbom results/sbom.cdx.json --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
+
+          # -------------------- Deactivate Python venv if used --------------------
+          if [ -f project/.venv/bin/activate ]; then
+            deactivate
+          fi
 
             
       - name: Merge SBOM counts
