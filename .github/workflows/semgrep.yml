@@ -128,22 +128,44 @@ jobs:
             echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
 
-      # ---------------- SBOM - Trivy ----------------
+           # ---------------- SBOM - Trivy ----------------
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
           mkdir -p results
+
+          # Generate SBOM with CycloneDX (language-agnostic)
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
-          trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
+
+          # Trivy vulnerabilities
+          trivy fs project --scanners vuln --format json --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
           jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + .Severity + (.VulnID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
-          jq '
-            [.components[]? | select(.licenses != null) | .licenses[].license.id]
-            | group_by(.)
-            | map({(.[0]): length})
-            | add
-          ' results/sbom.cdx.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
+
+          # ---------------- Trivy License Scan ----------------
+          LICENSE_SCAN_PATH="project"  # default
+
+          # Python virtualenv
+          if [ -f project/.venv/bin/activate ]; then
+            source project/.venv/bin/activate
+            LICENSE_SCAN_PATH="project/.venv"
+          fi
+
+          # Java dependencies
+          if [ -f project/pom.xml ]; then
+            cd project
+            mkdir -p target/deps
+            mvn dependency:copy-dependencies -DoutputDirectory=target/deps || true
+            LICENSE_SCAN_PATH="target/deps"
+            cd ..
+          fi
+
+          trivy fs "$LICENSE_SCAN_PATH" --scanners license --format json --output results/trivy_license.json || echo '{}' > results/trivy_license.json
+
+          # Extract license counts
+          jq '[.Results[].Licenses[]?] | group_by(.) | map({(.[0].License): length}) | add' results/trivy_license.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
       - name: OSV-Scanner
         run: |
+          # Scan the SBOM with OSV
           osv-scanner --sbom results/sbom.cdx.json --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
 
 
