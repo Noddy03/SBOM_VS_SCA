@@ -152,8 +152,6 @@ jobs:
       - name: SBOM, Trivy vulnerabilities & licenses, OSV
         run: |
           mkdir -p results
-
-          # -------------------- Determine dependency path --------------------
           DEP_PATH="project"
           if [ -f project/pom.xml ]; then
             # Java: resolve dependencies and copy to target/deps
@@ -162,36 +160,27 @@ jobs:
             DEP_PATH="project/target/deps"
             cd ..
           elif [ -f project/.venv/bin/activate ]; then
-            # Python: activate venv and get site-packages
+            # Python: activate venv, scan project root
             source project/.venv/bin/activate
-            DEP_PATH="$(python -c 'import site; print(site.getsitepackages()[0])')"
+            DEP_PATH="project"
           fi
-
-          # -------------------- Generate SBOM --------------------
           trivy fs "$DEP_PATH" --format cyclonedx --output results/sbom.cdx.json || true
-
-          # -------------------- Trivy vulnerabilities --------------------
           trivy fs "$DEP_PATH" --scanners vuln --format json --ignore-unfixed --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
           jq '[.Results[].Vulnerabilities[]?] 
               | unique_by(.PkgName + .Severity + (.VulnID // "")) 
               | group_by(.Severity) 
               | map({(.[0].Severity): length}) 
               | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
-
-          # -------------------- Trivy licenses --------------------
           trivy fs "$DEP_PATH" --scanners license --format json --output results/trivy_license.json || echo '{}' > results/trivy_license.json
           jq '[.Results[].Licenses[]?] 
               | group_by(.) 
               | map({(.[0].License): length}) 
               | add' results/trivy_license.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
-
-          # -------------------- OSV-Scanner --------------------
           osv-scanner --sbom results/sbom.cdx.json --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
-
-          # -------------------- Deactivate Python venv if used --------------------
           if [ -f project/.venv/bin/activate ]; then
             deactivate
           fi
+
 
             
       - name: Merge SBOM counts
