@@ -156,33 +156,32 @@ jobs:
           IS_PYTHON=false
           IS_JAVA=false
           if [ -f project/pom.xml ]; then
-            IS_JAVA=true
-          elif [ -f project/.venv/bin/activate ] || [ -f project/requirements.txt ]; then
-            IS_PYTHON=true
+              IS_JAVA=true
+          elif [ -f project/requirements.txt ] || [ -f project/.venv/bin/activate ]; then
+              IS_PYTHON=true
           fi
           if [ "$IS_JAVA" = true ]; then
-            echo "Detected Java project → generating SBOM"
-            cd project
-            mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.5:makeAggregateBom -DoutputDirectory=../results
-            # Ensure output is always sbom.cdx.json
-            if [ -f ../results/bom.json ]; then
-              mv ../results/bom.json ../results/sbom.cdx.json
-            fi
-            cd ..
+              echo "Detected Java project → generating SBOM"
+              cd project
+              if ! mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.5:makeAggregateBom -DoutputDirectory=../results -DskipTests=true; then
+                  echo "Maven build failed, using Trivy FS fallback"
+                  cd ..
+                  trivy fs project --format cyclonedx --output results/sbom.cdx.json || echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
+              else
+                  cd ..
+                  [ -f results/bom.json ] && mv results/bom.json results/sbom.cdx.json
+              fi
           elif [ "$IS_PYTHON" = true ]; then
-            echo "Detected Python project → generating SBOM"
-            pip install cyclonedx-bom
-            cd project
-            # Export requirements if missing
-            if [ ! -f requirements.txt ] && [ -f .venv/bin/activate ]; then
-              source .venv/bin/activate
-              pip freeze > requirements.txt
-            fi
-            cyclonedx-py -r requirements.txt -o ../results/sbom.cdx.json
-            cd ..
+              echo "Detected Python project → generating SBOM"
+              pip install --user cyclonedx-bom
+              if [ -f project/requirements.txt ]; then
+                  cyclonedx-py requirements -r project/requirements.txt -o results/sbom.cdx.json
+              elif [ -f project/.venv/bin/activate ]; then
+                  cyclonedx-py venv -p project/.venv -o results/sbom.cdx.json
+              fi
           else
-            echo "Unknown project type → using Trivy FS scan as fallback"
-            trivy fs project --format cyclonedx --output results/sbom.cdx.json || echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
+              echo "Unknown project type → Trivy FS fallback"
+              trivy fs project --format cyclonedx --output results/sbom.cdx.json || echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
           fi
           trivy sbom results/sbom.cdx.json --scanners vuln --format json --ignore-unfixed --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
           jq '[.Results[].Vulnerabilities[]?] 
@@ -195,8 +194,8 @@ jobs:
               | group_by(.) 
               | map({(.[0].License): length}) 
               | add' results/trivy_license.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
-          osv-scanner --sbom results/sbom.cdx.json --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json     
-          echo "SBOM, vulnerability, license, and OSV scan completed ✅"
+          osv-scanner --sbom results/sbom.cdx.json --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json    
+          echo "SBOM, Trivy, and OSV scans complete ✅"
 
             
       - name: Merge SBOM counts
