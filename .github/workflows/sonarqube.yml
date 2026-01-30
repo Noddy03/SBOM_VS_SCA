@@ -149,42 +149,38 @@ jobs:
           semgrep --config p/security-audit --config p/owasp-top-ten --config p/$LANG_LOWER --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
        # ---------------- SBOM + Trivy + OSV ----------------
-      - name: Trivy SBOM + vulnerabilities + licenses + OSV
+      - name: Trivy vuln + license (real scan)
         run: |
           set -e
           mkdir -p results
-          echo "Generating SBOM with Trivy"
-          trivy fs project --format cyclonedx --output results/sbom.cdx.json      
-          echo "Trivy vulnerability scan"
-          trivy sbom results/sbom.cdx.json \
-            --scanners vuln \
+      
+          trivy fs project \
+            --scanners vuln,license \
             --format json \
-            --ignore-unfixed \
-            --output results/sbom_vuln.json \
-            || echo '{"Results":[]}' > results/sbom_vuln.json      
-          echo "Trivy license scan"
-          trivy sbom results/sbom.cdx.json \
-            --scanners license \
-            --format json \
-            --output results/trivy_license.json \
-            || echo '{"Results":[]}' > results/trivy_license.json      
-          echo "Aggregating vulnerabilities"
+            --output results/trivy.json || echo '{"Results":[]}' > results/trivy.json
+      
           jq '[.Results[].Vulnerabilities[]?]
               | unique_by(.PkgName + .Severity + (.VulnID // ""))
               | group_by(.Severity)
               | map({(.[0].Severity): length})
-              | add' results/sbom_vuln.json \
-              > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json      
-          echo "Aggregating licenses"
+              | add' results/trivy.json \
+              > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+      
           jq '[.Results[].Licenses[]?]
               | group_by(.License)
               | map({(.[0].License): length})
-              | add' results/trivy_license.json \
-              > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json      
-          echo "OSV scan from SBOM"
-          osv-scanner --sbom results/sbom.cdx.json --format json \
-            > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json      
-          echo "All scans complete ✅"
+              | add' results/trivy.json \
+              > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
+      
+      - name: OSV scan
+        run: |
+          osv-scanner -r project --format json \
+            > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
+      
+      - name: Generate SBOM (compliance)
+        run: |
+          trivy fs project --format cyclonedx --output results/sbom.cdx.json
+
 
 
             
