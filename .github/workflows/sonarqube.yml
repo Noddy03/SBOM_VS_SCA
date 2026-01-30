@@ -152,37 +152,38 @@ jobs:
       - name: Trivy vulnerabilities + licenses
         run: |
           set -e
-          mkdir -p results           
+          mkdir -p results     
           # Main Trivy output (MATCHES downstream expectations)
           trivy fs project \
             --scanners vuln,license \
             --format json \
-            --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json            
+            --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json      
           # Vulnerability summary
           jq '[.Results[].Vulnerabilities[]?]
               | unique_by(.PkgName + .Severity + (.VulnID // ""))
               | group_by(.Severity)
               | map({(.[0].Severity): length})
               | add' results/sbom_vuln.json \
-              > results/vuln_summary.json || echo '{}' > results/vuln_summary.json           
+              > results/vuln_summary.json || echo '{}' > results/vuln_summary.json     
           # License summary (MATCHES summary job)
           jq '[.Results[].Licenses[]?]
               | group_by(.License)
               | map({(.[0].License): length})
               | add' results/sbom_vuln.json \
               > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
-          
-       - name: Generate SBOM (compliance only)
-         run: |
-             mkdir -p results
-             trivy fs project --format cyclonedx --output results/sbom.cdx.json || \
-               echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
-          
-       - name: OSV scan
-         run: |
-             mkdir -p results
-             osv-scanner -r project --format json \
-              > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
+
+      - name: Generate SBOM (compliance only)
+        run: |
+          mkdir -p results
+          trivy fs project --format cyclonedx --output results/sbom.cdx.json || \
+            echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
+      
+      - name: OSV scan
+        run: |
+          mkdir -p results
+          osv-scanner -r project --format json \
+            > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
+
 
         
       - name: Merge SBOM counts
