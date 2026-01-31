@@ -117,53 +117,58 @@ jobs:
       - name: Trivy Dependency SCA
         run: |
           mkdir -p results
-          cd project
+          echo "ok" > results/sca_status.txt
+          cd project      
           if [ -f pom.xml ]; then
-            trivy fs pom.xml --scanners vuln --format json --ignore-unfixed --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            trivy fs pom.xml --scanners vuln --format json --ignore-unfixed \
+              --output ../results/trivy_sca.json \
+              || echo "failed" > ../results/sca_status.txt
           elif [ -f requirements.txt ] || [ -f pyproject.toml ]; then
             source .venv/bin/activate
-            trivy fs . --scanners vuln --format json --ignore-unfixed --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            trivy fs . --scanners vuln --format json --ignore-unfixed \
+              --output ../results/trivy_sca.json \
+              || echo "failed" > ../results/sca_status.txt
             deactivate
           else
             echo '{"Results":[]}' > ../results/trivy_sca.json
+            echo "no_deps" > ../results/sca_status.txt
           fi
 
-           # ---------------- SBOM - Trivy ----------------
      # ---------------- SBOM - Trivy ----------------
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
-          set -e
           mkdir -p results
-          cd project
-          # 1. Real Trivy scan (vuln + license)
+          echo "ok" > results/trivy_status.txt
+          cd project   
           trivy fs . \
             --scanners vuln,license \
             --format json \
-            --output ../results/sbom_vuln.json || \
-            echo '{"Results":[]}' > ../results/sbom_vuln.json
-          # 2. Vulnerability summary
+            --output ../results/sbom_vuln.json \
+            || echo "failed" > ../results/trivy_status.txt     
           jq '[.Results[].Vulnerabilities[]?]
               | unique_by(.PkgName + .Severity + (.VulnID // ""))
               | group_by(.Severity)
               | map({(.[0].Severity): length})
               | add' ../results/sbom_vuln.json \
-              > ../results/trivy_tmp.json || echo '{}' > ../results/trivy_tmp.json
-          # 3. License summary (FIXED FIELD)
+              > ../results/trivy_tmp.json || echo '{}' > ../results/trivy_tmp.json      
           jq '[.Results[].Licenses[]?]
               | group_by(.License)
               | map({(.[0].License): length})
               | add' ../results/sbom_vuln.json \
-              > ../results/licenses_tmp.json || echo '{}' > ../results/licenses_tmp.json
-          # 4. Actual SBOM for compliance
-          trivy fs . --format cyclonedx --output ../results/sbom.cdx.json || \
-            echo '{"bomFormat":"CycloneDX","components":[]}' > ../results/sbom.cdx.json
+              > ../results/licenses_tmp.json || echo '{}' > ../results/licenses_tmp.json      
+          trivy fs . --format cyclonedx \
+            --output ../results/sbom.cdx.json \
+            || echo "failed" > ../results/trivy_status.txt
 
      # ---------------- OSV-Scanner ----------------
       - name: OSV-Scanner
         run: |
           mkdir -p results
+          echo "ok" > results/osv_status.txt    
           osv-scanner -r project --format json \
-            > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
+            > results/osv-scan.json \
+            || echo "failed" > results/osv_status.txt
+
 
 
       # ---------------- Merge SBOM counts ----------------
@@ -208,23 +213,34 @@ jobs:
           path: all_results
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
-          for d in all_results/*; do
-            R=$(basename "$d")
-            R=${R//_//}
-            SCAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            SCAM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            SCAH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            SCAC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            if [ -f "$d/sbom_counts.txt" ]; then
-              IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
-            else
-              SB_L=0; SB_M=0; SB_H=0; SB_C=0
-            fi
-            STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
-            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C))
-            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
-          done
+          echo "repo,\
+          sca_low,sca_medium,sca_high,sca_critical,\
+          sbom_low,sbom_medium,sbom_high,sbom_critical,\
+          sca_status,trivy_status,osv_status,total" > summary.csv     
+              for d in all_results/*; do
+                R=$(basename "$d")
+                R=${R//_//}    
+                # -------- SCA (Trivy) --------
+                SCAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+                SCAM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+                SCAH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+                SCAC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)          
+                # -------- SBOM (Trivy + OSV merged) --------
+                if [ -f "$d/sbom_counts.txt" ]; then
+                  IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
+                else
+                  SB_L=0; SB_M=0; SB_H=0; SB_C=0
+                fi      
+                # -------- Status flags --------
+                SCA_STATUS=$(cat "$d/sca_status.txt" 2>/dev/null || echo "unknown")
+                TRIVY_STATUS=$(cat "$d/trivy_status.txt" 2>/dev/null || echo "unknown")
+                OSV_STATUS=$(cat "$d/osv_status.txt" 2>/dev/null || echo "unknown")      
+                TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C))       
+                echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,\
+          $SB_L,$SB_M,$SB_H,$SB_C,\
+          $SCA_STATUS,$TRIVY_STATUS,$OSV_STATUS,$TOTAL" >> summary.csv
+              done
+
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
