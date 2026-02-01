@@ -153,39 +153,19 @@ jobs:
 
 
      # ---------------- SBOM - Trivy ----------------
-      - name: Trivy SBOM + vulnerabilities + licenses (FINAL, ROBUST)
+      - name: Trivy SBOM + vulnerabilities + licenses (FINAL, CORRECT)
         run: |
           set -e
           mkdir -p results
-          echo "ok" > results/trivy_status.txt
-          USE_DEPS=false
-          # Java: try to materialize Maven dependencies
-          if [ -f project/pom.xml ]; then
-            cd project
-            if mvn -q -DskipTests dependency:copy-dependencies -DoutputDirectory=deps; then
-              USE_DEPS=true
-            fi
-            cd ..
-          fi
-          if [ "$USE_DEPS" = true ] && [ -d project/deps ]; then
-            echo "Using materialized Maven dependencies"
-            trivy fs project/deps \
-              --format cyclonedx \
-              --output results/sbom.cdx.json || true
-            trivy fs project/deps \
-              --scanners vuln,license \
-              --format json \
-              --output results/sbom_vuln.json || true
-          else
-            echo "Falling back to source tree scan"
-            trivy fs project \
-              --format cyclonedx \
-              --output results/sbom.cdx.json || true
-            trivy fs project \
-              --scanners vuln,license \
-              --format json \
-              --output results/sbom_vuln.json || true
-          fi
+          echo "ok" > results/trivy_status.txt     
+          trivy fs project \
+            --scanners vuln,license \
+            --format json \
+            --output results/sbom_vuln.json || true      
+          trivy fs project \
+            --format cyclonedx \
+            --output results/sbom.cdx.json || true
+
 
     # ---------------- Build Trivy severity summary ----------------
       - name: Build Trivy severity summary
@@ -224,14 +204,21 @@ jobs:
           TL=$(jq '.LOW // 0' results/trivy_tmp.json)
           TM=$(jq '.MEDIUM // 0' results/trivy_tmp.json)
           TH=$(jq '.HIGH // 0' results/trivy_tmp.json)
-          TC=$(jq '.CRITICAL // 0' results/trivy_tmp.json)
-          
+          TC=$(jq '.CRITICAL // 0' results/trivy_tmp.json)    
           # OSV Counts (Logic updated for OSV-Scanner JSON schema)
-          OL=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="LOW")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          OM=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="MEDIUM")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          OH=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="HIGH")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          OC=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="CRITICAL")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          
+          # OSV Counts (real severity from CVSS)
+          OL=$(jq '[.results[].packages[].vulnerabilities[]? 
+                    | (.severity[]?.score // "0") | tonumber 
+                    | select(. < 4.0)] | length' results/osv-scan.json)      
+          OM=$(jq '[.results[].packages[].vulnerabilities[]? 
+                    | (.severity[]?.score // "0") | tonumber 
+                    | select(. >= 4.0 and . < 7.0)] | length' results/osv-scan.json)       
+          OH=$(jq '[.results[].packages[].vulnerabilities[]? 
+                    | (.severity[]?.score // "0") | tonumber 
+                    | select(. >= 7.0 and . < 9.0)] | length' results/osv-scan.json)      
+          OC=$(jq '[.results[].packages[].vulnerabilities[]? 
+                    | (.severity[]?.score // "0") | tonumber 
+                    | select(. >= 9.0)] | length' results/osv-scan.json)
           echo "$((TL+OL)),$((TM+OM)),$((TH+OH)),$((TC+OC))" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
 
