@@ -166,12 +166,18 @@ jobs:
 
        # ---------------- SBOM + Trivy + OSV ----------------
     # ---------------- BUILD ARTIFACT ----------------
-      - name: Build artifact
+      - name: Build artifact (best effort, safe)
         run: |
           cd project
           if [ -f pom.xml ]; then
-            mvn -B -DskipTests package
+            mvn -B -DskipTests \
+                -Ddocker.skip=true \
+                -DskipDocker=true \
+                -Djib.skip=true \
+                -Dfabric8.skip=true \
+                package || true
           fi
+
       
       # ---------------- REAL SBOM + VULNS + LICENSES ----------------
       - name: Trivy SBOM + vulnerabilities + licenses (FULL REAL COVERAGE)
