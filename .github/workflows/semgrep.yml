@@ -189,18 +189,24 @@ jobs:
 
 
      # ---------------- OSV-Scanner ----------------
-      - name: OSV-Scanner (REAL)
+      - name: OSV-Scanner (REAL, crash-proof)
         run: |
           mkdir -p results
           echo "ok" > results/osv_status.txt    
           JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)   
           if [ -n "$JARS" ]; then
-            echo "Scanning artifacts"
-            osv-scanner --scan-file $JARS --format json > results/osv-scan.json || true
+            osv-scanner --scan-file $JARS --format json \
+              > results/osv-scan.json 2> results/osv-error.log || true
           else
-            echo "Scanning source tree"
-            osv-scanner -r project --format json > results/osv-scan.json || true
+            osv-scanner -r project --format json \
+              > results/osv-scan.json 2> results/osv-error.log || true
           fi
+          # HARD GUARD (the missing piece)
+          if ! jq empty results/osv-scan.json 2>/dev/null; then
+            echo '{"results":[]}' > results/osv-scan.json
+            echo "failed" > results/osv_status.txt
+          fi
+
 
       # ---------------- Merge SBOM counts ----------------
       - name: Merge SBOM counts
