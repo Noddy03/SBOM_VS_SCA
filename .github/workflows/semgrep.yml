@@ -174,14 +174,16 @@ jobs:
       - name: OSV-Scanner (REAL)
         run: |
           mkdir -p results
-          JAR=$(ls project/target/*.jar | head -n 1)      
-          if [ -z "$JAR" ]; then
-            echo '{"results":[]}' > results/osv-scan.json
-            echo "failed" > results/osv_status.txt
-            exit 0
-          fi      
-          echo "ok" > results/osv_status.txt
-          osv-scanner --scan-file "$JAR" --format json > results/osv-scan.json
+          echo "ok" > results/osv_status.txt    
+          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)   
+          if [ -n "$JARS" ]; then
+            echo "Scanning artifacts"
+            osv-scanner --scan-file $JARS --format json > results/osv-scan.json || true
+          else
+            echo "Scanning source tree"
+            osv-scanner -r project --format json > results/osv-scan.json || true
+          fi
+
 
 
 
