@@ -179,26 +179,19 @@ jobs:
 
       
       # ---------------- REAL SBOM + VULNS + LICENSES ----------------
-      - name: Trivy SBOM + vulnerabilities + licenses (Java correct)
+      - name: Trivy SBOM + vulnerabilities + licenses (correct)
         run: |
           set -e
           mkdir -p results
-          echo "ok" > results/trivy_status.txt    
-          # 1. Force Maven to materialize all deps into folder
-          if [ -f project/pom.xml ]; then
-            cd project
-            mvn -q -DskipTests dependency:copy-dependencies -DoutputDirectory=deps || true
-            cd ..
-          fi      
-          # 2. Generate SBOM from real dependency files
-          trivy fs project/deps \
-            --format cyclonedx \
-            --output results/sbom.cdx.json || true      
-          # 3. Vulns + licenses from same materialized deps
-          trivy fs project/deps \
+          echo "ok" > results/trivy_status.txt        
+          trivy fs project \
             --scanners vuln,license \
             --format json \
-            --output results/sbom_vuln.json || true
+            --output results/sbom_vuln.json || true     
+          trivy fs project \
+            --format cyclonedx \
+            --output results/sbom.cdx.json || true
+
 
 
       
@@ -231,16 +224,19 @@ jobs:
             jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_ids_crit.txt || touch trivy_ids_crit.txt
             # 2. Extract Unique IDs from OSV-Scanner by severity
             # Mapping OSV's nested structure to match the "Package:ID" format
-            jq -r '.results[].packages[]? | .package.name as $pkg | .vulnerabilities[]? | select(.database_specific.severity=="LOW") | $pkg + ":" + .id' results/osv-scan.json > osv_ids_low.txt || touch osv_ids_low.txt
-            jq -r '.results[].packages[]? | .package.name as $pkg | .vulnerabilities[]? | select(.database_specific.severity=="MEDIUM") | $pkg + ":" + .id' results/osv-scan.json > osv_ids_med.txt || touch osv_ids_med.txt
-            jq -r '.results[].packages[]? | .package.name as $pkg | .vulnerabilities[]? | select(.database_specific.severity=="HIGH") | $pkg + ":" + .id' results/osv-scan.json > osv_ids_high.txt || touch osv_ids_high.txt
-            jq -r '.results[].packages[]? | .package.name as $pkg | .vulnerabilities[]? | select(.database_specific.severity=="CRITICAL") | $pkg + ":" + .id' results/osv-scan.json > osv_ids_crit.txt || touch osv_ids_crit.txt 
+                 jq -r '
+             .results[].packages[]?
+             | .package.name as $pkg
+              | .vulnerabilities[]?
+              | $pkg + ":" + .id
+              ' results/osv-scan.json > osv_ids_all.txt || touch osv_ids_all.txt
             # 3. Merge, Sort, and De-duplicate
             # 'sort -u' combines the lists and removes any ID found by both tools
-            COMBINED_L=$(cat trivy_ids_low.txt osv_ids_low.txt | sort -u | wc -l)
-            COMBINED_M=$(cat trivy_ids_med.txt osv_ids_med.txt | sort -u | wc -l)
-            COMBINED_H=$(cat trivy_ids_high.txt osv_ids_high.txt | sort -u | wc -l)
-            COMBINED_C=$(cat trivy_ids_crit.txt osv_ids_crit.txt | sort -u | wc -l) 
+            COMBINED_L=$(cat trivy_ids_low.txt osv_ids_all.txt | sort -u | wc -l)
+            COMBINED_M=$(cat trivy_ids_med.txt osv_ids_all.txt | sort -u | wc -l)
+            COMBINED_H=$(cat trivy_ids_high.txt osv_ids_all.txt | sort -u | wc -l)
+            COMBINED_C=$(cat trivy_ids_crit.txt osv_ids_all.txt | sort -u | wc -l)
+
             # 4. Save final de-duplicated counts
             echo "$COMBINED_L,$COMBINED_M,$COMBINED_H,$COMBINED_C" > results/sbom_counts.txt
             echo "generated" > results/sbom_status.txt
