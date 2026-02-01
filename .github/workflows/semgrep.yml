@@ -76,8 +76,10 @@ jobs:
     continue-on-error: true
     strategy:
       fail-fast: false
+      max-parallel: 5
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
+    
     steps:
       - name: Install tools
         run: |
@@ -85,9 +87,18 @@ jobs:
           sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-pip golang
           pip3 install --upgrade pip
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          # Install OSV-Scanner
           go install github.com/google/osv-scanner/cmd/osv-scanner@v1.9.0
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Cache build tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.cache/trivy
+            ~/.cache/pip
+            ~/go/pkg
+          key: ${{ runner.os }}-security-scan-lite
 
       - name: Clone repo
         env:
