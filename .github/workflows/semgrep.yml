@@ -153,26 +153,40 @@ jobs:
 
 
      # ---------------- SBOM - Trivy ----------------
-      - name: Trivy SBOM + vulnerabilities + licenses (Java FIXED)
+      - name: Trivy SBOM + vulnerabilities + licenses (FINAL, ROBUST)
         run: |
           set -e
           mkdir -p results
           echo "ok" > results/trivy_status.txt
-          # Materialize Maven dependencies into real files
+          USE_DEPS=false
+          # Java: try to materialize Maven dependencies
           if [ -f project/pom.xml ]; then
             cd project
-            mvn -q -DskipTests dependency:copy-dependencies -DoutputDirectory=deps || true
+            if mvn -q -DskipTests dependency:copy-dependencies -DoutputDirectory=deps; then
+              USE_DEPS=true
+            fi
             cd ..
           fi
-          # Generate SBOM from real dependency artifacts
-          trivy fs project/deps \
-            --format cyclonedx \
-            --output results/sbom.cdx.json || true
-          # Vulnerabilities + licenses from same source
-          trivy fs project/deps \
-            --scanners vuln,license \
-            --format json \
-            --output results/sbom_vuln.json || true
+          if [ "$USE_DEPS" = true ] && [ -d project/deps ]; then
+            echo "Using materialized Maven dependencies"
+            trivy fs project/deps \
+              --format cyclonedx \
+              --output results/sbom.cdx.json || true
+            trivy fs project/deps \
+              --scanners vuln,license \
+              --format json \
+              --output results/sbom_vuln.json || true
+          else
+            echo "Falling back to source tree scan"
+            trivy fs project \
+              --format cyclonedx \
+              --output results/sbom.cdx.json || true
+            trivy fs project \
+              --scanners vuln,license \
+              --format json \
+              --output results/sbom_vuln.json || true
+          fi
+
 
 
      # ---------------- OSV-Scanner ----------------
