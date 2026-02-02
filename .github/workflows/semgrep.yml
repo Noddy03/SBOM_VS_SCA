@@ -44,7 +44,7 @@ jobs:
                   if os.environ["LANG"].lower() == "java":
                       files = ["pom.xml"]
                   elif os.environ["LANG"].lower() == "python":
-                      files = ["requirements.txt", "pyproject.toml", "setup.py", "poetry.lock", "pdm.lock"]
+                      files = ["requirements.txt", "pyproject.toml", "setup.py"]
                   found = False
                   for f in files:
                       if requests.get(
@@ -142,11 +142,16 @@ jobs:
           fi
 
 
-      - name: Resolve Maven dependencies (best effort)
+      - name: Build Java project (REAL dependency graph)
         run: |
           cd project
           if [ -f pom.xml ]; then
-            mvn -q -DskipTests dependency:go-offline || true
+            mvn -B -DskipTests \
+                -Ddocker.skip=true \
+                -DskipDocker=true \
+                -Djib.skip=true \
+                -Dfabric8.skip=true \
+                package || true
           fi
 
 
@@ -217,7 +222,7 @@ jobs:
           fi
 
       # ---------------- REAL OSV ----------------
-      - name: SBOM → Vulnerabilities (OSV) (FIXED)
+      - name: OSV scan (REAL for Java)
         run: |
           cd project
           echo "ok" > results/osv_status.txt       
@@ -226,10 +231,14 @@ jobs:
               --lockfile results/python_lock.txt \
               --format json > results/sbom_osv.json || true
           else
-            osv-scanner \
-              --sbom results/sbom.json \
-              --format json > results/sbom_osv.json || true
+            JARS=$(find . -type f -name "*.jar" | head -n 10)
+            if [ -n "$JARS" ]; then
+              osv-scanner --scan-file $JARS --format json > results/sbom_osv.json || true
+            else
+              osv-scanner -r . --format json > results/sbom_osv.json || true
+            fi
           fi
+
 
       
       # ---------------- REAL MERGE (FIXED) ----------------
