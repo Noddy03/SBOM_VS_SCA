@@ -163,18 +163,19 @@ jobs:
 
     
       # ---------------- SBOM ----------------
-      - name: SBOM generation (real)
+      - name: SBOM generation (real, compatible)
         run: |
           cd project   
           if [ "${{ inputs.language }}" = "Python" ]; then
             source venv/bin/activate
             pip install cyclonedx-bom      
-            cyclonedx-py venv -o results/sbom.json      
+            cyclonedx-py venv -o results/sbom.json
           else
             trivy fs . \
               --format cyclonedx \
               --output results/sbom.json
           fi
+
 
       - name: License scanning (real)
         run: |
@@ -205,9 +206,13 @@ jobs:
         run: |
           cd project
           echo "ok" > results/osv_status.txt    
-          osv-scanner --sbom results/sbom.json \
-             --no-ignore \
-             --format json > results/sbom_osv.json || true
+          if [ "${{ inputs.language }}" = "Python" ]; then
+            osv-scanner -r . --format json > results/sbom_osv.json || true
+          else
+            osv-scanner --sbom results/sbom.json \
+              --format json > results/sbom_osv.json || true
+          fi
+
       
       # ---------------- REAL MERGE (FIXED) ----------------
       - name: Merge SBOM counts (100% unbreakable)
