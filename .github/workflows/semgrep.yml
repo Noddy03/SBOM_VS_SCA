@@ -125,25 +125,19 @@ jobs:
           deactivate
 
       # ---------------- SCA - Trivy ----------------
-      - name: Trivy Dependency SCA
+      - name: Trivy Dependency SCA (REAL)
         run: |
           mkdir -p results
           echo "ok" > results/sca_status.txt
           cd project      
-          if [ -f pom.xml ]; then
-            trivy fs pom.xml --scanners vuln --format json --ignore-unfixed \
-              --output ../results/trivy_sca.json \
-              || echo "failed" > ../results/sca_status.txt
-          elif [ -f requirements.txt ] || [ -f pyproject.toml ]; then
-            source .venv/bin/activate
-            trivy fs . --scanners vuln --format json --ignore-unfixed \
-              --output ../results/trivy_sca.json \
-              || echo "failed" > ../results/sca_status.txt
-            deactivate
-          else
-            echo '{"Results":[]}' > ../results/trivy_sca.json
-            echo "no_deps" > ../results/sca_status.txt
-          fi
+          trivy fs . \
+            --scanners vuln \
+            --include-dev-deps \
+            --format json \
+            --ignore-unfixed \
+            --output ../results/trivy_sca.json \
+            || echo "failed" > ../results/sca_status.txt
+
 
       # ---------------- SCA - Unique CVEs ----------------
       - name: Build SCA unique CVE summary
