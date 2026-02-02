@@ -242,45 +242,42 @@ jobs:
 
       
       # ---------------- REAL MERGE (FIXED) ----------------
-      - name: Merge SBOM counts (100% unbreakable)
+      - name: Merge SBOM counts (REAL, normalized, comparable to SCA)
         run: |
           cd project
-          # Extract CVEs
-          jq -r '.Results[]?.Vulnerabilities[]?.VulnID' \
-            results/sca.json > results/trivy_cves.txt || true
-          jq -r '.results[].packages[].vulnerabilities[]?.id' \
-            results/sbom_osv.json > results/osv_cves.txt || true
-          # Merge
-          cat results/trivy_cves.txt results/osv_cves.txt \
-            | sort -u > results/merged_cves.txt
-          # If no CVEs at all
-          if [ ! -s results/merged_cves.txt ]; then
-            echo '{"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0}' > results/sbom_counts.json
-            echo "0,0,0,0" > results/sbom_counts.txt
-            exit 0
-          fi
-          # Load merged CVEs
-          jq -Rn '[inputs]' results/merged_cves.txt \
-            > results/merged_cves.json
-          # FINAL MERGE (no severity_map file used at all)
-          jq -s '
-            def sevmap:
-              (.Results // [])
-              | [.[]?.Vulnerabilities[]?]
-              | map({id:.VulnID, sev:(.Severity // "LOW")});
-            reduce .[0][] as $cve (
-              {"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0};
-              .[
-                (
-                  (sevmap | map(select(.id==$cve)) | .[0].sev)
-                  // "LOW"
-                )
-              ] += 1
-            )
-          ' results/merged_cves.json results/sca.json \
-            > results/sbom_counts.json
-          jq -r '[.LOW,.MEDIUM,.HIGH,.CRITICAL] | @csv' \
-            results/sbom_counts.json > results/sbom_counts.txt
+          mkdir -p results
+          # -------- Trivy by severity --------
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") | .VulnID' \
+            results/sca.json > results/trivy_low.txt || touch results/trivy_low.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") | .VulnID' \
+            results/sca.json > results/trivy_med.txt || touch results/trivy_med.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") | .VulnID' \
+            results/sca.json > results/trivy_high.txt || touch results/trivy_high.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | .VulnID' \
+            results/sca.json > results/trivy_crit.txt || touch results/trivy_crit.txt
+          # -------- OSV mapped via CVSS --------
+          jq -r '
+            .results[].packages[]?
+            | .vulnerabilities[]?
+            | (.severity[]?.score // 0 | tonumber) as $s
+            | if $s < 4 then "LOW"
+              elif $s < 7 then "MEDIUM"
+              elif $s < 9 then "HIGH"
+              else "CRITICAL" end
+            | . + "|" + .id
+          ' results/sbom_osv.json > results/osv_mapped.txt || touch results/osv_mapped.txt
+          grep '^LOW|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_low.txt || touch results/osv_low.txt
+          grep '^MEDIUM|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_med.txt || touch results/osv_med.txt
+          grep '^HIGH|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_high.txt || touch results/osv_high.txt
+          grep '^CRITICAL|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_crit.txt || touch results/osv_crit.txt
+          # -------- TRUE SBOM UNION --------
+          SB_L=$(cat results/trivy_low.txt results/osv_low.txt | sort -u | wc -l)
+          SB_M=$(cat results/trivy_med.txt results/osv_med.txt | sort -u | wc -l)
+          SB_H=$(cat results/trivy_high.txt results/osv_high.txt | sort -u | wc -l)
+          SB_C=$(cat results/trivy_crit.txt results/osv_crit.txt | sort -u | wc -l)
+          echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
+          echo "generated" > results/sbom_status.txt
+
 
 
 
