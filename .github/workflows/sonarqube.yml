@@ -120,48 +120,55 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install . || true; fi
 
-            - name: SCA - Snyk (deduplicated, real)
+      - name: SCA - Snyk (deduplicated, real)
         env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}   # optional, but strongly recommended
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
-          run: |
-            mkdir -p results
-            echo "ok" > results/snyk_status.txt
-            if [ -f project/pom.xml ]; then
-              mvn -f project/pom.xml dependency:resolve || echo "Maven resolution failed"
-            fi  
-            set +e
-            snyk test --all-projects --scan-unmanaged --detection-depth=50 --json --skip-unresolved \
-              > results/sca_raw.json
-            CODE=$?
-            set -e  
-            if [ "$CODE" -gt 1 ]; then
-              echo "failed" > results/snyk_status.txt
-            fi 
-            # Normalize (array vs object)
-            jq '
-              if type=="array"
-              then map(.vulnerabilities // []) | add
-              else .vulnerabilities // []
-              end
-            ' results/sca_raw.json > results/sca_flat.json || echo '[]' > results/sca_flat.json 
-            # TRUE deduplication (overwrite same filename used by summary)
-            jq '
-            {
-              vulnerabilities:
-                .
-                | map(select(((.ignored // .isIgnored // false) | not)))
-                | unique_by(.id)
-                | map({
-                    id,
-                    severity: (.severity // "unknown"),
-                    title,
-                    package: (.packageName // .name // "unknown"),
-                    version: (.version // "unknown"),
-                    url
-                  })
-            }
-            ' results/sca_flat.json > results/sca_cleaned.json
+        run: |
+          mkdir -p results
+          echo "ok" > results/snyk_status.txt
+          # Pre-resolve deps if Java
+          if [ -f project/pom.xml ]; then
+            mvn -f project/pom.xml dependency:resolve || true
+          fi    
+          set +e
+          snyk test \
+            --all-projects \
+            --scan-unmanaged \
+            --detection-depth=50 \
+            --json \
+            --skip-unresolved \
+            > results/sca_raw.json
+          CODE=$?
+          set -e     
+          if [ "$CODE" -gt 1 ]; then
+            echo "failed" > results/snyk_status.txt
+          fi      
+          # Normalize output (array vs object)
+          jq '
+            if type=="array"
+            then map(.vulnerabilities // []) | add
+            else .vulnerabilities // []
+            end
+          ' results/sca_raw.json > results/sca_flat.json || echo "[]" > results/sca_flat.json      
+          # TRUE deduplication (by vulnerability ID)
+          jq '
+          {
+            vulnerabilities:
+              .
+              | map(select(((.ignored // .isIgnored // false) | not)))
+              | unique_by(.id)
+              | map({
+                  id,
+                  severity: (.severity // "unknown"),
+                  title,
+                  package: (.packageName // .name // "unknown"),
+                  version: (.version // "unknown"),
+                  url
+                })
+          }
+          ' results/sca_flat.json > results/sca_cleaned.json
+  
 
 
 
