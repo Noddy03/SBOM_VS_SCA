@@ -17,9 +17,6 @@ permissions:
   security-events: write
 
 jobs:
-  # =========================================================
-  # FETCH REPOSITORIES
-  # =========================================================
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -66,9 +63,6 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
-  # =========================================================
-  # SCAN EACH REPOSITORY
-  # =========================================================
   scan_repo:
     needs: fetch_repos
     if: needs.fetch_repos.outputs.repos != '[]'
@@ -79,7 +73,7 @@ jobs:
       max-parallel: 5
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
-    
+
     steps:
       - name: Install tools
         run: |
@@ -105,73 +99,31 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-     
-      # ---------------- JAVA ----------------
-     
-      - name: Resolve Java dependencies
-        if: ${{ inputs.language == 'Java' }}
+      # ---------------- REAL DEP RESOLUTION ----------------
+      - name: Resolve dependencies (all ecosystems)
         run: |
           cd project
-          if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
-      
-      # ---------------- PYTHON ----------------
-      
-      - name: Resolve Python dependencies (fixed)
-        if: ${{ inputs.language == 'Python' }}
-        run: |
-          cd project
-          pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt --target deps || true
-          fi
-          if [ -f pyproject.toml ]; then
-            pip install . --target deps || true
-          fi
-      
-      # ---------------- BUILD ----------------
-      - name: Build artifact
-        if: ${{ inputs.language == 'Java' }}
-        run: |
-          cd project
-          mvn -B -DskipTests package || true
-      
-      # ---------------- SCA - Trivy (REAL) ----------------
-      
-      # Java SCA (scan real JARs)
-      - name: Trivy Dependency SCA (Java)
-        if: ${{ inputs.language == 'Java' }}
+          mvn -q -DskipTests package || \
+          gradle build || \
+          ./gradlew build || \
+          pip install -r requirements.txt || \
+          pip install . || true
+
+      # ---------------- REAL SCA ----------------
+      - name: Real Dependency SCA (all ecosystems)
         run: |
           mkdir -p results
-          echo "ok" > results/sca_status.txt 
-          trivy fs project/target \
+          echo "ok" > results/sca_status.txt
+          trivy fs project \
             --scanners vuln \
             --format json \
             --ignore-unfixed \
             --output results/trivy_sca.json \
             || echo "failed" > results/sca_status.txt
-      
-      # Python SCA (scan installed deps)
-      - name: Trivy Dependency SCA (Python)
-        if: ${{ inputs.language == 'Python' }}
-        run: |
-          mkdir -p results
-          echo "ok" > results/sca_status.txt      
-          trivy fs project/deps \
-            --scanners vuln \
-            --format json \
-            --ignore-unfixed \
-            --output results/trivy_sca.json \
-            || echo "failed" > results/sca_status.txt
-
-
 
       # ---------------- SCA - Unique CVEs ----------------
       - name: Build SCA unique CVE summary
         run: |
-          if ! jq empty results/trivy_sca.json 2>/dev/null; then
-            echo '{}' > results/sca_unique.json
-            exit 0
-          fi
           jq '
             [.Results[]?.Vulnerabilities[]?]
             | unique_by(.VulnID)
@@ -180,104 +132,56 @@ jobs:
             | add
           ' results/trivy_sca.json > results/sca_unique.json || echo '{}' > results/sca_unique.json
 
-      # ---------------- SBOM - Trivy ----------------
-      - name: Trivy SBOM + vulnerabilities + licenses (FINAL, CORRECT)
+      # ---------------- SBOM ----------------
+      - name: Trivy SBOM + vulnerabilities + licenses
         run: |
-          set -e
           mkdir -p results
-          echo "ok" > results/trivy_status.txt     
+          echo "ok" > results/trivy_status.txt
           trivy fs project \
             --scanners vuln,license \
             --format json \
-            --output results/sbom_vuln.json || true      
-          trivy fs project \
-            --format cyclonedx \
-            --output results/sbom.cdx.json || true
+            --output results/sbom_vuln.json || true
 
-      - name: Build license summary
-        run: |
-          if ! jq empty results/sbom_vuln.json 2>/dev/null; then
-            echo '{}' > results/licenses_tmp.json
-            exit 0
-          fi
-          jq '
-            [.Results[]?.Licenses[]?]
-            | map(.Name)
-            | group_by(.)
-            | map({(.[0]): length})
-            | add
-          ' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
-
-
-
-      # ---------------- Build Trivy severity summary ----------------
-      - name: Build Trivy severity summary
-        run: |
-          if ! jq empty results/sbom_vuln.json 2>/dev/null; then
-            echo '{}' > results/trivy_tmp.json
-            exit 0
-          fi
-          jq '
-            [.Results[]?.Vulnerabilities[]?]
-            | if length == 0 then
-                {}
-              else
-                unique_by(.PkgName + .Severity + (.VulnID // ""))
-                | group_by(.Severity)
-                | map({(.[0].Severity): length})
-                | add
-              end
-          ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
-
-      # ---------------- OSV-Scanner ----------------
-      - name: OSV-Scanner (bulletproof)
+      # ---------------- OSV ----------------
+      - name: OSV-Scanner
         run: |
           mkdir -p results
-          echo "ok" > results/osv_status.txt     
-          TMP=$(mktemp)      
-          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
-          if [ -n "$JARS" ]; then
-            osv-scanner --scan-file $JARS --format json > "$TMP" 2>/dev/null || true
-          else
-            osv-scanner -r project --format json > "$TMP" 2>/dev/null || true
-          fi      
-          # Accept only real JSON
-          if jq 'type=="object"' "$TMP" >/dev/null 2>&1; then
-            mv "$TMP" results/osv-scan.json
-          else
-            echo '{"results":[]}' > results/osv-scan.json
-            echo "failed" > results/osv_status.txt
-          fi
+          echo "ok" > results/osv_status.txt
+          osv-scanner -r project --format json > results/osv-scan.json || \
+          echo '{"results":[]}' > results/osv-scan.json
 
-      # ---------------- Merge SBOM counts ----------------
-      - name: Merge SBOM counts
+      # ---------------- REAL MERGE (FIXED) ----------------
+      - name: Merge SBOM counts (CVE-based, deduped)
         run: |
-          # HARD GUARD AGAIN (in case previous step was skipped)
-          if ! jq empty results/trivy_tmp.json 2>/dev/null; then
-            echo '{}' > results/trivy_tmp.json
-          fi   
-          # Trivy Counts (now impossible to crash)
-          TL=$(jq -r '(.LOW // 0) | tonumber' results/trivy_tmp.json)
-          TM=$(jq -r '(.MEDIUM // 0) | tonumber' results/trivy_tmp.json)
-          TH=$(jq -r '(.HIGH // 0) | tonumber' results/trivy_tmp.json)
-          TC=$(jq -r '(.CRITICAL // 0) | tonumber' results/trivy_tmp.json)    
-          # OSV Counts
-          OL=$(jq '[.results[].packages[].vulnerabilities[]? 
-                    | (.severity[]?.score // "0") | tonumber 
-                    | select(. < 4.0)] | length' results/osv-scan.json)      
-          OM=$(jq '[.results[].packages[].vulnerabilities[]? 
-                    | (.severity[]?.score // "0") | tonumber 
-                    | select(. >= 4.0 and . < 7.0)] | length' results/osv-scan.json)       
-          OH=$(jq '[.results[].packages[].vulnerabilities[]? 
-                    | (.severity[]?.score // "0") | tonumber 
-                    | select(. >= 7.0 and . < 9.0)] | length' results/osv-scan.json)      
-          OC=$(jq '[.results[].packages[].vulnerabilities[]? 
-                    | (.severity[]?.score // "0") | tonumber 
-                    | select(. >= 9.0)] | length' results/osv-scan.json)   
-          echo "$((TL+OL)),$((TM+OM)),$((TH+OH)),$((TC+OC))" > results/sbom_counts.txt
+          # Extract CVEs
+          jq -r '.Results[]?.Vulnerabilities[]?.VulnID' \
+            results/sbom_vuln.json > results/trivy_cves.txt
+          jq -r '.results[].packages[].vulnerabilities[]?.id' \
+            results/osv-scan.json > results/osv_cves.txt
+          # Merge + dedupe
+          cat results/trivy_cves.txt results/osv_cves.txt \
+            | sort -u > results/merged_cves.txt
+          # Build severity map from Trivy
+          jq '
+            [.Results[]?.Vulnerabilities[]?]
+            | map({id:.VulnID, sev:.Severity})
+          ' results/sbom_vuln.json > results/trivy_severity_map.json
+          # Convert merged CVEs to JSON
+          jq -Rn '[inputs]' results/merged_cves.txt > results/merged_cves.json
+          # Count by severity
+          jq '
+            reduce .[] as $id (
+              {"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0};
+              .[
+                ( (input | map(select(.id==$id))[0].sev) // "LOW" )
+              ] += 1
+            )
+          ' results/merged_cves.json results/trivy_severity_map.json \
+          > results/sbom_counts.json
+          # Export as CSV line
+          jq -r '[.LOW,.MEDIUM,.HIGH,.CRITICAL] | @csv' \
+            results/sbom_counts.json > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
-
-
 
 
       - name: Set artifact name
