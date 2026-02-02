@@ -188,53 +188,46 @@ jobs:
              --format json > results/sbom_osv.json || true
       
       # ---------------- REAL MERGE (FIXED) ----------------
-      - name: Merge SBOM counts (100% empty-safe)
+      - name: Merge SBOM counts (100% unbreakable)
         run: |
           cd project
-          # Extract CVEs (may be empty)
+          # Extract CVEs
           jq -r '.Results[]?.Vulnerabilities[]?.VulnID' \
             results/sca.json > results/trivy_cves.txt || true
           jq -r '.results[].packages[].vulnerabilities[]?.id' \
             results/sbom_osv.json > results/osv_cves.txt || true
-          # Merge unique CVEs
+          # Merge
           cat results/trivy_cves.txt results/osv_cves.txt \
             | sort -u > results/merged_cves.txt
-          # If no CVEs → short-circuit
+          # If no CVEs at all
           if [ ! -s results/merged_cves.txt ]; then
             echo '{"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0}' > results/sbom_counts.json
             echo "0,0,0,0" > results/sbom_counts.txt
             exit 0
           fi
-          # Build severity map (FORCE ARRAY)
-          jq '
-            (.Results // [])
-            | [.[]?.Vulnerabilities[]?]
-            | map({id:.VulnID, sev:(.Severity // "LOW")})
-          ' results/sca.json > results/severity_map.json
-          # Ensure severity_map is ALWAYS an array
-          jq 'if type=="array" then . else [] end' \
-            results/severity_map.json > results/severity_map.safe.json
-          mv results/severity_map.safe.json results/severity_map.json
           # Load merged CVEs
           jq -Rn '[inputs]' results/merged_cves.txt \
-            > results/merged_cves.json      
-          # Final safe merge
+            > results/merged_cves.json
+          # FINAL MERGE (no severity_map file used at all)
           jq -s '
+            def sevmap:
+              (.Results // [])
+              | [.[]?.Vulnerabilities[]?]
+              | map({id:.VulnID, sev:(.Severity // "LOW")});
             reduce .[0][] as $cve (
               {"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0};
               .[
                 (
-                  .[1]
-                  | map(select(.id==$cve))
-                  | .[0].sev
+                  (sevmap | map(select(.id==$cve)) | .[0].sev)
+                  // "LOW"
                 )
-                // "LOW"
               ] += 1
             )
-          ' results/merged_cves.json results/severity_map.json \
+          ' results/merged_cves.json results/sca.json \
             > results/sbom_counts.json
           jq -r '[.LOW,.MEDIUM,.HIGH,.CRITICAL] | @csv' \
             results/sbom_counts.json > results/sbom_counts.txt
+
 
 
 
