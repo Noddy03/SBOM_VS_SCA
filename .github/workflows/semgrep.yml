@@ -169,18 +169,12 @@ jobs:
           if [ "${{ inputs.language }}" = "Python" ]; then
             source venv/bin/activate
             pip install cyclonedx-bom      
-            cyclonedx-py venv \
-              -o results/sbom.json \
-              -f json      
+            cyclonedx-py venv -o results/sbom.json      
           else
             trivy fs . \
               --format cyclonedx \
               --output results/sbom.json
           fi
-
-
-
-
 
       - name: License scanning (real)
         run: |
