@@ -119,19 +119,13 @@ jobs:
       - name: SCA (direct vulnerability scanning)
         run: |
           cd project
-          echo "ok" > results/sca_status.txt   
-          if [ -f results/python_lock.txt ]; then
-            trivy sbom results/python_lock.txt \
-              --scanners vuln \
-              --format json \
-              --output results/sca_python.json
-          fi      
-          if [ -f results/maven_lock.txt ]; then
-            trivy sbom results/maven_lock.txt \
-              --scanners vuln \
-              --format json \
-              --output results/sca_maven.json
-          fi
+          echo "ok" > results/sca_status.txt
+          echo "ok" > results/trivy_status.txt   
+          trivy fs . \
+            --scanners vuln \
+            --format json \
+            --output results/sca.json
+
 
 
       # ---------------- SCA - Unique CVEs ----------------
@@ -143,41 +137,29 @@ jobs:
             | group_by(.Severity)
             | map({(.[0].Severity): length})
             | add
-          ' results/sca_*.json > results/sca_unique.json || echo '{}' > results/sca_unique.json
+          ' results/sca.json > results/sca_unique.json || echo '{}' > results/sca_unique.json
           echo "ok" > results/trivy_status.txt
 
 
 
+
       # ---------------- SBOM ----------------
-      - name: SBOM generation (no vulnerabilities)
+      - name: SBOM generation (ground truth)
         run: |
-          cd project     
-          if [ -f results/python_lock.txt ]; then
-            trivy sbom results/python_lock.txt \
-              --format cyclonedx \
-              --output results/sbom_python.json
-          fi     
-          if [ -f results/maven_lock.txt ]; then
-            trivy sbom results/maven_lock.txt \
-              --format cyclonedx \
-              --output results/sbom_maven.json
-          fi
+          cd project
+          trivy fs . \
+            --format cyclonedx \
+            --output results/sbom.json
+
 
       - name: License scanning (real)
         run: |
           cd project
-          if [ -f results/python_lock.txt ]; then
-            trivy sbom results/python_lock.txt \
-              --scanners license \
-              --format json \
-              --output results/licenses_python.json
-          fi
-          if [ -f results/maven_lock.txt ]; then
-            trivy sbom results/maven_lock.txt \
-              --scanners license \
-              --format json \
-              --output results/licenses_maven.json
-          fi
+          trivy sbom results/sbom.json \
+            --scanners license \
+            --format json \
+            --output results/licenses.json
+
 
       - name: Aggregate licenses
         run: |
@@ -186,23 +168,19 @@ jobs:
             | group_by(.)
             | map({(.[0]): length})
             | add
-          ' results/licenses_*.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
+          ' results/licenses.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
       
+            
 
 
       # ---------------- REAL OSV ----------------
       - name: SBOM → Vulnerabilities (OSV)
         run: |
           cd project
-          echo "ok" > results/sbom_status.txt   
-          if [ -f results/python_lock.txt ]; then
-            osv-scanner --lockfile results/python_lock.txt \
-              --format json > results/sbom_osv_python.json
-          fi    
-          if [ -f results/maven_lock.txt ]; then
-            osv-scanner --lockfile results/maven_lock.txt \
-              --format json > results/sbom_osv_maven.json
-          fi
+          echo "ok" > results/sbom_status.txt    
+          osv-scanner --sbom results/sbom.json \
+            --format json > results/sbom_osv.json
+      
 
 
 
@@ -210,23 +188,23 @@ jobs:
       - name: Merge SBOM counts (real)
         run: |
           jq -r '.Results[]?.Vulnerabilities[]?.VulnID' \
-            results/sca_*.json > results/trivy_cves.txt     
+            results/sca.json > results/trivy_cves.txt         
           jq -r '.results[].packages[].vulnerabilities[]?.id' \
-            results/sbom_osv_*.json > results/osv_cves.txt    
+            results/sbom_osv.json > results/osv_cves.txt          
           cat results/trivy_cves.txt results/osv_cves.txt \
-            | sort -u > results/merged_cves.txt    
+            | sort -u > results/merged_cves.txt          
           jq '
             [.Results[]?.Vulnerabilities[]?]
             | map({id:.VulnID, sev:.Severity})
-          ' results/sca_*.json > results/severity_map.json    
-          jq -Rn '[inputs]' results/merged_cves.txt > results/merged.json    
+          ' results/sca.json > results/severity_map.json          
+          jq -Rn '[inputs]' results/merged_cves.txt > results/merged.json         
           jq '
             reduce .[] as $id (
               {"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0};
               .[(input | map(select(.id==$id))[0].sev) // "LOW"] += 1
             )
           ' results/merged.json results/severity_map.json \
-          > results/sbom_counts.json    
+          > results/sbom_counts.json       
           jq -r '[.LOW,.MEDIUM,.HIGH,.CRITICAL] | @csv' \
             results/sbom_counts.json > results/sbom_counts.txt
 
