@@ -135,6 +135,7 @@ jobs:
       # ---------------- SCA - Unique CVEs ----------------
       - name: Build SCA unique CVE summary
         run: |
+          cd project
           jq '
             [.Results[]?.Vulnerabilities[]?]
             | unique_by(.VulnID)
@@ -142,7 +143,7 @@ jobs:
             | map({(.[0].Severity): length})
             | add
           ' results/sca.json > results/sca_unique.json || echo '{}' > results/sca_unique.json
-          echo "ok" > results/trivy_status.txt
+
 
 
 
@@ -181,7 +182,7 @@ jobs:
       - name: SBOM → Vulnerabilities (OSV)
         run: |
           cd project
-          echo "ok" > results/sbom_status.txt    
+          echo "ok" > results/osv_status.txt    
           osv-scanner --sbom results/sbom.json \
             --format json > results/sbom_osv.json
       
@@ -191,6 +192,7 @@ jobs:
       # ---------------- REAL MERGE (FIXED) ----------------
       - name: Merge SBOM counts (real)
         run: |
+          cd project
           jq -r '.Results[]?.Vulnerabilities[]?.VulnID' \
             results/sca.json > results/trivy_cves.txt         
           jq -r '.results[].packages[].vulnerabilities[]?.id' \
