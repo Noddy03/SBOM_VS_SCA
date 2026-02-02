@@ -100,19 +100,23 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       # ---------------- REAL DEP RESOLUTION ----------------
-      - name: Resolve dependencies (ground truth)
+     # ---------------- SAFE DEP RESOLUTION ----------------
+      - name: Collect declared dependencies (ground truth)
         run: |
           cd project
-          mkdir -p results     
-          # Python
-          if [ -f requirements.txt ] || [ -f pyproject.toml ]; then
-            pip install -r requirements.txt || pip install .
-            pip freeze > results/python_lock.txt
-          fi     
-          # Maven
+          mkdir -p results   
+          # Python (declared deps only)
+          if [ -f requirements.txt ]; then
+            cp requirements.txt results/python_deps.txt
+          fi      
+          if [ -f pyproject.toml ]; then
+            cp pyproject.toml results/pyproject.toml
+          fi      
+          # Java (declared deps only)
           if [ -f pom.xml ]; then
-            mvn -q dependency:list -DoutputFile=results/maven_lock.txt
+            cp pom.xml results/pom.xml
           fi
+
 
 
 
