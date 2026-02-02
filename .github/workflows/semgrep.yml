@@ -99,8 +99,8 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      # ---------------- REAL DEP RESOLUTION ----------------
-     # ---------------- SAFE DEP RESOLUTION ----------------
+     
+      # ---------------- SAFE DEP RESOLUTION ----------------
       - name: Collect declared dependencies (ground truth)
         run: |
           cd project
@@ -144,11 +144,6 @@ jobs:
             | map({(.[0].Severity): length})
             | add
           ' results/sca.json > results/sca_unique.json || echo '{}' > results/sca_unique.json
-
-
-
-
-
 
       # ---------------- SBOM ----------------
       - name: SBOM generation (ground truth)
@@ -201,28 +196,32 @@ jobs:
             results/sca.json > results/trivy_cves.txt || true
           jq -r '.results[].packages[].vulnerabilities[]?.id' \
             results/sbom_osv.json > results/osv_cves.txt || true
-          # Merge
+          # Merge unique CVEs
           cat results/trivy_cves.txt results/osv_cves.txt \
             | sort -u > results/merged_cves.txt
-          # If no CVEs at all → short-circuit
+          # If no CVEs → short-circuit
           if [ ! -s results/merged_cves.txt ]; then
             echo '{"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0}' > results/sbom_counts.json
             echo "0,0,0,0" > results/sbom_counts.txt
             exit 0
           fi
-          # Build severity map (may also be empty)
+          # Build severity map (array!)
           jq '
             [.Results[]?.Vulnerabilities[]?]
             | map({id:.VulnID, sev:(.Severity // "LOW")})
           ' results/sca.json > results/severity_map.json
-          # Now safe merge
+          # Build merged counts safely
           jq -Rn '[inputs]' results/merged_cves.txt \
             > results/merged_cves.json
           jq -s '
             reduce .[0][] as $cve (
               {"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0};
               .[
-                ( .[1][] | select(.id==$cve) | .sev )
+                (
+                  .[1]
+                  | map(select(.id==$cve))
+                  | .[0].sev
+                )
                 // "LOW"
               ] += 1
             )
@@ -230,6 +229,7 @@ jobs:
             > results/sbom_counts.json
           jq -r '[.LOW,.MEDIUM,.HIGH,.CRITICAL] | @csv' \
             results/sbom_counts.json > results/sbom_counts.txt
+
 
 
       - name: Set artifact name
@@ -264,10 +264,14 @@ jobs:
                 R=$(basename "$d")
                 R=${R//_//}    
                 # -------- SCA (Trivy) --------
-                SCAL=$(jq -r '(.LOW // 0)' "$d/sca_unique.json")
-                SCAM=$(jq -r '(.MEDIUM // 0)' "$d/sca_unique.json")
-                SCAH=$(jq -r '(.HIGH // 0)' "$d/sca_unique.json")
-                SCAC=$(jq -r '(.CRITICAL // 0)' "$d/sca_unique.json")
+                if [ -f "$d/sca_unique.json" ]; then
+                  SCAL=$(jq -r '(.LOW // 0)' "$d/sca_unique.json")
+                  SCAM=$(jq -r '(.MEDIUM // 0)' "$d/sca_unique.json")
+                  SCAH=$(jq -r '(.HIGH // 0)' "$d/sca_unique.json")
+                  SCAC=$(jq -r '(.CRITICAL // 0)' "$d/sca_unique.json")
+                else
+                  SCAL=0; SCAM=0; SCAH=0; SCAC=0
+                fi
                 # -------- SBOM (Trivy + OSV merged) --------
                 if [ -f "$d/sbom_counts.txt" ]; then
                   IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
