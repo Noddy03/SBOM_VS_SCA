@@ -168,12 +168,19 @@ jobs:
 
       - name: Aggregate licenses
         run: |
-          jq '
-            [.Results[]?.Licenses[]?.License?.Name]
-            | group_by(.)
-            | map({(.[0]): length})
-            | add
-          ' results/licenses.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
+          cd project
+          mkdir -p results
+          if [ -f results/licenses.json ]; then
+            jq '
+              [.Results[]?.Licenses[]?.License?.Name]
+              | group_by(.)
+              | map({(.[0]): length})
+              | add
+            ' results/licenses.json > results/licenses_tmp.json
+          else
+            echo '{}' > results/licenses_tmp.json
+          fi
+
       
             
 
