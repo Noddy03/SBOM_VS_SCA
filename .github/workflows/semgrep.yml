@@ -197,29 +197,29 @@ jobs:
 
 
       # ---------------- REAL MERGE (FIXED) ----------------
-      - name: Merge SBOM counts (real)
+      - name: Merge SBOM counts (fixed)
         run: |
-          cd project
+          cd project      
           jq -r '.Results[]?.Vulnerabilities[]?.VulnID' \
-            results/sca.json > results/trivy_cves.txt         
+            results/sca.json > results/trivy_cves.txt      
           jq -r '.results[].packages[].vulnerabilities[]?.id' \
-            results/sbom_osv.json > results/osv_cves.txt          
+            results/sbom_osv.json > results/osv_cves.txt
           cat results/trivy_cves.txt results/osv_cves.txt \
-            | sort -u > results/merged_cves.txt          
+            | sort -u > results/merged_cves.txt
           jq '
             [.Results[]?.Vulnerabilities[]?]
             | map({id:.VulnID, sev:.Severity})
-          ' results/sca.json > results/severity_map.json          
-          jq -Rn '[inputs]' results/merged_cves.txt > results/merged.json         
+          ' results/sca.json > results/severity_map.json
           jq '
-            reduce .[] as $id (
+            reduce .[] as $cve (
               {"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0};
-              .[(input | map(select(.id==$id))[0].sev) // "LOW"] += 1
+              .[ ( $sevmap[] | select(.id==$cve) | .sev ) // "LOW" ] += 1
             )
-          ' results/merged.json results/severity_map.json \
-          > results/sbom_counts.json       
+          ' --argfile sevmap results/severity_map.json \
+            results/merged_cves.txt > results/sbom_counts.json
           jq -r '[.LOW,.MEDIUM,.HIGH,.CRITICAL] | @csv' \
             results/sbom_counts.json > results/sbom_counts.txt
+
 
 
 
