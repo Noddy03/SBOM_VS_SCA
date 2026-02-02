@@ -120,6 +120,25 @@ jobs:
 
 
 
+     
+      - name: Resolve Python dependencies
+        run: |
+          cd project
+          python -m venv venv
+          source venv/bin/activate
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            pip install .
+          fi
+
+      - name: Resolve Maven dependencies
+        run: |
+          cd project
+          if [ -f pom.xml ]; then
+            mvn -q -DskipTests dependency:go-offline
+          fi
+
       - name: SCA (direct vulnerability scanning)
         run: |
           cd project
@@ -145,6 +164,7 @@ jobs:
             | add
           ' results/sca.json > results/sca_unique.json || echo '{}' > results/sca_unique.json
 
+    
       # ---------------- SBOM ----------------
       - name: SBOM generation (ground truth)
         run: |
