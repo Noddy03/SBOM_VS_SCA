@@ -71,8 +71,23 @@ jobs:
       - name: Clone repo
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project
 
+      - name: Create results dir
+        run: mkdir -p results
+
+      - name: Detect buildable repo
+        id: detect
+        run: |
+          cd project
+          if [ -f pom.xml ] || [ -f requirements.txt ] || [ -f pyproject.toml ]; then
+            echo "buildable=true" >> $GITHUB_OUTPUT
+          else
+            echo "buildable=false" >> $GITHUB_OUTPUT
+          fi
+
+
 # ---------------- Build deps ----------------
       - name: Resolve dependencies
+        if: steps.detect.outputs.buildable == 'true'
         run: |
           cd project
           if [ "${{ inputs.language }}" = "Java" ] && [ -f pom.xml ]; then
@@ -87,31 +102,52 @@ jobs:
             deactivate
           fi
 
-# ---------------- REAL SBOM ----------------
-      - name: Generate CycloneDX SBOM
-        run: |
-          mkdir -p results
-          cd project
-          trivy fs . --format cyclonedx --output ../results/sbom.cdx.json
 
-# ---------------- SCA FROM SBOM ----------------
+      # ---------------- REAL SBOM ----------------
+      - name: Generate SBOM (Python deps)
+        if: steps.detect.outputs.buildable == 'true' && inputs.language == 'Python'
+        run: |
+          cd project
+          mkdir -p ../results
+          source .venv/bin/activate
+          trivy fs .venv --format cyclonedx --output ../results/sbom.cdx.json
+          deactivate
+
+      
+      - name: Generate SBOM (Java deps)
+        if: steps.detect.outputs.buildable == 'true' && inputs.language == 'Java'
+        run: |
+          cd project
+          mkdir -p ../results
+          mvn -q -DskipTests package
+          trivy fs target --format cyclonedx --output ../results/sbom.cdx.json
+
+
+
+      # ---------------- SCA FROM SBOM ----------------
       - name: OSV scan SBOM
+        if: steps.detect.outputs.buildable == 'true'
         run: |
           osv-scanner --sbom results/sbom.cdx.json --format json > results/osv.json
 
+
 # ---------------- LICENSES ----------------
       - name: License scan
+        if: steps.detect.outputs.buildable == 'true'
         run: |
           trivy fs project --scanners license --format json > results/licenses.json
 
+
 # ---------------- SUMMARY ----------------
       - name: Build summary
+        if: steps.detect.outputs.buildable == 'true'
         run: |
           jq '[.results[].packages[].vulnerabilities[]?] 
               | unique_by(.id + .package.name) 
-              | group_by(.severity) 
-              | map({(.[0].severity): length}) 
+              | group_by(.database_specific.severity // "UNKNOWN") 
+              | map({(.[0].database_specific.severity // "UNKNOWN"): length}) 
               | add' results/osv.json > results/vuln_counts.json
+
 
       - name: Set artifact name
         id: name
@@ -119,9 +155,11 @@ jobs:
           echo "artifact=$(echo "${{ matrix.repo }}" | tr '/' '_')" >> $GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
+        if: steps.detect.outputs.buildable == 'true'
         with:
           name: ${{ steps.name.outputs.artifact }}
           path: results
+
 
 # =========================================================
 # GLOBAL SUMMARY
