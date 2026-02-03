@@ -93,70 +93,102 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       # ---------------- JAVA ----------------
-      - name: Resolve Java dependencies
+      - name: Build Java project
         if: ${{ inputs.language == 'Java' }}
         run: |
           cd project
-          if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
+          if [ -f pom.xml ]; then
+            mvn -B -DskipTests package || true
+          fi
+
       # ---------------- PYTHON ----------------
-      - name: Resolve Python dependencies
+      # ---------------- PYTHON ----------------
+      - name: Build Python environment
         if: ${{ inputs.language == 'Python' }}
         run: |
+          mkdir -p results
           cd project
           python3 -m venv .venv
           source .venv/bin/activate
-          pip install --upgrade pip setuptools wheel
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
-          if [ -f pyproject.toml ]; then pip install . || true; fi
+          pip install --upgrade pip setuptools wheel         
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            pip install .
+          fi            
+          pip freeze > ../results/requirements.lock.txt
           deactivate
+
+
       # ---------------- SCA - Trivy ----------------
       - name: Trivy Dependency SCA
         run: |
           mkdir -p results
-          cd project
-          if [ -f pom.xml ]; then
-            trivy fs pom.xml --scanners vuln --format json --ignore-unfixed --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-          elif [ -f requirements.txt ] || [ -f pyproject.toml ]; then
-            source .venv/bin/activate
-            trivy fs . --scanners vuln --format json --ignore-unfixed --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-            deactivate
+          if [ -d project/target ]; then
+            trivy fs project/target --scanners vuln --format json \
+              --ignore-unfixed --output results/trivy_sca.json || \
+              echo '{"Results":[]}' > results/trivy_sca.json
+          elif [ -d project/.venv ]; then
+            trivy fs project/.venv --scanners vuln --format json \
+              --ignore-unfixed --output results/trivy_sca.json || \
+              echo '{"Results":[]}' > results/trivy_sca.json
           else
-            echo '{"Results":[]}' > ../results/trivy_sca.json
+            echo '{"Results":[]}' > results/trivy_sca.json
           fi
+
+      # ---------------- SBOM - Trivy ----------------
       # ---------------- SBOM - Trivy ----------------
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
-          mkdir -p results
-          cd project      
-          # Create SBOM and capture vulnerabilities
-          trivy fs . --scanners vuln,license --format json --output ../results/sbom_vuln.json || true          
+          mkdir -p results    
+          if [ -d project/target ]; then
+            trivy fs project/target --scanners vuln,license \
+              --format json --output results/sbom_vuln.json || true
+          elif [ -d project/.venv ]; then
+            trivy fs project/.venv --scanners vuln,license \
+              --format json --output results/sbom_vuln.json || true
+          else
+            echo '{"Results":[]}' > results/sbom_vuln.json
+          fi      
           # Extract Trivy Counts
           jq '[.Results[].Vulnerabilities[]?] 
               | unique_by(.PkgName + .Severity + (.VulnID // "")) 
               | group_by(.Severity) 
               | map({(.[0].Severity): length}) 
               | add // {}' \
-              ../results/sbom_vuln.json > ../results/trivy_tmp.json || echo '{}' > ../results/trivy_tmp.json          
-          # Extract Licenses (FIXED)
+              results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json  
+          # Extract Licenses
           jq '[.Results[].Licenses[]? | select(.LicenseName != null)] 
               | group_by(.LicenseName) 
               | map({(.[0].LicenseName): length}) 
               | add // {}' \
-              ../results/sbom_vuln.json > ../results/licenses_tmp.json || echo '{}' > ../results/licenses_tmp.json
+              results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
+
+     
+      # ---------------- OSV-Scanner ----------------
       # ---------------- OSV-Scanner ----------------
       - name: OSV-Scanner (real dependency scan)
         run: |
-          mkdir -p results
-          echo "ok" > results/osv_status.txt          
-          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
-          if [ -n "$JARS" ]; then
-            echo "Scanning built artifacts"
-            osv-scanner scan $JARS --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
+          mkdir -p results     
+          if [ -d project/target ]; then
+            JARS=$(find project/target -maxdepth 1 -name "*.jar" 2>/dev/null | head -n 5)
+            if [ -n "$JARS" ]; then
+              echo "Scanning built artifacts"
+              osv-scanner scan $JARS --format json > results/osv-scan.json || \
+                echo '{"results":[]}' > results/osv-scan.json
+            else
+              echo '{"results":[]}' > results/osv-scan.json
+            fi      
+          elif [ -d project/.venv ]; then
+            echo "Scanning Python environment"
+            osv-scanner scan project/.venv --format json > results/osv-scan.json || \
+              echo '{"results":[]}' > results/osv-scan.json
           else
-            echo "Scanning source tree"
-            osv-scanner scan -r project --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
+            echo '{"results":[]}' > results/osv-scan.json
           fi
+
+
 
 
       # ---------------- DEDUPLICATED CVE LISTS BY SEVERITY ----------------
