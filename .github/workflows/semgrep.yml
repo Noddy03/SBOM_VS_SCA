@@ -1,4 +1,4 @@
-name: Security Scan – Trivy SBOM + OSV (Java & Python)
+name: Security Scan – Trivy SCA + Trivy SBOM + OSV (Java & Python)
 
 on:
   workflow_dispatch:
@@ -37,11 +37,11 @@ jobs:
             headers=h)
           repos=[x["full_name"] for x in r.json().get("items",[])]
           with open(os.environ["GITHUB_OUTPUT"],"a") as f:
-              f.write("repos="+json.dumps(repos))
+              f.write("repos="+json.dumps(repos)+"\n")
           EOF
 
 # =========================================================
-# SCAN
+# SCAN EACH REPO
 # =========================================================
   scan_repo:
     needs: fetch_repos
@@ -53,7 +53,6 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
 
     steps:
-      # ---------- Install tools (FIXED) ----------
       - name: Install tools
         run: |
           sudo apt-get update
@@ -66,18 +65,14 @@ jobs:
       - name: Clone
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project
 
-      # ---------- Java deps (never fail) ----------
+      # ---------- Java deps ----------
       - name: Java deps
         if: inputs.language == 'Java'
         continue-on-error: true
         run: |
           cd project
           if [ -f pom.xml ]; then
-            mvn -B -q \
-              -DskipTests \
-              -Ddocker.skip=true \
-              -Djib.skip=true \
-              dependency:resolve || true
+            mvn -B -q -DskipTests dependency:resolve || true
           fi
 
       # ---------- Python deps ----------
@@ -92,46 +87,42 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install . || true; fi
 
-      # ---------- Trivy SBOM (BULLETPROOF) ----------
-      - name: Trivy SBOM
+      # ---------- TRIVY SCA ----------
+      - name: Trivy SCA (real)
         run: |
           mkdir -p results
-
           trivy fs project \
-            --scanners vuln \
+            --scanners vuln,license \
             --format json \
-            --output results/sbom_vuln.json || \
-            echo '{"Results":[]}' > results/sbom_vuln.json
+            --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
+          echo ok > results/trivy_status.txt
 
+      # ---------- TRIVY SBOM ----------
+      - name: Trivy SBOM
+        run: |
           trivy fs project \
             --format cyclonedx \
             --output results/sbom.cdx.json || true
 
-          echo ok > results/trivy_status.txt
-
-      # ---------- OSV scan ----------
-      - name: OSV scan
+      # ---------- OSV FROM SBOM ----------
+      - name: OSV scan (from SBOM)
         run: |
           mkdir -p results
-          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 3)
-          if [ -n "$JARS" ]; then
-            osv-scanner --scan-file $JARS --format json > results/osv.json || true
-          else
-            osv-scanner -r project --format json > results/osv.json || true
-          fi
+          osv-scanner --sbom results/sbom.cdx.json \
+            --format json > results/osv.json || true
           echo ok > results/osv_status.txt
 
-      # ---------- Merge counts ----------
-      - name: Merge SBOM counts
+      # ---------- MERGE COUNTS ----------
+      - name: Merge counts
         run: |
           mkdir -p results
 
-          # Trivy severity counts
+          # Trivy
           jq -r '.Results[].Vulnerabilities[]?.Severity' \
-            results/sbom_vuln.json \
-            | sort | uniq -c > results/trivy_counts.txt || true
+            results/trivy_sca.json | sort | uniq -c \
+            > results/trivy_counts.txt || true
 
-          # OSV CVSS → severity
+          # OSV
           jq -r '
             .results[].packages[]?
             | .vulnerabilities[]?
@@ -140,20 +131,65 @@ jobs:
               elif . < 7 then "MEDIUM"
               elif . < 9 then "HIGH"
               else "CRITICAL" end
-          ' results/osv.json \
-            | sort | uniq -c > results/osv_counts.txt || true
+          ' results/osv.json | sort | uniq -c \
+            > results/osv_counts.txt || true
 
-          echo ok > results/sbom_status.txt
-
-      # ---------- Safe artifact name (FIXED) ----------
       - name: Set artifact name
         id: artifact
         run: |
           SAFE=$(echo "${{ matrix.repo }}" | tr '/:' '_')
           echo "name=$SAFE" >> $GITHUB_OUTPUT
 
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: results
+
+# =========================================================
+# GLOBAL SUMMARY
+# =========================================================
+  summarize:
+    needs: scan_repo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+
+      - name: Build summary.csv
+        run: |
+          echo "repo,trivy_low,trivy_medium,trivy_high,trivy_critical,osv_low,osv_medium,osv_high,osv_critical" > summary.csv
+          for d in all/*; do
+            R=$(basename "$d" | tr '_' '/')
+
+            TL=$(grep -c LOW "$d/trivy_counts.txt" 2>/dev/null || echo 0)
+            TM=$(grep -c MEDIUM "$d/trivy_counts.txt" 2>/dev/null || echo 0)
+            TH=$(grep -c HIGH "$d/trivy_counts.txt" 2>/dev/null || echo 0)
+            TC=$(grep -c CRITICAL "$d/trivy_counts.txt" 2>/dev/null || echo 0)
+
+            OL=$(grep -c LOW "$d/osv_counts.txt" 2>/dev/null || echo 0)
+            OM=$(grep -c MEDIUM "$d/osv_counts.txt" 2>/dev/null || echo 0)
+            OH=$(grep -c HIGH "$d/osv_counts.txt" 2>/dev/null || echo 0)
+            OC=$(grep -c CRITICAL "$d/osv_counts.txt" 2>/dev/null || echo 0)
+
+            echo "$R,$TL,$TM,$TH,$TC,$OL,$OM,$OH,$OC" >> summary.csv
+          done
+
+      - name: Build licenses.csv
+        run: |
+          echo "repo,license" > licenses.csv
+          for d in all/*; do
+            R=$(basename "$d" | tr '_' '/')
+            jq -r '.Results[].Licenses[]?.Name' "$d/trivy_sca.json" 2>/dev/null | \
+              sort -u | sed "s/^/$R,/" >> licenses.csv
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-summary
+          path: summary.csv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: licenses-summary
+          path: licenses.csv
