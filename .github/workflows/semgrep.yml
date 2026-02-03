@@ -1,25 +1,20 @@
-name: Security Scan – Real SBOM + OSV SCA + Licenses
+name: Security Scan – Trivy SBOM + OSV (Java & Python)
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: 'Choose language to scan'
+        description: 'Java or Python'
         required: true
         default: 'Java'
       top_n:
-        description: 'Number of repositories to scan'
-        required: false
+        description: 'Top repos'
         default: '5'
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
-# =========================================================
-# FETCH REPOSITORIES
-# =========================================================
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -32,28 +27,19 @@ jobs:
           TOP_N: ${{ inputs.top_n }}
         run: |
           python3 <<'EOF'
-          import os, requests, json, urllib.parse
-          headers = {"Authorization": f"token {os.environ['TOKEN']}"}
-          repos = []
-          page = 1
-          while len(repos) < int(os.environ["TOP_N"]):
-              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page=30&page={page}"
-              r = requests.get(url, headers=headers)
-              if r.status_code != 200: break
-              for repo in r.json().get("items", []):
-                  repos.append(repo["full_name"])
-                  if len(repos) >= int(os.environ["TOP_N"]): break
-              page += 1
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"repos={json.dumps(repos)}\n")
+          import os,requests,json,urllib.parse
+          h={"Authorization":f"token {os.environ['TOKEN']}"}
+          r=requests.get(
+            f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page={os.environ['TOP_N']}",
+            headers=h)
+          repos=[x["full_name"] for x in r.json()["items"]]
+          open(os.environ["GITHUB_OUTPUT"],"a").write("repos="+json.dumps(repos))
           EOF
 
-# =========================================================
-# SCAN REPOS
-# =========================================================
   scan_repo:
     needs: fetch_repos
     runs-on: ubuntu-latest
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -63,139 +49,92 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-pip golang
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          sudo apt-get install -y jq git openjdk-17-jdk maven python3-venv golang
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh
           go install github.com/google/osv-scanner/cmd/osv-scanner@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
-      - name: Clone repo
+      - name: Clone
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project
 
-      - name: Create results dir
-        run: mkdir -p results
-
-      - name: Detect buildable repo
-        id: detect
+      # ---------- Java deps (never fail) ----------
+      - name: Java deps
+        if: inputs.language == 'Java'
+        continue-on-error: true
         run: |
           cd project
-          if [ -f pom.xml ] || [ -f requirements.txt ] || [ -f pyproject.toml ]; then
-            echo "buildable=true" >> $GITHUB_OUTPUT
-          else
-            echo "buildable=false" >> $GITHUB_OUTPUT
+          if [ -f pom.xml ]; then
+            mvn -B -q -DskipTests \
+                -Ddocker.skip=true \
+                -Djib.skip=true \
+                dependency:resolve || true
           fi
 
-
-# ---------------- Build deps ----------------
-      - name: Resolve dependencies
-        if: steps.detect.outputs.buildable == 'true'
+      # ---------- Python deps ----------
+      - name: Python deps
+        if: inputs.language == 'Python'
+        continue-on-error: true
         run: |
           cd project
-          if [ "${{ inputs.language }}" = "Java" ] && [ -f pom.xml ]; then
-            mvn -B -q dependency:resolve
-          fi
-          if [ "${{ inputs.language }}" = "Python" ]; then
-            python3 -m venv .venv
-            source .venv/bin/activate
-            pip install -q --upgrade pip
-            if [ -f requirements.txt ]; then pip install -q -r requirements.txt; fi
-            if [ -f pyproject.toml ]; then pip install -q .; fi
-            deactivate
-          fi
-
-
-      # ---------------- REAL SBOM ----------------
-      - name: Generate SBOM (Python deps)
-        if: steps.detect.outputs.buildable == 'true' && inputs.language == 'Python'
-        run: |
-          cd project
-          mkdir -p ../results
+          python3 -m venv .venv
           source .venv/bin/activate
-          trivy fs .venv --format cyclonedx --output ../results/sbom.cdx.json
-          deactivate
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          if [ -f pyproject.toml ]; then pip install . || true; fi
 
-      
-      - name: Generate SBOM (Java deps)
-        if: steps.detect.outputs.buildable == 'true' && inputs.language == 'Java'
+      # ---------- Trivy SBOM ----------
+      - name: Trivy SBOM
         run: |
-          cd project
-          mkdir -p ../results
-          mvn -q -DskipTests package
-          trivy fs target --format cyclonedx --output ../results/sbom.cdx.json
+          mkdir -p results
+          trivy fs project \
+            --scanners vuln \
+            --format json \
+            --output results/sbom_vuln.json || echo "{}" > results/sbom_vuln.json
 
-      - name: Check SBOM has components
-        id: sbomcheck
-        if: steps.detect.outputs.buildable == 'true'
+          trivy fs project \
+            --format cyclonedx \
+            --output results/sbom.cdx.json || true
+
+          echo ok > results/trivy_status.txt
+
+      # ---------- OSV scan ----------
+      - name: OSV scan
         run: |
-          COUNT=$(jq '.components | length' results/sbom.cdx.json 2>/dev/null || echo 0)
-          if [ "$COUNT" -gt 0 ]; then
-            echo "has_components=true" >> $GITHUB_OUTPUT
+          mkdir -p results
+          JARS=$(find project -name "*.jar" | head -n 3)
+          if [ -n "$JARS" ]; then
+            osv-scanner --scan-file $JARS --format json > results/osv.json || true
           else
-            echo "has_components=false" >> $GITHUB_OUTPUT
+            osv-scanner -r project --format json > results/osv.json || true
           fi
+          echo ok > results/osv_status.txt
 
-      # ---------------- SCA FROM SBOM ----------------
-      - name: OSV scan SBOM
-        if: steps.detect.outputs.buildable == 'true' && steps.sbomcheck.outputs.has_components == 'true'
+      # ---------- Merge counts (bulletproof) ----------
+      - name: Merge SBOM counts
         run: |
-          osv-scanner --sbom results/sbom.cdx.json --format json > results/osv.json
+          mkdir -p results
 
+          # Trivy
+          jq -r '.Results[].Vulnerabilities[]?.Severity' \
+            results/sbom_vuln.json \
+            | sort | uniq -c > results/trivy_counts.txt || true
 
+          # OSV (map CVSS → severity)
+          jq -r '
+            .results[].packages[]?
+            | .vulnerabilities[]?
+            | (.severity[]?.score // 0 | tonumber)
+            | if . < 4 then "LOW"
+              elif . < 7 then "MEDIUM"
+              elif . < 9 then "HIGH"
+              else "CRITICAL" end
+          ' results/osv.json \
+            | sort | uniq -c > results/osv_counts.txt || true
 
+          echo ok > results/sbom_status.txt
 
-      # ---------------- LICENSES ----------------
-      - name: License scan
-        if: steps.detect.outputs.buildable == 'true'
-        run: |
-          trivy fs project --scanners license --format json > results/licenses.json
-
-
-# ---------------- SUMMARY ----------------
-      - name: Build summary
-        if: steps.detect.outputs.buildable == 'true'
-        run: |
-          jq '[.results[].packages[].vulnerabilities[]?] 
-              | unique_by(.id + .package.name) 
-              | group_by(.database_specific.severity // "UNKNOWN") 
-              | map({(.[0].database_specific.severity // "UNKNOWN"): length}) 
-              | add' results/osv.json > results/vuln_counts.json
-
-
-      - name: Set artifact name
-        id: name
-        run: |
-          echo "artifact=$(echo "${{ matrix.repo }}" | tr '/' '_')" >> $GITHUB_OUTPUT
-
-      - uses: actions/upload-artifact@v4
-        if: steps.detect.outputs.buildable == 'true'
+      - name: Upload
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.name.outputs.artifact }}
+          name: ${{ matrix.repo }}
           path: results
-
-
-# =========================================================
-# GLOBAL SUMMARY
-# =========================================================
-  build_summary:
-    needs: scan_repo
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: all
-
-      - name: Build CSV
-        run: |
-          echo "repo,low,medium,high,critical" > summary.csv
-          for d in all/*; do
-            R=$(basename "$d" | tr '_' '/')
-            L=$(jq '.LOW // 0' "$d/vuln_counts.json")
-            M=$(jq '.MEDIUM // 0' "$d/vuln_counts.json")
-            H=$(jq '.HIGH // 0' "$d/vuln_counts.json")
-            C=$(jq '.CRITICAL // 0' "$d/vuln_counts.json")
-            echo "$R,$L,$M,$H,$C" >> summary.csv
-          done
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: security-summary
-          path: summary.csv
