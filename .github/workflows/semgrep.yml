@@ -99,7 +99,25 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-     
+      - name: Force dependency resolution without building
+        run: |
+          cd project
+          if [ -f pom.xml ]; then
+            mvn -B -DskipTests dependency:go-offline || true
+          fi
+
+      - name: Init results dir
+        run: |
+          cd project
+          mkdir -p results
+
+      - name: Export Maven dependency graph (REAL)
+        run: |
+          cd project
+          mvn -B dependency:tree \
+            -DoutputType=json \
+            -DoutputFile=results/maven-deps.json || true
+ 
       # ---------------- SAFE DEP RESOLUTION ----------------
       - name: Collect declared dependencies (ground truth)
         run: |
@@ -142,25 +160,7 @@ jobs:
           fi
 
 
-      - name: Build Java project (REAL dependency graph)
-        run: |
-          cd project
-          if [ -f pom.xml ]; then
-            mvn -B -DskipTests \
-                -Ddocker.skip=true \
-                -DskipDocker=true \
-                -Djib.skip=true \
-                -Dfabric8.skip=true \
-                package || true
-          fi
-
-      - name: Export Maven dependency graph (REAL)
-        run: |
-          cd project
-          mvn -B dependency:tree \
-            -DoutputType=json \
-            -DoutputFile=results/maven-deps.json || true
-
+     
 
       - name: SCA (REAL Java + Python)
         run: |
@@ -173,7 +173,7 @@ jobs:
               --format json \
               --output results/sca.json
           else
-            trivy fs ~/.m2 \
+            trivy fs . ~/.m2 \
               --scanners vuln \
               --format json \
               --output results/sca.json
@@ -256,19 +256,20 @@ jobs:
 
       
       # ---------------- REAL MERGE (FIXED) ----------------
+ # ---------------- REAL MERGE (FIXED) ----------------
       - name: Merge SBOM counts (REAL, normalized, comparable to SCA)
         run: |
           cd project
-          mkdir -p results
+          mkdir -p results      
           # -------- Trivy by severity --------
           jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") | .VulnID' \
-            results/sca.json > results/trivy_low.txt || touch results/trivy_low.txt
+            results/sca.json > results/trivy_low.txt || touch results/trivy_low.txt    
           jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") | .VulnID' \
-            results/sca.json > results/trivy_med.txt || touch results/trivy_med.txt
+            results/sca.json > results/trivy_med.txt || touch results/trivy_med.txt      
           jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") | .VulnID' \
-            results/sca.json > results/trivy_high.txt || touch results/trivy_high.txt
+            results/sca.json > results/trivy_high.txt || touch results/trivy_high.txt      
           jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | .VulnID' \
-            results/sca.json > results/trivy_crit.txt || touch results/trivy_crit.txt
+            results/sca.json > results/trivy_crit.txt || touch results/trivy_crit.txt      
           # -------- OSV mapped via CVSS --------
           jq -r '
             .results[].packages[]?
@@ -279,21 +280,18 @@ jobs:
               elif $s < 9 then "HIGH"
               else "CRITICAL" end
             | . + "|" + .id
-          ' results/sbom_osv.json > results/osv_mapped.txt || touch results/osv_mapped.txt
+          ' results/sbom_osv.json > results/osv_mapped.txt || touch results/osv_mapped.txt      
           grep '^LOW|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_low.txt || touch results/osv_low.txt
           grep '^MEDIUM|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_med.txt || touch results/osv_med.txt
           grep '^HIGH|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_high.txt || touch results/osv_high.txt
-          grep '^CRITICAL|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_crit.txt || touch results/osv_crit.txt
+          grep '^CRITICAL|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_crit.txt || touch results/osv_crit.txt     
           # -------- TRUE SBOM UNION --------
           SB_L=$(cat results/trivy_low.txt results/osv_low.txt | sort -u | wc -l)
           SB_M=$(cat results/trivy_med.txt results/osv_med.txt | sort -u | wc -l)
           SB_H=$(cat results/trivy_high.txt results/osv_high.txt | sort -u | wc -l)
-          SB_C=$(cat results/trivy_crit.txt results/osv_crit.txt | sort -u | wc -l)
+          SB_C=$(cat results/trivy_crit.txt results/osv_crit.txt | sort -u | wc -l)  
           echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
-
-
-
 
 
 
