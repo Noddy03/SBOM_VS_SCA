@@ -218,10 +218,10 @@ jobs:
           JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
           if [ -n "$JARS" ]; then
             echo "Scanning artifacts"
-            osv-scanner --scan-file $JARS --format json > results/osv-scan.json || true
+            osv-scanner scan $JARS --format json > results/osv-scan.json || true
           else
             echo "Scanning source tree"
-            osv-scanner -r project --format json > results/osv-scan.json || true
+            osv-scanner scan -r project --format json > results/osv-scan.json || true
           fi
 
 
