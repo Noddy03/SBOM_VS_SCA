@@ -15,6 +15,9 @@ permissions:
   contents: read
 
 jobs:
+# =========================================================
+# FETCH REPOS
+# =========================================================
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -32,10 +35,14 @@ jobs:
           r=requests.get(
             f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page={os.environ['TOP_N']}",
             headers=h)
-          repos=[x["full_name"] for x in r.json()["items"]]
-          open(os.environ["GITHUB_OUTPUT"],"a").write("repos="+json.dumps(repos))
+          repos=[x["full_name"] for x in r.json().get("items",[])]
+          with open(os.environ["GITHUB_OUTPUT"],"a") as f:
+              f.write("repos="+json.dumps(repos))
           EOF
 
+# =========================================================
+# SCAN
+# =========================================================
   scan_repo:
     needs: fetch_repos
     runs-on: ubuntu-latest
@@ -46,11 +53,13 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
 
     steps:
+      # ---------- Install tools (FIXED) ----------
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git openjdk-17-jdk maven python3-venv golang
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
           go install github.com/google/osv-scanner/cmd/osv-scanner@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
@@ -64,10 +73,11 @@ jobs:
         run: |
           cd project
           if [ -f pom.xml ]; then
-            mvn -B -q -DskipTests \
-                -Ddocker.skip=true \
-                -Djib.skip=true \
-                dependency:resolve || true
+            mvn -B -q \
+              -DskipTests \
+              -Ddocker.skip=true \
+              -Djib.skip=true \
+              dependency:resolve || true
           fi
 
       # ---------- Python deps ----------
@@ -82,14 +92,16 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install . || true; fi
 
-      # ---------- Trivy SBOM ----------
+      # ---------- Trivy SBOM (BULLETPROOF) ----------
       - name: Trivy SBOM
         run: |
           mkdir -p results
+
           trivy fs project \
             --scanners vuln \
             --format json \
-            --output results/sbom_vuln.json || echo "{}" > results/sbom_vuln.json
+            --output results/sbom_vuln.json || \
+            echo '{"Results":[]}' > results/sbom_vuln.json
 
           trivy fs project \
             --format cyclonedx \
@@ -101,7 +113,7 @@ jobs:
       - name: OSV scan
         run: |
           mkdir -p results
-          JARS=$(find project -name "*.jar" | head -n 3)
+          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 3)
           if [ -n "$JARS" ]; then
             osv-scanner --scan-file $JARS --format json > results/osv.json || true
           else
@@ -109,17 +121,17 @@ jobs:
           fi
           echo ok > results/osv_status.txt
 
-      # ---------- Merge counts (bulletproof) ----------
+      # ---------- Merge counts ----------
       - name: Merge SBOM counts
         run: |
           mkdir -p results
 
-          # Trivy
+          # Trivy severity counts
           jq -r '.Results[].Vulnerabilities[]?.Severity' \
             results/sbom_vuln.json \
             | sort | uniq -c > results/trivy_counts.txt || true
 
-          # OSV (map CVSS → severity)
+          # OSV CVSS → severity
           jq -r '
             .results[].packages[]?
             | .vulnerabilities[]?
@@ -133,8 +145,15 @@ jobs:
 
           echo ok > results/sbom_status.txt
 
+      # ---------- Safe artifact name (FIXED) ----------
+      - name: Set artifact name
+        id: artifact
+        run: |
+          SAFE=$(echo "${{ matrix.repo }}" | tr '/:' '_')
+          echo "name=$SAFE" >> $GITHUB_OUTPUT
+
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo }}
+          name: ${{ steps.artifact.outputs.name }}
           path: results
