@@ -159,41 +159,36 @@ jobs:
           fi
 
 
-      # ---------------- GLOBAL CVE DEDUPLICATION ----------------
-      - name: Deduplicate CVEs across Trivy + OSV
+      # ---------------- DEDUPLICATED CVE LISTS BY SEVERITY ----------------
+      - name: Generate Severity-Based Deduplicated Files
         run: |
-          mkdir -p results      
-          # Trivy CVEs
-          jq -r '.Results[].Vulnerabilities[]?.VulnerabilityID' \
-            results/trivy_sca.json | sort -u > results/trivy_cves.txt      
-          # OSV CVEs (only real CVEs, skip GHSA-only IDs)
-          jq -r '.results[].packages[].vulnerabilities[]?.id 
-                 | select(startswith("CVE-"))' \
-            results/osv-scan.json | sort -u > results/osv_cves.txt      
-          # Global unique CVE set
-          cat results/trivy_cves.txt results/osv_cves.txt \
-            | sort -u > results/global_unique_cves.txt      
-          # Count
-          wc -l results/global_unique_cves.txt > results/global_unique_cve_count.txt
-
-
-      # ---------------- Merge SBOM counts ----------------
-      - name: Merge SBOM counts
-        run: |
-          # Trivy Counts
-          TL=$(jq '.LOW // 0' results/trivy_tmp.json)
-          TM=$(jq '.MEDIUM // 0' results/trivy_tmp.json)
-          TH=$(jq '.HIGH // 0' results/trivy_tmp.json)
-          TC=$(jq '.CRITICAL // 0' results/trivy_tmp.json)
-          
-          # OSV Counts (Logic updated for OSV-Scanner JSON schema)
-          OL=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="LOW")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          OM=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="MEDIUM")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          OH=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="HIGH")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          OC=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="CRITICAL")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          
-          echo "$((TL+OL)),$((TM+OM)),$((TH+OH)),$((TC+OC))" > results/sbom_counts.txt
+          mkdir -p results
+          # --- 1. SCA DEDUPLICATION (By Severity) ---
+          for sev in LOW MEDIUM HIGH CRITICAL; do
+            case $sev in "MEDIUM") s="med";; "CRITICAL") s="crit";; *) s=$(echo $sev | tr '[:upper:]' '[:lower:]');; esac         
+            jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID' \
+              results/trivy_sca.json | sort -u | grep -v '^$' > results/deduped_sca_$s.txt || touch results/deduped_sca_$s.txt
+          done
+          # --- 2. SBOM DEDUPLICATION (By Severity: Trivy SBOM + OSV) ---
+          for sev in LOW MEDIUM HIGH CRITICAL; do
+            case $sev in "MEDIUM") s="med";; "CRITICAL") s="crit";; *) s=$(echo $sev | tr '[:upper:]' '[:lower:]');; esac                       
+            # A. Get Trivy SBOM IDs
+            jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID' \
+              results/sbom_vuln.json > temp_ids.txt || touch temp_ids.txt        
+            # B. Get Robust OSV IDs
+            jq -r --arg sev "$sev" '
+              .results[].packages[].vulnerabilities[]? 
+              | select(
+                  .database_specific.severity == $sev or 
+                  ((.severity[]? | select(.type=="CVSS_V3" or .type=="CVSS_V2") | .score | tonumber) as $s | 
+                   if $s < 4 then "LOW" elif $s < 7 then "MEDIUM" elif $s < 9 then "HIGH" else "CRITICAL" end == $sev)
+                ) | .id' results/osv-scan.json >> temp_ids.txt || touch temp_ids.txt           
+            # C. Save unique IDs to the file the summary expects
+            sort -u temp_ids.txt | grep -v '^$' > results/vulnerability_sbom_$s.txt || touch results/vulnerability_sbom_$s.txt
+          done
           echo "generated" > results/sbom_status.txt
+          rm -f temp_ids.txt
+          
       - name: Set artifact name
         id: set_artifact
         run: |
@@ -217,19 +212,23 @@ jobs:
           path: all_results
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv       
           for d in all_results/*; do
             R=$(basename "$d")
             R=${R//_//}
-            SCAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            SCAM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            SCAH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            SCAC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            if [ -f "$d/sbom_counts.txt" ]; then
-              IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
-            else
-              SB_L=0; SB_M=0; SB_H=0; SB_C=0
-            fi
+            # -------- 1. DEDUPLICATED SCA COUNTS --------
+            # Assuming you created these in the previous job inside the results folder
+            SCAL=$(wc -l < "$d/deduped_sca_low.txt" 2>/dev/null || echo 0)
+            SCAM=$(wc -l < "$d/deduped_sca_med.txt" 2>/dev/null || echo 0)
+            SCAH=$(wc -l < "$d/deduped_sca_high.txt" 2>/dev/null || echo 0)
+            SCAC=$(wc -l < "$d/deduped_sca_crit.txt" 2>/dev/null || echo 0)
+            # -------- 2. DEDUPLICATED SBOM COUNTS --------
+            # These files contain (Trivy SBOM + OSV) sorted and unique
+            SB_L=$(wc -l < "$d/vulnerability_sbom_low.txt" 2>/dev/null || echo 0)
+            SB_M=$(wc -l < "$d/vulnerability_sbom_med.txt" 2>/dev/null || echo 0)
+            SB_H=$(wc -l < "$d/vulnerability_sbom_high.txt" 2>/dev/null || echo 0)
+            SB_C=$(wc -l < "$d/vulnerability_sbom_crit.txt" 2>/dev/null || echo 0)
+            # -------- 3. STATUS & TOTAL --------
             STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
             TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C))
             echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
