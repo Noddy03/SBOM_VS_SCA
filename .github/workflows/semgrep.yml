@@ -256,7 +256,6 @@ jobs:
 
       
       # ---------------- REAL MERGE (FIXED) ----------------
- # ---------------- REAL MERGE (FIXED) ----------------
       - name: Merge SBOM counts (REAL, normalized, comparable to SCA)
         run: |
           cd project
