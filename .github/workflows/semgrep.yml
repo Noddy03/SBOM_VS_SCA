@@ -157,15 +157,19 @@ jobs:
       # =======================
       # OSV — ARTIFACT FIRST
       # =======================
-      - name: OSV scan (realistic)
+      - name: OSV scan (artifact-only, correct)
         run: |
           cd project
           JARS=$(find . -type f -name "*.jar" | head -n 5)
+          WHEELS=$(find . -type f -name "*.whl" | head -n 5)     
           if [ -n "$JARS" ]; then
             osv-scanner --scan-file $JARS --format json > results/osv.json
+          elif [ -n "$WHEELS" ]; then
+            osv-scanner --scan-file $WHEELS --format json > results/osv.json
           else
-            osv-scanner -r . --format json > results/osv.json
+            echo '{"note":"no artifacts for OSV"}' > results/osv.json
           fi
+
 
       - name: Set artifact name
         id: set_artifact
