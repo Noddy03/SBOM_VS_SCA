@@ -1,4 +1,4 @@
-name: Security Scan – Independent SCA vs SBOM
+name: Security Scan – Trivy SCA & SBOM + OSV
 
 on:
   workflow_dispatch:
