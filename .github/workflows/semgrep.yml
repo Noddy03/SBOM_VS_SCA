@@ -108,10 +108,17 @@ jobs:
         else "CRITICAL" end
         ' results/osv.json | sort | uniq -c > results/osv_severity_counts.txt
 
+    - name: Set artifact name
+      id: set_artifact
+      run: |
+        SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '_')
+        echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
+    
     - uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.repo }}
+        name: ${{ steps.set_artifact.outputs.name }}
         path: results
+
 
 # =========================================================
 # SUMMARY
