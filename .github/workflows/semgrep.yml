@@ -1,4 +1,4 @@
-name: Security Scan – Trivy SCA & SBOM + OSV
+name: Security Scan – Trivy SCA & SBOM + OSV (Real World)
 
 on:
   workflow_dispatch:
@@ -78,8 +78,7 @@ jobs:
           cd project
           mkdir -p results
 
-      # Resolve once
-      - name: Resolve dependencies (industry realistic)
+      - name: Resolve dependencies
         run: |
           cd project
           if [ -f pom.xml ]; then
@@ -89,15 +88,23 @@ jobs:
             pip install -r requirements.txt || true
           fi
 
-
-      # =======================
-      # PIPELINE A — PURE SCA
-      # =======================
-  
-      - name: SCA (Direct Trivy)
+      - name: Build project (real artifact)
         run: |
           cd project
-          trivy fs . \
+          if [ -f pom.xml ]; then
+            mvn -B -DskipTests \
+                -Ddocker.skip=true \
+                -Djib.skip=true \
+                package || true
+          fi
+
+      # =======================
+      # PIPELINE A — REAL SCA
+      # =======================
+      - name: SCA (Trivy on artifacts + source)
+        run: |
+          cd project
+          trivy fs project/target project \
             --scanners vuln \
             --format json \
             --output results/sca_direct.json
@@ -114,18 +121,16 @@ jobs:
           ' results/sca_direct.json > results/sca_counts.json || echo '{}' > results/sca_counts.json
 
       # =======================
-      # PIPELINE B — PURE SBOM
+      # PIPELINE B — REAL SBOM
       # =======================
-
-
-      - name: Generate SBOM (correct)
+      - name: Generate SBOM (from artifacts + source)
         run: |
           cd project
-          trivy fs . \
+          trivy fs project/target project \
             --format cyclonedx \
             --output results/sbom.json
 
-      - name: SBOM-based vulnerability scan (correct)
+      - name: SBOM-based vulnerability scan
         run: |
           cd project
           trivy sbom results/sbom.json \
@@ -145,27 +150,29 @@ jobs:
           ' results/sca_from_sbom.json > results/sbom_counts.json || echo '{}' > results/sbom_counts.json
 
       # =======================
-      # OSV (independent 3rd view)
+      # OSV — ARTIFACT FIRST
       # =======================
-      - name: OSV from SBOM
+      - name: OSV scan (realistic)
         run: |
           cd project
-          osv-scanner \
-            --sbom results/sbom.json \
-            --format json > results/osv.json || true
+          JARS=$(find . -type f -name "*.jar" | head -n 5)
+          if [ -n "$JARS" ]; then
+            osv-scanner --scan-file $JARS --format json > results/osv.json
+          else
+            osv-scanner -r . --format json > results/osv.json
+          fi
 
       - name: Set artifact name
         id: set_artifact
         run: |
           SAFE_NAME=$(echo "${{ matrix.repo }}" | sed 's#[/:]#_#g')
           echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
-      
+
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.set_artifact.outputs.name }}
           path: project/results
-
 
   # =======================
   # GLOBAL COMPARISON
