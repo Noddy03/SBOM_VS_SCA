@@ -253,11 +253,16 @@ jobs:
           grep '^MEDIUM|' results/osv_mapped.txt | cut -d'|' -f2 > osv_med.txt || touch osv_med.txt
           grep '^HIGH|' results/osv_mapped.txt | cut -d'|' -f2 > osv_high.txt || touch osv_high.txt
           grep '^CRITICAL|' results/osv_mapped.txt | cut -d'|' -f2 > osv_crit.txt || touch osv_crit.txt
-          # -------- Merge correctly (same severity only) --------
-          SB_L=$(cat trivy_low.txt osv_low.txt | sort -u | wc -l)
-          SB_M=$(cat trivy_med.txt osv_med.txt | sort -u | wc -l)
-          SB_H=$(cat trivy_high.txt osv_high.txt | sort -u | wc -l)
-          SB_C=$(cat trivy_crit.txt osv_crit.txt | sort -u | wc -l)  
+          # -------- Merge correctly and SAVE to files in results folder --------
+          cat trivy_low.txt osv_low.txt | sort -u > results/vulnerability_sbom_low.txt
+          cat trivy_med.txt osv_med.txt | sort -u > results/vulnerability_sbom_med.txt
+          cat trivy_high.txt osv_high.txt | sort -u > results/vulnerability_sbom_high.txt
+          cat trivy_crit.txt osv_crit.txt | sort -u > results/vulnerability_sbom_crit.txt
+          # -------- Count the lines from the saved files --------
+          SB_L=$(wc -l < results/vulnerability_sbom_low.txt)
+          SB_M=$(wc -l < results/vulnerability_sbom_med.txt)
+          SB_H=$(wc -l < results/vulnerability_sbom_high.txt)
+          SB_C=$(wc -l < results/vulnerability_sbom_crit.txt)
           echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
 
