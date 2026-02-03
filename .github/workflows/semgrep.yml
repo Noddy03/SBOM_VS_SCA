@@ -1,4 +1,4 @@
-name: Security Scan – Trivy SCA + SBOM + OSV-Scanner + Licenses
+name: Security Scan – Independent SCA vs SBOM
 
 on:
   workflow_dispatch:
@@ -14,14 +14,12 @@ on:
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.fetch.outputs.repos }}
-    timeout-minutes: 10
     steps:
       - id: fetch
         env:
@@ -31,7 +29,7 @@ jobs:
         run: |
           python3 <<'EOF'
           import os, requests, json, urllib.parse, time
-          headers = {"Authorization": f"token {os.environ['TOKEN']}", "Accept": "application/vnd.github+json"}
+          headers = {"Authorization": f"token {os.environ['TOKEN']}"}
           repos = []
           page = 1
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
@@ -40,26 +38,15 @@ jobs:
               if r.status_code != 200:
                   break
               for repo in r.json().get("items", []):
-                  files = []
-                  if os.environ["LANG"].lower() == "java":
-                      files = ["pom.xml"]
-                  elif os.environ["LANG"].lower() == "python":
-                      files = ["requirements.txt", "pyproject.toml", "setup.py"]
-                  found = False
+                  files = ["pom.xml"] if os.environ["LANG"].lower()=="java" else ["requirements.txt","pyproject.toml"]
                   for f in files:
-                      if requests.get(
-                          f"https://api.github.com/repos/{repo['full_name']}/contents/{f}",
-                          headers=headers
-                      ).status_code == 200:
-                          found = True
+                      if requests.get(f"https://api.github.com/repos/{repo['full_name']}/contents/{f}",headers=headers).status_code==200:
+                          repos.append(repo["full_name"])
                           break
-                  if found:
-                      repos.append(repo["full_name"])
-                      if len(repos) >= int(os.environ["TOP_N"]):
-                          break
-              page += 1
-              time.sleep(1)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  if len(repos)>=int(os.environ["TOP_N"]):
+                      break
+              page+=1; time.sleep(1)
+          with open(os.environ["GITHUB_OUTPUT"],"a") as f:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
@@ -67,10 +54,8 @@ jobs:
     needs: fetch_repos
     if: needs.fetch_repos.outputs.repos != '[]'
     runs-on: ubuntu-latest
-    continue-on-error: true
     strategy:
       fail-fast: false
-      max-parallel: 5
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
 
@@ -78,244 +63,99 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-pip golang
-          pip3 install --upgrade pip
+          sudo apt-get install -y jq git curl openjdk-17-jdk maven python3-pip golang
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           go install github.com/google/osv-scanner/cmd/osv-scanner@v1.9.0
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-
-      - name: Cache build tools
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.m2
-            ~/.cache/trivy
-            ~/.cache/pip
-            ~/go/pkg
-          key: ${{ runner.os }}-security-scan-lite
 
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Force dependency resolution without building
-        run: |
-          cd project
-          if [ -f pom.xml ]; then
-            mvn -B -DskipTests dependency:go-offline || true
-          fi
-
-      - name: Init results dir
+      - name: Init results
         run: |
           cd project
           mkdir -p results
 
-      - name: Export Maven dependency graph (REAL)
+      # =======================
+      # PIPELINE A — PURE SCA
+      # =======================
+      - name: SCA (Direct Trivy)
         run: |
           cd project
-          mvn -B dependency:tree \
-            -DoutputType=json \
-            -DoutputFile=results/maven-deps.json || true
- 
-      # ---------------- SAFE DEP RESOLUTION ----------------
-      - name: Collect declared dependencies (ground truth)
-        run: |
-          cd project
-          mkdir -p results   
-          # Python (declared deps only)
-          if [ -f requirements.txt ]; then
-            cp requirements.txt results/python_deps.txt
-          fi      
-          if [ -f pyproject.toml ]; then
-            cp pyproject.toml results/pyproject.toml
-          fi      
-          # Java (declared deps only)
-          if [ -f pom.xml ]; then
-            cp pom.xml results/pom.xml
-          fi
-     
-      - name: Resolve Python dependencies (real & safe)
-        run: |
-          cd project
-          python -m venv venv
-          source venv/bin/activate
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt || true
-          elif [ -f pyproject.toml ]; then
-            pip install . || true
-          fi
-      - name: Freeze Python dependency graph (REAL FIX)
-        run: |
-          cd project
-          if [ -f poetry.lock ]; then
-            cp poetry.lock results/python_lock.txt
-          elif [ -f pdm.lock ]; then
-            cp pdm.lock results/python_lock.txt
-          elif [ -f requirements.txt ]; then
-            cp requirements.txt results/python_lock.txt
-          else
-            source venv/bin/activate
-            pip freeze > results/python_lock.txt
-          fi
+          trivy fs . \
+            --scanners vuln \
+            --format json \
+            --output results/sca_direct.json
 
-      # ---------------- SCA (REAL Java + Python) ----------------
-      - name: SCA (REAL Java + Python)
-        run: |
-          cd project
-          echo "ok" > results/sca_status.txt
-          echo "ok" > results/trivy_status.txt     
-          if [ "${{ inputs.language }}" = "Python" ]; then
-            trivy fs . \
-              --scanners vuln \
-              --format json \
-              --output results/sca.json
-          else
-            # Java project scan
-            trivy fs . \
-              --scanners vuln \
-              --format json \
-              --output results/sca_proj.json      
-            # Maven cache scan
-            trivy fs ~/.m2 \
-              --scanners vuln \
-              --format json \
-              --output results/sca_m2.json     
-            # Merge both
-            jq -s '
-              {
-                Results: (.[0].Results + .[1].Results)
-              }
-            ' results/sca_proj.json results/sca_m2.json > results/sca.json
-          fi
-
-      # ---------------- SCA - Unique CVEs ----------------
-      - name: Build SCA unique CVE summary
+      - name: SCA summary
         run: |
           cd project
           jq '
             [.Results[]?.Vulnerabilities[]?]
             | unique_by(.VulnID)
-            | sort_by(.Severity)
             | group_by(.Severity)
             | map({(.[0].Severity): length})
             | add
-          ' results/sca.json > results/sca_unique.json || echo '{}' > results/sca_unique.json
+          ' results/sca_direct.json > results/sca_counts.json || echo '{}' > results/sca_counts.json
 
-    
-      # ---------------- SBOM ----------------
-      - name: SBOM generation (REAL)
+      # =======================
+      # PIPELINE B — PURE SBOM
+      # =======================
+      - name: Generate SBOM
         run: |
           cd project
-          if [ "${{ inputs.language }}" = "Python" ]; then
-            source venv/bin/activate
-            pip install cyclonedx-bom
-            cyclonedx-py environment -o results/sbom.json
-          else
-            trivy fs ~/.m2 \
-              --format cyclonedx \
-              --output results/sbom.json
-          fi
+          trivy sbom \
+            --format cyclonedx \
+            --output results/sbom.json \
+            .
 
-
-
-
-      - name: License scanning (real)
+      - name: SBOM-based vulnerability scan
         run: |
           cd project
           trivy sbom results/sbom.json \
-            --scanners license \
+            --scanners vuln \
             --format json \
-            --output results/licenses.json
+            --output results/sca_from_sbom.json
 
-
-      - name: Aggregate licenses (null-safe)
+      - name: SBOM summary
         run: |
           cd project
-          if [ -f results/licenses.json ]; then
-            jq '
-              [.Results[]?.Licenses[]?.License?.Name
-               | select(. != null)]
-              | group_by(.)
-              | map({(.[0]): length})
-              | add
-            ' results/licenses.json > results/licenses_tmp.json
-          else
-            echo '{}' > results/licenses_tmp.json
-          fi
+          jq '
+            [.Results[]?.Vulnerabilities[]?]
+            | unique_by(.VulnID)
+            | group_by(.Severity)
+            | map({(.[0].Severity): length})
+            | add
+          ' results/sca_from_sbom.json > results/sbom_counts.json || echo '{}' > results/sbom_counts.json
 
-      # ---------------- REAL OSV ----------------
-      - name: OSV scan (REAL)
+      # =======================
+      # OSV (independent 3rd view)
+      # =======================
+      - name: OSV from SBOM
         run: |
           cd project
-          echo "ok" > results/osv_status.txt    
-          if [ "${{ inputs.language }}" = "Python" ]; then
-            osv-scanner \
-              --lockfile results/python_lock.txt \
-              --format json > results/sbom_osv.json || true
-          else
-            osv-scanner \
-              --maven results/maven-deps.json \
-              --format json > results/sbom_osv.json || true
-          fi
-
-
-
-      
-      # ---------------- REAL MERGE (FIXED) ----------------
-      - name: Merge SBOM counts (REAL, normalized, comparable to SCA)
-        run: |
-          cd project
-          mkdir -p results      
-          # -------- Trivy by severity --------
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") | .VulnID' \
-            results/sca.json > results/trivy_low.txt || touch results/trivy_low.txt    
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") | .VulnID' \
-            results/sca.json > results/trivy_med.txt || touch results/trivy_med.txt      
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") | .VulnID' \
-            results/sca.json > results/trivy_high.txt || touch results/trivy_high.txt      
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | .VulnID' \
-            results/sca.json > results/trivy_crit.txt || touch results/trivy_crit.txt      
-          # -------- OSV mapped via CVSS --------
-          jq -r '
-            .results[].packages[]?
-            | .vulnerabilities[]?
-            | (.severity[]?.score // 0 | tonumber) as $s
-            | if $s < 4 then "LOW"
-              elif $s < 7 then "MEDIUM"
-              elif $s < 9 then "HIGH"
-              else "CRITICAL" end
-            | . + "|" + .id
-          ' results/sbom_osv.json > results/osv_mapped.txt || touch results/osv_mapped.txt      
-          grep '^LOW|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_low.txt || touch results/osv_low.txt
-          grep '^MEDIUM|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_med.txt || touch results/osv_med.txt
-          grep '^HIGH|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_high.txt || touch results/osv_high.txt
-          grep '^CRITICAL|' results/osv_mapped.txt | cut -d'|' -f2 > results/osv_crit.txt || touch results/osv_crit.txt     
-          # -------- TRUE SBOM UNION --------
-          SB_L=$(cat results/trivy_low.txt results/osv_low.txt | sort -u | wc -l)
-          SB_M=$(cat results/trivy_med.txt results/osv_med.txt | sort -u | wc -l)
-          SB_H=$(cat results/trivy_high.txt results/osv_high.txt | sort -u | wc -l)
-          SB_C=$(cat results/trivy_crit.txt results/osv_crit.txt | sort -u | wc -l)  
-          echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
-          echo "generated" > results/sbom_status.txt
-
-
+          osv-scanner \
+            --sbom results/sbom.json \
+            --format json > results/osv.json || true
 
       - name: Set artifact name
         id: set_artifact
         run: |
-          ARTIFACT_NAME=$(echo "${{ matrix.repo }}" | sed 's#[/:]#_#g')_$(date +%s)
-          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
-
+          SAFE_NAME=$(echo "${{ matrix.repo }}" | sed 's#[/:]#_#g')
+          echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
+      
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.set_artifact.outputs.artifact_name }}
+          name: ${{ steps.set_artifact.outputs.name }}
           path: project/results
 
-  # =========================================================
-  # GLOBAL SUMMARY
-  # =========================================================
+
+  # =======================
+  # GLOBAL COMPARISON
+  # =======================
   build_summary:
     needs: scan_repo
     runs-on: ubuntu-latest
@@ -323,59 +163,30 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: all_results
-      - name: Build summary.csv
+
+      - name: Build thesis summary
         run: |
           echo "repo,\
           sca_low,sca_medium,sca_high,sca_critical,\
-          sbom_low,sbom_medium,sbom_high,sbom_critical,\
-          sca_status,trivy_status,osv_status,total" > summary.csv     
-              for d in all_results/*; do
-                R=$(basename "$d")
-                R=${R//_//}    
-                # -------- SCA (Trivy) --------
-                if [ -f "$d/sca_unique.json" ]; then
-                  SCAL=$(jq -r '(.LOW // 0)' "$d/sca_unique.json")
-                  SCAM=$(jq -r '(.MEDIUM // 0)' "$d/sca_unique.json")
-                  SCAH=$(jq -r '(.HIGH // 0)' "$d/sca_unique.json")
-                  SCAC=$(jq -r '(.CRITICAL // 0)' "$d/sca_unique.json")
-                else
-                  SCAL=0; SCAM=0; SCAH=0; SCAC=0
-                fi
-                # -------- SBOM (Trivy + OSV merged) --------
-                if [ -f "$d/sbom_counts.txt" ]; then
-                  IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
-                else
-                  SB_L=0; SB_M=0; SB_H=0; SB_C=0
-                fi      
-                # -------- Status flags --------
-                SCA_STATUS=$(cat "$d/sca_status.txt" 2>/dev/null || echo "unknown")
-                TRIVY_STATUS=$(cat "$d/trivy_status.txt" 2>/dev/null || echo "unknown")
-                OSV_STATUS=$(cat "$d/osv_status.txt" 2>/dev/null || echo "unknown")      
-                TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C))       
-                echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,\
-          $SB_L,$SB_M,$SB_H,$SB_C,\
-          $SCA_STATUS,$TRIVY_STATUS,$OSV_STATUS,$TOTAL" >> summary.csv
-              done
+          sbom_low,sbom_medium,sbom_high,sbom_critical" > summary.csv
+
+          for d in all_results/*; do
+            R=$(basename "$d"); R=${R//_//}
+
+            SCAL=$(jq -r '(.LOW // 0)' "$d/sca_counts.json")
+            SCAM=$(jq -r '(.MEDIUM // 0)' "$d/sca_counts.json")
+            SCAH=$(jq -r '(.HIGH // 0)' "$d/sca_counts.json")
+            SCAC=$(jq -r '(.CRITICAL // 0)' "$d/sca_counts.json")
+
+            SBL=$(jq -r '(.LOW // 0)' "$d/sbom_counts.json")
+            SBM=$(jq -r '(.MEDIUM // 0)' "$d/sbom_counts.json")
+            SBH=$(jq -r '(.HIGH // 0)' "$d/sbom_counts.json")
+            SBC=$(jq -r '(.CRITICAL // 0)' "$d/sbom_counts.json")
+
+            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SBL,$SBM,$SBH,$SBC" >> summary.csv
+          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: security-summary
+          name: thesis-summary
           path: summary.csv
-      - name: Build summary_licenses.csv
-        run: |
-          echo "repo,license_name,count" > summary_licenses.csv
-          for d in all_results/*; do
-            R=$(basename "$d")
-            R=${R//_//}
-            if [ -f "$d/licenses_tmp.json" ]; then
-              jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
-              while IFS=',' read -r license count; do
-                license=$(echo $license | tr -d '"')
-                echo "$R,$license,$count" >> summary_licenses.csv
-              done
-            fi
-          done
-      - uses: actions/upload-artifact@v4
-        with:
-          name: licenses-summary
-          path: summary_licenses.csv
