@@ -229,31 +229,48 @@ jobs:
         
       # ---------------- Merge SBOM counts (UNIQUE CVEs) ----------------
            
+      # ---------------- Merge SBOM counts (WITH CVEs) ----------------
       - name: Merge SBOM counts
         run: |
-          mkdir -p results
-          # -------- Trivy by severity (ALL IDs) --------
+          mkdir -p results   
+          # -------- Trivy by severity (REAL VulnID + CVEs) --------
           jq -r '
             .Results[].Vulnerabilities[]?
             | select(.Severity=="LOW")
             | .VulnID
-          ' results/sbom_vuln.json | sort -u > trivy_low.txt || touch trivy_low.txt
+              + (if (.CVEIDs // [] | length) > 0
+                 then " (" + (.CVEIDs | join(",")) + ")"
+                 else ""
+                end)
+          ' results/sbom_vuln.json | sort -u > trivy_low.txt || touch trivy_low.txt      
           jq -r '
             .Results[].Vulnerabilities[]?
             | select(.Severity=="MEDIUM")
             | .VulnID
-          ' results/sbom_vuln.json | sort -u > trivy_med.txt || touch trivy_med.txt
+              + (if (.CVEIDs // [] | length) > 0
+                 then " (" + (.CVEIDs | join(",")) + ")"
+                 else ""
+                end)
+          ' results/sbom_vuln.json | sort -u > trivy_med.txt || touch trivy_med.txt    
           jq -r '
             .Results[].Vulnerabilities[]?
             | select(.Severity=="HIGH")
             | .VulnID
-          ' results/sbom_vuln.json | sort -u > trivy_high.txt || touch trivy_high.txt
+              + (if (.CVEIDs // [] | length) > 0
+                 then " (" + (.CVEIDs | join(",")) + ")"
+                 else ""
+                end)
+          ' results/sbom_vuln.json | sort -u > trivy_high.txt || touch trivy_high.txt      
           jq -r '
             .Results[].Vulnerabilities[]?
             | select(.Severity=="CRITICAL")
             | .VulnID
-          ' results/sbom_vuln.json | sort -u > trivy_crit.txt || touch trivy_crit.txt
-          # -------- OSV by severity (ALL IDs + CVE aliases) --------
+              + (if (.CVEIDs // [] | length) > 0
+                 then " (" + (.CVEIDs | join(",")) + ")"
+                 else ""
+                end)
+          ' results/sbom_vuln.json | sort -u > trivy_crit.txt || touch trivy_crit.txt     
+          # -------- OSV by severity (already correct) --------
           jq -r '
             .results[].packages[]?
             | .vulnerabilities[]?
@@ -268,23 +285,24 @@ jobs:
                  then " (" + (.aliases[] | select(startswith("CVE-")) | join(",")) + ")"
                  else ""
                  end))
-          ' results/osv-scan.json > osv_mapped.txt || touch osv_mapped.txt
+          ' results/osv-scan.json > osv_mapped.txt || touch osv_mapped.txt    
           grep '^LOW|' osv_mapped.txt | cut -d'|' -f2 | sort -u > osv_low.txt || touch osv_low.txt
           grep '^MEDIUM|' osv_mapped.txt | cut -d'|' -f2 | sort -u > osv_med.txt || touch osv_med.txt
           grep '^HIGH|' osv_mapped.txt | cut -d'|' -f2 | sort -u > osv_high.txt || touch osv_high.txt
-          grep '^CRITICAL|' osv_mapped.txt | cut -d'|' -f2 | sort -u > osv_crit.txt || touch osv_crit.txt
-          # -------- Merge EXACTLY WHAT IS COUNTED --------
+          grep '^CRITICAL|' osv_mapped.txt | cut -d'|' -f2 | sort -u > osv_crit.txt || touch osv_crit.txt    
+          # -------- Merge EXACT vulnerability identifiers --------
           cat trivy_low.txt osv_low.txt | sort -u > results/vulnerability_sbom_low.txt
           cat trivy_med.txt osv_med.txt | sort -u > results/vulnerability_sbom_med.txt
           cat trivy_high.txt osv_high.txt | sort -u > results/vulnerability_sbom_high.txt
-          cat trivy_crit.txt osv_crit.txt | sort -u > results/vulnerability_sbom_crit.txt
-          # -------- Count UNIQUE (matches files exactly) --------
+          cat trivy_crit.txt osv_crit.txt | sort -u > results/vulnerability_sbom_crit.txt     
+          # -------- Count UNIQUE --------
           SB_L=$(wc -l < results/vulnerability_sbom_low.txt)
           SB_M=$(wc -l < results/vulnerability_sbom_med.txt)
           SB_H=$(wc -l < results/vulnerability_sbom_high.txt)
-          SB_C=$(wc -l < results/vulnerability_sbom_crit.txt)
+          SB_C=$(wc -l < results/vulnerability_sbom_crit.txt)     
           echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
+
 
 
 
