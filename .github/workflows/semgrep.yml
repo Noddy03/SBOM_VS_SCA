@@ -53,8 +53,10 @@ jobs:
     needs: fetch_repos
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
+
 
     steps:
       - name: Install tools
@@ -70,29 +72,46 @@ jobs:
 
       - name: Build Java
         if: inputs.language == 'Java'
-        run: cd project && mvn -B -DskipTests package || true
-
-      - name: Build Python
-        if: inputs.language == 'Python'
         run: |
           cd project
+          mvn -B -DskipTests package || true
+      
+     
+
+      - name: Build Python (best effort)
+        if: inputs.language == 'Python'
+        run: |
+          mkdir -p results
+          cd project
           python3 -m venv .venv
-          source .venv/bin/activate
-          pip install -U pip setuptools wheel
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f pyproject.toml ]; then pip install .; fi
-          deactivate
+          source .venv/bin/activate  
+          pip install -U pip setuptools wheel || true    
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt || true
+          fi      
+          if [ -f pyproject.toml ]; then
+            pip install . || true
+          fi      
+          pip freeze > ../results/requirements.lock.txt || true
+          deactivate || true
+
 
       - name: Resolve scan path
         id: resolve
         run: |
           if [ "${{ inputs.language }}" = "Java" ]; then
             JARS=$(find project -name "*.jar")
-            [ -z "$JARS" ] && SCAN_PATH="project" || SCAN_PATH=$(echo "$JARS" | xargs -n1 dirname | sort -u | tr '\n' ' ')
+            if [ -z "$JARS" ]; then
+              SCAN_PATH="project"
+            else
+              SCAN_PATH=$(echo "$JARS" | xargs -n1 dirname | sort -u | tr '\n' ' ')
+            fi
           else
             SCAN_PATH="project"
           fi
           echo "scan_path=$SCAN_PATH" >> $GITHUB_OUTPUT
+
+
 
       # -------- FIXED: no invalid flags ----------
       - name: Trivy SCA
