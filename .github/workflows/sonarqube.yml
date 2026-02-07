@@ -193,7 +193,7 @@ jobs:
 
       
       # ---------------- REAL SBOM + VULNS + LICENSES ----------------
-         - name: Trivy SBOM + vulnerabilities + licenses (correct)
+      - name: Trivy SBOM + vulnerabilities + licenses (correct)
         run: |
           mkdir -p results
           echo "ok" > results/trivy_status.txt     
