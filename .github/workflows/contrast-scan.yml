@@ -123,17 +123,15 @@ jobs:
           set -e
           mkdir -p results
           echo "ok" > results/trivy_status.txt            
+          # 1. Generate SBOM
           trivy fs project \
-            --scanners vuln,license \
-            --detect-unmanaged \
-            --include-dev-deps \
-            --format json \
-            --output results/sbom_vuln.json || true           
-          trivy fs project \
-            --detect-unmanaged \
-            --include-dev-deps \
             --format cyclonedx \
-            --output results/sbom.cdx.json || true
+            --output results/sbom.cdx.json        
+          # 2. Scan the SBOM itself
+          trivy sbom results/sbom.cdx.json \
+            --scanners vuln \
+            --format json \
+            --output results/trivy_sbom_vuln.json
 
       - name: Extract license counts
         run: |
@@ -141,10 +139,7 @@ jobs:
           sort | uniq -c |
           awk '{count=$1; $1=""; sub(/^ /,""); print "\"" $0 "\":" count}' |
           sed '1s/^/{/;$s/$/}/' > results/licenses_tmp.json || touch results/licenses_tmp.json
-      
-     
-    
-        
+            
      # ---------------- Merge SBOM counts (FIXED, REAL SEVERITY) ----------------
       - name: Merge SBOM counts
         run: |
