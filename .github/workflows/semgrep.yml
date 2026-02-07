@@ -93,16 +93,14 @@ jobs:
 
 
 
-      # -------- FIXED: no invalid flags ----------
+      # -------- Trivy SCA ----------
       - name: Trivy SCA
         run: |
           mkdir -p results
           trivy fs project \
-          --scanners vuln \
-          --detect-unmanaged \
-          --include-dev-deps \
-          --format json \
-          --output results/trivy_sca.json || true
+            --scanners vuln \
+            --format json \
+            --output results/trivy_sca.json || true
 
       - name: Deduplicate SCA
         run: |
