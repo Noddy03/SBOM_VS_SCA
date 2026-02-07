@@ -98,9 +98,11 @@ jobs:
         run: |
           mkdir -p results
           trivy fs project \
-            --scanners vuln \
-            --format json \
-            --output results/trivy_sca.json || true
+          --scanners vuln \
+          --detect-unmanaged \
+          --include-dev-deps \
+          --format json \
+          --output results/trivy_sca.json || true
 
       - name: Deduplicate SCA
         run: |
@@ -128,14 +130,16 @@ jobs:
         run: |
           set -e
           mkdir -p results
-          echo "ok" > results/trivy_status.txt        
-          trivy fs project \
-            --scanners vuln,license \
-            --format json \
-            --output results/sbom_vuln.json || true     
+          echo "ok" > results/trivy_status.txt            
+          # 1. Generate SBOM
           trivy fs project \
             --format cyclonedx \
-            --output results/sbom.cdx.json || true
+            --output results/sbom.cdx.json        
+          # 2. Scan the SBOM itself
+          trivy sbom results/sbom.cdx.json \
+            --scanners vuln \
+            --format json \
+            --output results/sbom_vuln.json
 
       - name: Extract license counts
         run: |
