@@ -87,15 +87,29 @@ jobs:
           if [ -f requirements.txt ]; then pip install --no-deps -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install --no-deps . || true; fi
       # -------- FIXED: no invalid flags ----------
-      - name: Trivy SCA
+      - name: Trivy SCA (Java + Python – correct)
         run: |
-          mkdir -p results
-          trivy fs project \
-          --scanners vuln \
-          --detect-unmanaged \
-          --include-dev-deps \
-          --format json \
-          --output results/trivy_sca.json || true
+          mkdir -p results      
+          if [ -f project/pom.xml ]; then
+            echo "Java Maven SCA"
+            trivy pom project/pom.xml \
+              --include-dev-deps \
+              --format json \
+              --output results/trivy_sca.json      
+          elif [ -f project/requirements.txt ] || [ -f project/poetry.lock ]; then
+            echo "Python SCA"
+            trivy pip project \
+              --include-dev-deps \
+              --format json \
+              --output results/trivy_sca.json      
+          else
+            echo "Fallback filesystem scan"
+            trivy fs project \
+              --scanners vuln \
+              --format json \
+              --output results/trivy_sca.json
+          fi
+
 
       - name: Deduplicate SCA
         run: |
