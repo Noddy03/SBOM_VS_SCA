@@ -131,7 +131,7 @@ jobs:
           trivy sbom results/sbom.cdx.json \
             --scanners vuln \
             --format json \
-            --output results/trivy_sbom_vuln.json
+            --output results/sbom_vuln.json
 
       - name: Extract license counts
         run: |
