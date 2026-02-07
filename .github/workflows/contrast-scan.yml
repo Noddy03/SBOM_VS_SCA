@@ -122,14 +122,19 @@ jobs:
         run: |
           set -e
           mkdir -p results
-          echo "ok" > results/trivy_status.txt        
+          echo "ok" > results/trivy_status.txt            
           trivy fs project \
             --scanners vuln,license \
+            --detect-unmanaged \
+            --include-dev-deps \
             --format json \
-            --output results/sbom_vuln.json || true     
+            --output results/sbom_vuln.json || true           
           trivy fs project \
+            --detect-unmanaged \
+            --include-dev-deps \
             --format cyclonedx \
             --output results/sbom.cdx.json || true
+
       - name: Extract license counts
         run: |
           jq -r '.Results[].Licenses[]?.Name' results/sbom_vuln.json |
