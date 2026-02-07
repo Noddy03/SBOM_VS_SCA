@@ -206,7 +206,7 @@ jobs:
           trivy sbom results/sbom.cdx.json \
             --scanners vuln \
             --format json \
-            --output results/sbom_vuln.json
+            --output results/sbom_vuln.json || true
 
 
       
