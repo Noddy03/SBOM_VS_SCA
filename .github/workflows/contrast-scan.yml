@@ -142,10 +142,10 @@ jobs:
         run: |
           mkdir -p results    
           # -------- Trivy IDs by severity --------
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_low.txt || touch trivy_low.txt
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_med.txt || touch trivy_med.txt
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_high.txt || touch trivy_high.txt
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_crit.txt || touch trivy_crit.txt  
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") | .PkgName + ":" + .VulnerabilityID' results/sbom_vuln.json > trivy_low.txt || touch trivy_low.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") | .PkgName + ":" + .VulnerabilityID' results/sbom_vuln.json > trivy_med.txt || touch trivy_med.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") | .PkgName + ":" + .VulnerabilityID' results/sbom_vuln.json > trivy_high.txt || touch trivy_high.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | .PkgName + ":" + .VulnerabilityID' results/sbom_vuln.json > trivy_crit.txt || touch trivy_crit.txt  
           
           # -------- Merge correctly and SAVE to files in results folder --------
           cat trivy_low.txt  | sort -u > results/vulnerability_sbom_low.txt
