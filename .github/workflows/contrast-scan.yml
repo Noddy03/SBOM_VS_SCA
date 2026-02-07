@@ -120,18 +120,27 @@ jobs:
       # ---------------- REAL SBOM + VULNS + LICENSES ----------------
       - name: Trivy SBOM + vulnerabilities + licenses (correct)
         run: |
-          set -e
           mkdir -p results
-          echo "ok" > results/trivy_status.txt            
-          # 1. Generate SBOM
+          echo "ok" > results/trivy_status.txt     
+          # 1. Generate SBOM (safe)
+          set +e
           trivy fs project \
+            --timeout 20m \
             --format cyclonedx \
-            --output results/sbom.cdx.json        
-          # 2. Scan the SBOM itself
+            --output results/sbom.cdx.json
+          EXIT=$?
+          set -e      
+          # Se SBOM fallisce, metti placeholder per non rompere il passo 2
+          if [ $EXIT -ne 0 ]; then
+            echo '{}' > results/sbom.cdx.json
+            echo "failed" > results/trivy_status.txt
+          fi     
+          # 2. Scan the SBOM itself 
           trivy sbom results/sbom.cdx.json \
             --scanners vuln \
             --format json \
             --output results/sbom_vuln.json || true
+
 
       - name: Extract license counts
         run: |
