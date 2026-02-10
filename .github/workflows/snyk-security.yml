@@ -94,7 +94,9 @@ jobs:
             --scanners vuln \
             --format json \
             --output results/trivy_sca.json || true
-            --output results/sbom.cdx_SCA.json
+          trivy fs project \
+            --format cyclonedx \
+            --output results/sbom.cdx_SCA.json || true
       - name: Deduplicate SCA
         run: |
           for sev in LOW MEDIUM HIGH CRITICAL; do
