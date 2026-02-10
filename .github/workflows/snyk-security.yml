@@ -258,10 +258,11 @@ jobs:
             ' "$d/sca_cleaned_Snyk.json" 2>/dev/null >> summary.csv || true
             # -------- SNYK SBOM INVENTORY --------
             jq -r --arg repo "$R" '
-              .components[]? |
+              (.components // .bom.components // [])[]? |
               [$repo,"Snyk","SBOM","NONE","",.name,(.version // "unknown")] |
               @csv
-            ' "$d/sbom_Snyk.cdx.json" 2>/dev/null >> summary.csv || true 
+            ' "$d/sbom_Snyk.cdx.json" 2>/dev/null >> summary.csv || true
+
 
            done
 
