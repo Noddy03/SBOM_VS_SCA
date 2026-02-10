@@ -256,6 +256,13 @@ jobs:
                (.version // "unknown")] |
               @csv
             ' "$d/sca_cleaned_Snyk.json" 2>/dev/null >> summary.csv
+            # -------- SNYK SBOM INVENTORY --------
+          jq -r --arg repo "$R" '
+            .components[]? |
+            [$repo,"Snyk","SBOM","NONE","",.name,(.version // "unknown")] |
+            @csv
+          ' "$d/sbom_Snyk.cdx.json" 2>/dev/null >> summary.csv
+
           done
 
   
