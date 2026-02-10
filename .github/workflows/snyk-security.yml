@@ -141,7 +141,7 @@ jobs:
           trivy fs project \
             --timeout 20m \
             --format cyclonedx \
-            --output results/sbom.cdx.json
+            --output results/sbom_Trivy.cdx.json
           EXIT=$?
           set -e      
           # Se SBOM fallisce, metti placeholder per non rompere il passo 2
@@ -150,7 +150,7 @@ jobs:
             echo "failed" > results/trivy_status.txt
           fi     
           # 2. Scan the SBOM itself 
-          trivy sbom results/sbom.cdx.json \
+          trivy sbom results/sbom_Trivy.cdx.json \
             --scanners vuln \
             --format json \
             --output results/sbom_vuln_Trivy.json || true
@@ -239,13 +239,13 @@ jobs:
               .Results[]?.Vulnerabilities[]? |
               [$repo,"Trivy","SCA",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] |
               @csv
-            ' "$d/trivy_sca.json" 2>/dev/null >> summary.csv      
+            ' "$d/trivy_sca.json" 2>/dev/null >> summary.csv || true      
             # -------- TRIVY SBOM --------
             jq -r --arg repo "$R" '
               .Results[]?.Vulnerabilities[]? |
               [$repo,"Trivy","SBOM",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] |
               @csv
-            ' "$d/sbom_vuln_Trivy.json" 2>/dev/null >> summary.csv   
+            ' "$d/sbom_vuln_Trivy.json" 2>/dev/null >> summary.csv || true   
             # -------- SNYK SCA --------
             jq -r --arg repo "$R" '
               .vulnerabilities[]? |
@@ -255,15 +255,15 @@ jobs:
                (.package // "unknown"),
                (.version // "unknown")] |
               @csv
-            ' "$d/sca_cleaned_Snyk.json" 2>/dev/null >> summary.csv
+            ' "$d/sca_cleaned_Snyk.json" 2>/dev/null >> summary.csv || true
             # -------- SNYK SBOM INVENTORY --------
-          jq -r --arg repo "$R" '
-            .components[]? |
-            [$repo,"Snyk","SBOM","NONE","",.name,(.version // "unknown")] |
-            @csv
-          ' "$d/sbom_Snyk.cdx.json" 2>/dev/null >> summary.csv
+            jq -r --arg repo "$R" '
+              .components[]? |
+              [$repo,"Snyk","SBOM","NONE","",.name,(.version // "unknown")] |
+              @csv
+            ' "$d/sbom_Snyk.cdx.json" 2>/dev/null >> summary.csv || true 
 
-          done
+           done
 
   
       - uses: actions/upload-artifact@v4
