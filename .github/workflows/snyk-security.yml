@@ -154,6 +154,7 @@ jobs:
             --scanners vuln \
             --format json \
             --output results/sbom_vuln_Trivy.json || true
+            
       - name: Extract license counts
         run: |
           jq -r '.Results[].Licenses[]?.Name' results/sbom_vuln_Trivy.json |
