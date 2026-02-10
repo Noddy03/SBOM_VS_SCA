@@ -20,8 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        repo: ${{ inputs.src_repository }}
     steps:
       - name: Install tools
         run: |
@@ -106,7 +104,7 @@ jobs:
             --output results/sbom_vuln_Trivy.json || true
       - name: Extract license counts
         run: |
-          jq -r '.Results[].Licenses[]?.Name' results/sbom_vuln.json |
+          jq -r '.Results[].Licenses[]?.Name' results/sbom_vuln_Trivy.json |
           sort | uniq -c |
           awk '{count=$1; $1=""; sub(/^ /,""); print "\"" $0 "\":" count}' |
           sed '1s/^/{/;$s/$/}/' > results/licenses_tmp.json || touch results/licenses_tmp.json
@@ -153,7 +151,7 @@ jobs:
             --detection-depth=50 \
             --json \
             --skip-unresolved \
-            > results/sca_raw.json
+            > results/sca_raw_Snyk.json
           CODE=$?
           set -e     
           if [ "$CODE" -gt 1 ]; then
@@ -185,7 +183,7 @@ jobs:
           ' results/sca_flat_Snyk.json > results/sca_cleaned_Snyk.json
 
       # ---------------- Snyk SBOM + vulnerabilities + licenses ----------------
-      - name: Snyk SBOM + vulnerabilities + licenses
+      - name: Snyk SBOM  + licenses
         run: |
           mkdir -p results
           echo "ok" > results/snyk_status.txt      
@@ -199,13 +197,7 @@ jobs:
             echo "failed" > results/snyk_status.txt
           fi     
    
-      # ---------------- Extract license counts ----------------
-      - name: Extract license counts
-        run: |
-          jq -r '.dependencies[].licenses[]?' results/sbom_vuln_Snyk.json |
-          sort | uniq -c |
-          awk '{count=$1; $1=""; sub(/^ /,""); print "\"" $0 "\":" count}' |
-          sed '1s/^/{/;$s/$/}/' > results/licenses_tmp_Snyk.json || touch results/licenses_tmp_Snyk.json
+   
                  
       - name: Set artifact name
         id: set_artifact
