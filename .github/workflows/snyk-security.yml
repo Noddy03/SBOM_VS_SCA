@@ -135,7 +135,7 @@ jobs:
       - name: Trivy SBOM + vulnerabilities + licenses (correct)
         run: |
           mkdir -p results
-          echo "ok" > results/trivy_status.txt     
+          echo "ok"     
           # 1. Generate SBOM (safe)
           set +e
           trivy fs project \
@@ -191,7 +191,7 @@ jobs:
       - name: Snyk SBOM  + licenses
         run: |
           mkdir -p results
-          echo "ok" > results/snyk_status.txt      
+          echo "ok"     
           # -------- 1. Generate SBOM --------
           set +e
           snyk sbom --format=cyclonedx1.6-json --output=results/sbom_Snyk.cdx.json
@@ -201,8 +201,6 @@ jobs:
             echo '{}' > results/sbom_Snyk.cdx.json
             echo "failed" > results/snyk_status.txt
           fi     
-   
-   
                  
       - name: Set artifact name
         id: set_artifact
