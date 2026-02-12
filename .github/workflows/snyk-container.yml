@@ -50,6 +50,18 @@ jobs:
           pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install --no-deps -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install --no-deps . || true; fi
+
+      - name: Build artifact (best effort, safe)
+        run: |
+          cd project
+          if [ -f pom.xml ]; then
+            mvn -B -DskipTests \
+                -Ddocker.skip=true \
+                -DskipDocker=true \
+                -Djib.skip=true \
+                -Dfabric8.skip=true \
+                package || true
+          fi
     
       # -------- Trivy SCA ----------
       - name: Trivy SCA
@@ -113,17 +125,7 @@ jobs:
                 })
           }
           ' results/sca_flat_Snyk.json > results/sca_cleaned_Snyk.json
-      - name: Build artifact (best effort, safe)
-        run: |
-          cd project
-          if [ -f pom.xml ]; then
-            mvn -B -DskipTests \
-                -Ddocker.skip=true \
-                -DskipDocker=true \
-                -Djib.skip=true \
-                -Dfabric8.skip=true \
-                package || true
-          fi
+     
       
       # ---------------- REAL SBOM + VULNS + LICENSES ----------------
       - name: Trivy SBOM + vulnerabilities + licenses (correct)
