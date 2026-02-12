@@ -73,12 +73,24 @@ jobs:
             echo '{}' > results/sbom_Trivy.cdx.json
           fi
 
+      - name: Keep only real runtime jars
+        run: |
+          mkdir -p real_binaries
+          find binaries -name "*.jar" \
+            ! -name "*-sources.jar" \
+            ! -name "*-tests.jar" \
+            ! -name "*-javadoc.jar" \
+            -exec cp {} real_binaries/ \;
+
+          echo "Scanning these artifacts:"
+          ls -lh real_binaries
+
 
       # -------- Trivy SCA ----------
       - name: Trivy SCA
         run: |
           mkdir -p results
-          trivy fs binaries \
+          trivy fs real_binaries \
             --scanners vuln \
             --skip-files '**/*sources.jar' \
             --skip-dirs node_modules \
@@ -111,7 +123,7 @@ jobs:
           snyk test \
             --unmanaged \
             --scan-all-unmanaged \
-            binaries \
+            real_binaries \
             --json > results/sca_raw_Snyk.json
           set -e
           # Normalize output (array vs object)
@@ -144,26 +156,34 @@ jobs:
       - name: Trivy SBOM + vulnerabilities + licenses (correct)
         run: |
           mkdir -p results
-          echo "ok"     
-          # 1. Generate SBOM (safe)
-          set +e
-          trivy fs binaries \
-            --format cyclonedx \
-            --scanners vuln \
-            --output results/sbom_Trivy.cdx.json
+          echo "Generating SBOM..."
 
+          # 1. Generate SBOM from real runtime binaries
+          set +e
+          trivy fs real_binaries \
+            --format cyclonedx \
+            --scanners vuln,license \
+            --ignore-unfixed \
+            --output results/sbom_Trivy.cdx.json
           EXIT=$?
           set -e      
-          # Se SBOM fallisce, metti placeholder per non rompere il passo 2
+
+          # If SBOM generation failed, create safe placeholder
           if [ $EXIT -ne 0 ]; then
             echo '{}' > results/sbom_Trivy.cdx.json
             echo "failed" > results/trivy_status.txt
           fi     
-          # 2. Scan the SBOM itself 
-          trivy sbom results/sbom_Trivy.cdx.json \
-            --scanners vuln \
-            --format json \
-            --output results/sbom_vuln_Trivy.json || true
+
+          # 2. Scan the SBOM itself (only if it exists)
+          if [ -s results/sbom_Trivy.cdx.json ]; then
+            trivy sbom results/sbom_Trivy.cdx.json \
+              --scanners vuln \
+              --format json \
+              --output results/sbom_vuln_Trivy.json || true
+          else
+            echo '{"Results":[]}' > results/sbom_vuln_Trivy.json
+          fi
+
             
       - name: Extract license counts
         run: |
@@ -255,14 +275,15 @@ jobs:
             ' "$d/sbom_vuln_Trivy.json" 2>/dev/null >> summary.csv || true   
             # -------- SNYK SCA --------
             jq -r --arg repo "$R" '
-              (.Results // [])[]?.Vulnerabilities[]? |
+              .vulnerabilities[]? |
               [$repo,"Snyk","SCA",
-               (.severity // "unknown" | ascii_upcase),
+               (.severity | ascii_upcase),
                .id,
-               (.package // "unknown"),
-               (.version // "unknown")] |
+               .package,
+               .version] |
               @csv
-            ' "$d/sca_cleaned_Snyk.json" 2>/dev/null >> summary.csv || true
+            ' "$d/sca_cleaned_Snyk.json"
+
             # -------- SNYK SBOM INVENTORY --------
             jq -r --arg repo "$R" '
               (.components // .bom.components // [])[]? |
