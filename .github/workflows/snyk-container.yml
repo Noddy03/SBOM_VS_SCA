@@ -77,13 +77,19 @@ jobs:
             --scanners vuln \
             --format json \
             --output results/trivy_sca.json || true
+            --exit-code 0 || true
       - name: Deduplicate SCA
         run: |
           for sev in LOW MEDIUM HIGH CRITICAL; do
             case $sev in "MEDIUM") s="med";; "CRITICAL") s="crit";; *) s=$(echo $sev | tr '[:upper:]' '[:lower:]');; esac
-            jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID + .PkgID + .InstalledVersion' \
-              results/trivy_sca.json | sort -u > results/deduped_sca_$s.txt || touch results/deduped_sca_$s.txt
+            jq -r --arg sev "$sev" '
+              (.Results // [])[]?.Vulnerabilities[]? 
+              | select(.Severity==$sev) 
+              | .VulnerabilityID + .PkgID + .InstalledVersion
+            ' results/trivy_sca.json \
+            | sort -u > results/deduped_sca_$s.txt || touch results/deduped_sca_$s.txt
           done
+
         # SNYK SCA
       - name: SCA - Snyk (deduplicated, real)
         env:
