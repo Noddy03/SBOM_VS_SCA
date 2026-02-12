@@ -55,12 +55,11 @@ jobs:
         run: |
           cd project
           if [ -f pom.xml ]; then
-            mvn -B -DskipTests \
-                -Ddocker.skip=true \
-                -DskipDocker=true \
-                -Djib.skip=true \
-                -Dfabric8.skip=true \
-                package || true
+           mvn -DskipTests \
+            -Dmaven.javadoc.skip=true \
+            -DskipAssembly=false \
+            -DskipMinify=true \
+            package
           fi
 
       - name: Collect compiled binaries
@@ -75,9 +74,12 @@ jobs:
           mkdir -p results
           trivy fs binaries \
             --scanners vuln \
+            --package-types jar \
+            --skip-files '**/*sources.jar' \
+            --skip-dirs node_modules \
             --format json \
-            --exit-code 0 \
-            --output results/trivy_sca.json || true
+            --output results/trivy_sca.json
+
              
       - name: Deduplicate SCA
         run: |
@@ -99,11 +101,11 @@ jobs:
         run: |
           mkdir -p results
           set +e
-          snyk test binaries \
-            --detection-depth=50 \
-            --json \
-            --skip-unresolved \
-            > results/sca_raw_Snyk.json
+          snyk test \
+            --scan-all-unmanaged \
+            --file=binaries \
+            --detection-depth=5
+            --json > results/sca_raw_Snyk.json
           CODE=$?
           set -e
           # Normalize output (array vs object)
@@ -140,9 +142,10 @@ jobs:
           # 1. Generate SBOM (safe)
           set +e
           trivy fs binaries \
-            --timeout 20m \
             --format cyclonedx \
+            --scanners vuln \
             --output results/sbom_Trivy.cdx.json
+
           EXIT=$?
           set -e      
           # Se SBOM fallisce, metti placeholder per non rompere il passo 2
