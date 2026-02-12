@@ -109,12 +109,10 @@ jobs:
           mkdir -p results
           set +e
           snyk test \
+            --unmanaged \
             --scan-all-unmanaged \
-            --file=binaries \
-            --detection-depth=5 \
-            --json > results/sca_raw_Snyk.json || echo '{}' > results/sca_raw_Snyk.json
-
-          CODE=$?
+            binaries \
+            --json > results/sca_raw_Snyk.json
           set -e
           # Normalize output (array vs object)
           jq '
