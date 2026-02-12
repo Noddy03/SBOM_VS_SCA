@@ -76,8 +76,9 @@ jobs:
           trivy fs binaries \
             --scanners vuln \
             --format json \
+            --exit-code 0 \
             --output results/trivy_sca.json || true
-            --exit-code 0 || true
+             
       - name: Deduplicate SCA
         run: |
           for sev in LOW MEDIUM HIGH CRITICAL; do
@@ -97,16 +98,14 @@ jobs:
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
         run: |
           mkdir -p results
+          set +e
           snyk test binaries \
             --detection-depth=50 \
             --json \
             --skip-unresolved \
             > results/sca_raw_Snyk.json
           CODE=$?
-          set -e     
-          if [ "$CODE" -gt 1 ]; then
-            echo "failed" > results/snyk_status.txt
-          fi      
+          set -e
           # Normalize output (array vs object)
           jq '
             if type=="array"
@@ -148,7 +147,7 @@ jobs:
           set -e      
           # Se SBOM fallisce, metti placeholder per non rompere il passo 2
           if [ $EXIT -ne 0 ]; then
-            echo '{}' > results/sbom.cdx.json
+            echo '{}' > results/sbom_Trivy.cdx.json
             echo "failed" > results/trivy_status.txt
           fi     
           # 2. Scan the SBOM itself 
