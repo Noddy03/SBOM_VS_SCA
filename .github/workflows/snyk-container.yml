@@ -26,8 +26,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-pip golang
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          go install github.com/google/osv-scanner/cmd/osv-scanner@v1.9.0
-          sudo mv ~/go/bin/osv-scanner /usr/local/bin/osv-scanner
           curl -sSL https://static.snyk.io/cli/latest/snyk-linux -o snyk
           chmod +x snyk
           sudo mv snyk /usr/local/bin/snyk
