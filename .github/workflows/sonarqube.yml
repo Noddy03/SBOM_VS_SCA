@@ -90,7 +90,7 @@ jobs:
           # ---- Install OSV-Scanner (prebuilt binary, no Go needed) ----
           OSV_VERSION="1.9.0"
           curl -sSL \
-            https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_${OSV_VERSION}_linux_amd64.tar.gz \
+            https://github.com/google/osv-scanner/releases/download/v1.9.0/osv-scanner_1.9.0_linux_amd64.tar.gz
             -o osv-scanner.tar.gz      
           tar -xzf osv-scanner.tar.gz
           sudo mv osv-scanner /usr/local/bin/
