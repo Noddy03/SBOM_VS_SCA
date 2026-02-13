@@ -104,8 +104,14 @@ jobs:
             --output=../results/sbom_Snyk.cdx.json || echo '{}' > ../results/sbom_Snyk.cdx.json
 
       # ---------------- UPLOAD ----------------
+      - name: Set artifact name
+        id: set_artifact
+        run: |
+              ARTIFACT_NAME=$(echo "${{ inputs.src_repository }}" | sed 's#[/:]#_#g')_$(date +%s)
+              echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+                
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-         name: ${{ inputs.src_repository}}
+         name: ${{ steps.set_artifact.outputs.artifact_name }}
          path: results
