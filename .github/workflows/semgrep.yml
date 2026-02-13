@@ -178,39 +178,74 @@ jobs:
      # ---------------- Merge SBOM counts (FIXED, REAL SEVERITY) ----------------
       - name: Merge SBOM counts
         run: |
-          mkdir -p results    
-          # -------- Trivy IDs by severity --------
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_low.txt || touch trivy_low.txt
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_med.txt || touch trivy_med.txt
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_high.txt || touch trivy_high.txt
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_crit.txt || touch trivy_crit.txt  
-          # -------- OSV mapped to severity via CVSS --------
+          mkdir -p results        
+          # -------- Trivy by severity (REAL VulnID + CVEs) --------
+          jq -r '
+            .Results[].Vulnerabilities[]?
+            | select(.Severity=="LOW")
+            |  .PkgName + ":" + .VulnerabilityID
+              + (if (.CVEIDs // [] | length) > 0
+                 then " (" + (.CVEIDs | join(",")) + ")"
+                 else ""
+                end)
+          ' results/sbom_vuln.json | sort -u > trivy_low.txt || touch trivy_low.txt            
+          jq -r '
+            .Results[].Vulnerabilities[]?
+            | select(.Severity=="MEDIUM")
+            |  .PkgName + ":" + .VulnerabilityID
+              + (if (.CVEIDs // [] | length) > 0
+                 then " (" + (.CVEIDs | join(",")) + ")"
+                 else ""
+                end)
+          ' results/sbom_vuln.json | sort -u > trivy_med.txt || touch trivy_med.txt        
+          jq -r '
+            .Results[].Vulnerabilities[]?
+            | select(.Severity=="HIGH")
+            |  .PkgName + ":" + .VulnerabilityID
+              + (if (.CVEIDs // [] | length) > 0
+                 then " (" + (.CVEIDs | join(",")) + ")"
+                 else ""
+                end)
+          ' results/sbom_vuln.json | sort -u > trivy_high.txt || touch trivy_high.txt            
+          jq -r '
+            .Results[].Vulnerabilities[]?
+            | select(.Severity=="CRITICAL")
+            | .PkgName + ":" + .VulnerabilityID
+              + (if (.CVEIDs // [] | length) > 0
+                 then " (" + (.CVEIDs | join(",")) + ")"
+                 else ""
+                end)
+          ' results/sbom_vuln.json | sort -u > trivy_crit.txt || touch trivy_crit.txt           
+          # -------- OSV by severity (already correct) --------
           jq -r '
             .results[].packages[]?
-            | .package.name as $pkg
             | .vulnerabilities[]?
-            | ( [.severity[]? | select(.type=="CVSS_V3") | .score | tonumber] | max // 0 ) as $s
-            | if $s < 4 then "LOW"
-              elif $s < 7 then "MEDIUM"
-              elif $s < 9 then "HIGH"
-              else "CRITICAL" end
-            | . + "|" + $pkg + ":" + .id
-          ' results/osv-scan.json > osv_mapped.txt || touch osv_mapped.txt
-          mv osv_mapped.txt results/
-          grep '^LOW|' results/osv_mapped.txt | cut -d'|' -f2 > osv_low.txt || touch osv_low.txt
-          grep '^MEDIUM|' results/osv_mapped.txt | cut -d'|' -f2 > osv_med.txt || touch osv_med.txt
-          grep '^HIGH|' results/osv_mapped.txt | cut -d'|' -f2 > osv_high.txt || touch osv_high.txt
-          grep '^CRITICAL|' results/osv_mapped.txt | cut -d'|' -f2 > osv_crit.txt || touch osv_crit.txt
-          # -------- Merge correctly and SAVE to files in results folder --------
+            | (.severity[]?.score // 0 | tonumber) as $s
+            | (if $s < 4 then "LOW"
+               elif $s < 7 then "MEDIUM"
+               elif $s < 9 then "HIGH"
+               else "CRITICAL" end)
+              + "|" +
+              (.id +
+                (if (.aliases // [] | map(select(startswith("CVE-"))) | length) > 0
+                 then " (" + (.aliases[] | select(startswith("CVE-")) | join(",")) + ")"
+                 else ""
+                end))
+          ' results/osv-scan.json > osv_mapped.txt || touch osv_mapped.txt          
+          grep '^LOW|' osv_mapped.txt | cut -d'|' -f2 | sort -u > osv_low.txt || touch osv_low.txt
+          grep '^MEDIUM|' osv_mapped.txt | cut -d'|' -f2 | sort -u > osv_med.txt || touch osv_med.txt
+          grep '^HIGH|' osv_mapped.txt | cut -d'|' -f2 | sort -u > osv_high.txt || touch osv_high.txt
+          grep '^CRITICAL|' osv_mapped.txt | cut -d'|' -f2 | sort -u > osv_crit.txt || touch osv_crit.txt          
+          # -------- Merge EXACT vulnerability identifiers --------
           cat trivy_low.txt osv_low.txt | sort -u > results/vulnerability_sbom_low.txt
           cat trivy_med.txt osv_med.txt | sort -u > results/vulnerability_sbom_med.txt
           cat trivy_high.txt osv_high.txt | sort -u > results/vulnerability_sbom_high.txt
-          cat trivy_crit.txt osv_crit.txt | sort -u > results/vulnerability_sbom_crit.txt
-          # -------- Count the lines from the saved files --------
+          cat trivy_crit.txt osv_crit.txt | sort -u > results/vulnerability_sbom_crit.txt           
+          # -------- Count UNIQUE --------
           SB_L=$(wc -l < results/vulnerability_sbom_low.txt)
           SB_M=$(wc -l < results/vulnerability_sbom_med.txt)
           SB_H=$(wc -l < results/vulnerability_sbom_high.txt)
-          SB_C=$(wc -l < results/vulnerability_sbom_crit.txt)
+          SB_C=$(wc -l < results/vulnerability_sbom_crit.txt)     
           echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
             
