@@ -29,37 +29,48 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ inputs.src_repository }} project
 
-      # ---------------- COMPILE (REALISM) ----------------
+      # 1️⃣ Trivy SCA sul codice sorgente (prima della compilazione)
+      - name: Trivy SCA (source, pre-compile)
+        run: |
+          mkdir -p results
+          trivy fs project \
+            --scanners vuln \
+            --format json \
+            --output results/trivy_sca_source.json || echo '{"Results":[]}' > results/trivy_sca_source.json
+      
+      # 2️⃣ Compila il progetto
       - name: Compile Java (best effort)
         run: |
           cd project
           if [ -f pom.xml ]; then
             mvn -DskipTests package || true
           fi
-
-      # ---------------- TRIVY SCA (SOURCE GRAPH) ----------------
-      - name: Trivy SCA (real Java)
+      
+      # 3️⃣ Trivy SCA sul codice compilato
+      - name: Trivy SCA (compiled, post-compile)
         run: |
-          mkdir -p results
           trivy fs project \
             --scanners vuln \
             --format json \
-            --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
-
-      # ---------------- TRIVY SBOM ----------------
+            --output results/trivy_sca_compiled.json || echo '{"Results":[]}' > results/trivy_sca_compiled.json
+      
+      # 4️⃣ Trivy SBOM (da compilato)
       - name: Trivy SBOM
         run: |
           trivy fs project \
             --format cyclonedx \
             --scanners vuln,license \
             --output results/sbom_Trivy.cdx.json || echo '{}' > results/sbom_Trivy.cdx.json
-
       - name: Trivy SBOM vulnerabilities
         run: |
           trivy sbom results/sbom_Trivy.cdx.json \
             --scanners vuln \
             --format json \
             --output results/sbom_vuln_Trivy.json || echo '{"Results":[]}' > results/sbom_vuln_Trivy.json
+      
+      # 5️⃣ Snyk SCA e SBOM possono rimanere uguali, ma ricordati:
+      # Snyk SCA pre-compile vs post-compile
+      # Snyk SBOM post-compile
 
       # ---------------- SNYK SCA ----------------
       - name: Snyk SCA (real Java)
@@ -102,6 +113,50 @@ jobs:
           cd project
           snyk sbom --format=cyclonedx1.6-json \
             --output=../results/sbom_Snyk.cdx.json || echo '{}' > ../results/sbom_Snyk.cdx.json
+
+      # ---------------- SUMMARY CVE ----------------
+      - name: Generate CVE summary
+        run: |
+          cat << 'EOF' > results/summary.py
+          import json
+          from pathlib import Path      
+          RESULTS_DIR = Path("results")      
+          SCANS = {
+              "trivy_sca_source.json": "Trivy SCA (pre-compile)",
+              "trivy_sca_compiled.json": "Trivy SCA (post-compile)",
+              "sbom_vuln_Trivy.json": "Trivy SBOM",
+              "snyk_sca_source.json": "Snyk SCA (pre-compile)",
+              "sca_cleaned_Snyk.json": "Snyk SCA (post-compile)"
+          }      
+          summary = {}      
+          for file_name, label in SCANS.items():
+              file_path = RESULTS_DIR / file_name
+              if not file_path.exists():
+                  summary[label] = {"count": 0, "cves": []}
+                  continue      
+              with open(file_path, "r") as f:
+                  data = json.load(f)      
+              vulns = []
+              if isinstance(data, dict):
+                  if "Results" in data:
+                      for r in data["Results"]:
+                          vulns += [v.get("VulnerabilityID") or v.get("Id") for v in r.get("Vulnerabilities", [])]
+                  elif "vulnerabilities" in data:
+                      vulns = [v.get("id") for v in data["vulnerabilities"]]
+              elif isinstance(data, list):
+                  for item in data:
+                      vulns += [v.get("id") for v in item.get("vulnerabilities", [])]      
+              unique_vulns = sorted(set(filter(None, vulns)))
+              summary[label] = {"count": len(unique_vulns), "cves": unique_vulns}      
+          print("=== CVE Summary ===\n")
+          for label, info in summary.items():
+              print(f"{label}: {info['count']} CVE")
+              print(", ".join(info["cves"]))
+              print("-" * 50)
+          EOF      
+          python3 results/summary.py > results/summary.txt
+          cat results/summary.txt
+
 
       # ---------------- UPLOAD ----------------
       - name: Set artifact name
