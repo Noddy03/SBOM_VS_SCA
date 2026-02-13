@@ -115,47 +115,48 @@ jobs:
             --output=../results/sbom_Snyk.cdx.json || echo '{}' > ../results/sbom_Snyk.cdx.json
 
       # ---------------- SUMMARY CVE ----------------
-      - name: Generate CVE summary
+      - name: Build detailed summary.csv
         run: |
-          cat << 'EOF' > results/summary.py
-          import json
-          from pathlib import Path      
-          RESULTS_DIR = Path("results")      
-          SCANS = {
-              "trivy_sca_source.json": "Trivy SCA (pre-compile)",
-              "trivy_sca_compiled.json": "Trivy SCA (post-compile)",
-              "sbom_vuln_Trivy.json": "Trivy SBOM",
-              "snyk_sca_source.json": "Snyk SCA (pre-compile)",
-              "sca_cleaned_Snyk.json": "Snyk SCA (post-compile)"
-          }      
-          summary = {}      
-          for file_name, label in SCANS.items():
-              file_path = RESULTS_DIR / file_name
-              if not file_path.exists():
-                  summary[label] = {"count": 0, "cves": []}
-                  continue      
-              with open(file_path, "r") as f:
-                  data = json.load(f)      
-              vulns = []
-              if isinstance(data, dict):
-                  if "Results" in data:
-                      for r in data["Results"]:
-                          vulns += [v.get("VulnerabilityID") or v.get("Id") for v in r.get("Vulnerabilities", [])]
-                  elif "vulnerabilities" in data:
-                      vulns = [v.get("id") for v in data["vulnerabilities"]]
-              elif isinstance(data, list):
-                  for item in data:
-                      vulns += [v.get("id") for v in item.get("vulnerabilities", [])]      
-              unique_vulns = sorted(set(filter(None, vulns)))
-              summary[label] = {"count": len(unique_vulns), "cves": unique_vulns}      
-          print("=== CVE Summary ===\n")
-          for label, info in summary.items():
-              print(f"{label}: {info['count']} CVE")
-              print(", ".join(info["cves"]))
-              print("-" * 50)
-          EOF      
-          python3 results/summary.py > results/summary.txt
-          cat results/summary.txt
+          mkdir -p results
+          echo "repo,tool,mode,severity,cve,package,version" > results/summary.csv    
+          REPO_NAME=$(echo "${{ inputs.src_repository }}" | sed 's#[/:]#_#g')      
+          # -------- TRIVY SCA pre-compile --------
+          jq -r --arg repo "$REPO_NAME" '
+            .Results[]?.Vulnerabilities[]? |
+            [$repo,"Trivy","SCA pre-compile",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] |
+            @csv
+          ' results/trivy_sca_source.json 2>/dev/null >> results/summary.csv || true      
+          # -------- TRIVY SCA post-compile --------
+          jq -r --arg repo "$REPO_NAME" '
+            .Results[]?.Vulnerabilities[]? |
+            [$repo,"Trivy","SCA post-compile",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] |
+            @csv
+          ' results/trivy_sca_compiled.json 2>/dev/null >> results/summary.csv || true      
+          # -------- TRIVY SBOM --------
+          jq -r --arg repo "$REPO_NAME" '
+            .Results[]?.Vulnerabilities[]? |
+            [$repo,"Trivy","SBOM",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] |
+            @csv
+          ' results/sbom_vuln_Trivy.json 2>/dev/null >> results/summary.csv || true      
+          # -------- SNYK SCA post-compile --------
+          jq -r --arg repo "$REPO_NAME" '
+            .vulnerabilities[]? |
+            [$repo,"Snyk","SCA post-compile",
+             (.severity // "unknown" | ascii_upcase),
+             .id,
+             (.package // "unknown"),
+             (.version // "unknown")] |
+            @csv
+          ' results/sca_cleaned_Snyk.json 2>/dev/null >> results/summary.csv || true      
+          # -------- SNYK SBOM --------
+          jq -r --arg repo "$REPO_NAME" '
+            (.components // .bom.components // [])[]? |
+            [$repo,"Snyk","SBOM","NONE","",.name,(.version // "unknown")] |
+            @csv
+          ' results/sbom_Snyk.cdx.json 2>/dev/null >> results/summary.csv || true    
+          cat results/summary.csv
+
+
 
 
       # ---------------- UPLOAD ----------------
