@@ -219,19 +219,22 @@ jobs:
 
       
       # ---------------- REAL OSV ----------------
-      - name: OSV scan (REAL)
+      - name: OSV scan (SBOM)
         run: |
           set -e
           mkdir -p results
           echo "ok" > results/osv_status.txt     
-          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
-          if [ -n "$JARS" ]; then
-            echo "Scanning artifacts"
-            osv-scanner scan $JARS --format json > results/osv-scan.json || true
+          # Only scan if SBOM looks valid
+          if jq -e '.components | length > 0' results/sbom.cdx.json > /dev/null 2>&1; then
+            echo "Scanning SBOM with OSV"
+            osv-scanner scan --sbom results/sbom.cdx.json \
+              --format json > results/osv-scan.json || true
           else
-            echo "Scanning source tree"
-            osv-scanner scan -r project --format json > results/osv-scan.json || true
+            echo "SBOM empty or invalid"
+            echo '{"results":[]}' > results/osv-scan.json
+            echo "failed" > results/osv_status.txt
           fi
+
 
 
 
