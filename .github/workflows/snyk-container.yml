@@ -1,4 +1,4 @@
-name: Security Scan – Trivy & SNYK (COMPILE + REAL JAVA SCA vs SBOM + Injected JAR)
+name: Security Scan – Trivy & SNYK (COMPILED CODE: SCA vs SBOM)
 
 on:
   workflow_dispatch:
@@ -29,68 +29,50 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ inputs.src_repository }} project
 
-      # 1️⃣ Trivy SCA sul codice sorgente (pre-compile)
-      - name: Trivy SCA (source, pre-compile)
-        run: |
-          mkdir -p results
-          trivy fs project --scanners vuln --format json --output results/trivy_sca_source.json || echo '{"Results":[]}' > results/trivy_sca_source.json
-
-      # 2️⃣ Compila il progetto
-      - name: Compile Java (best effort)
+      # 1️⃣ Compile Java project
+      - name: Compile Java
         run: |
           cd project
           if [ -f pom.xml ]; then
             mvn -DskipTests package || true
           fi
 
-      # 3️⃣ Inject JAR vulnerabili nella cartella target/lib
-      - name: Inject vulnerable JAR
+      # 2️⃣ Prepare compiled-only folder for SCA
+      - name: Prepare compiled code folder
         run: |
-          cd project
-          mkdir -p target/lib
-          # Qui puoi scaricare o copiare JAR vulnerabili per simulazione
-          # Esempio: curl -L <URL_JAR> -o target/lib/vuln-lib.jar
-          echo "Simulazione JAR vulnerabile" > target/lib/fake-vuln.jar
+          mkdir -p results/compiled_scan
+          cp -r project/target/* results/compiled_scan/ 2>/dev/null || echo "No compiled files found"
 
-      # 4️⃣ Trivy SCA sul codice compilato + librerie in target/lib
-      - name: Trivy SCA (compiled, post-compile + injected JAR)
+      # 3️⃣ Trivy SCA scan on compiled code
+      - name: Trivy SCA (compiled)
         run: |
-          trivy fs project --scanners vuln --format json --output results/trivy_sca_compiled.json || echo '{"Results":[]}' > results/trivy_sca_compiled.json
+          trivy fs results/compiled_scan --scanners vuln --format json --output results/trivy_sca_compiled.json || echo '{"Results":[]}' > results/trivy_sca_compiled.json
 
-      # 5️⃣ Trivy SBOM (post-compile + injected JAR)
-      - name: Trivy SBOM
+      # 4️⃣ Trivy SBOM scan on compiled code
+      - name: Trivy SBOM (compiled)
         run: |
-          trivy fs project --format cyclonedx --scanners vuln,license --output results/sbom_Trivy.cdx.json || echo '{}' > results/sbom_Trivy.cdx.json
+          trivy fs results/compiled_scan --format cyclonedx --scanners vuln,license --output results/sbom_Trivy.cdx.json || echo '{}' > results/sbom_Trivy.cdx.json
       - name: Trivy SBOM vulnerabilities
         run: |
           trivy sbom results/sbom_Trivy.cdx.json --scanners vuln --format json --output results/sbom_vuln_Trivy.json || echo '{"Results":[]}' > results/sbom_vuln_Trivy.json
 
-      # 6️⃣ Snyk SCA e SBOM (post-compile)
-      - name: Snyk SCA
+      # 5️⃣ Snyk SCA scan on compiled code
+      - name: Snyk SCA (compiled)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          cd project
-          snyk test --json > ../results/sca_raw_Snyk.json || true
-
+          snyk test results/compiled_scan --json > results/sca_raw_Snyk.json || echo '{"vulnerabilities":[]}' > results/sca_raw_Snyk.json
       - name: Normalize Snyk
         run: |
           jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end' results/sca_raw_Snyk.json > results/sca_flat_Snyk.json || echo "[]" > results/sca_flat_Snyk.json
           jq '{vulnerabilities: . | unique_by(.id) | map({id,severity,title,package:.packageName,version,url})}' results/sca_flat_Snyk.json > results/sca_cleaned_Snyk.json
 
-      - name: Snyk SBOM
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+      # 6️⃣ Build summary CSV
+      - name: Build summary.csv
         run: |
-          cd project
-          snyk sbom --format=cyclonedx1.6-json --output=../results/sbom_Snyk.cdx.json || echo '{}' > ../results/sbom_Snyk.cdx.json
+          echo "repo,tool,mode,severity,cve,package,version,cve_count" > results/summary.csv
+          R=$(echo "${{ inputs.src_repository }}" | sed 's#[/:]#_#g')
 
-      # 7️⃣ Generate CSV summary of all CVEs
-      - name: Build detailed summary.csv
-        run: |
-          echo "repo,tool,mode,severity,cve,package,version" > results/summary.csv
-          R=$(echo "${{ inputs.src_repository }}" | sed 's#[/:]#_#g')    
-          # Funzione helper per aggiungere CVE e stampare count
           add_cves() {
             local FILE=$1
             local TOOL=$2
@@ -99,31 +81,27 @@ jobs:
             jq -r --arg repo "$R" --arg tool "$TOOL" --arg mode "$MODE" \
               '.Results[]?.Vulnerabilities[]? | [$repo,$tool,$mode,.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] | @csv' "$FILE" 2>/dev/null >> results/summary.csv || true
             echo "$TOOL $MODE CVE count: $COUNT"
-          }      
-          # Trivy SCA pre-compile
-          add_cves results/trivy_sca_source.json "Trivy" "SCA pre-compile"
-          # Trivy SCA post-compile
-          add_cves results/trivy_sca_compiled.json "Trivy" "SCA post-compile"
-          # Trivy SBOM
-          add_cves results/sbom_vuln_Trivy.json "Trivy" "SBOM"      
-          # Snyk SCA
+          }
+
+          # Trivy SCA compiled
+          add_cves results/trivy_sca_compiled.json "Trivy" "SCA compiled"
+
+          # Trivy SBOM compiled
+          add_cves results/sbom_vuln_Trivy.json "Trivy" "SBOM compiled"
+
+          # Snyk SCA compiled
           COUNT=$(jq '[.vulnerabilities[]?] | length' results/sca_cleaned_Snyk.json 2>/dev/null || echo 0)
-          jq -r --arg repo "$R" '.vulnerabilities[]? | [$repo,"Snyk","SCA",(.severity // "unknown" | ascii_upcase),.id,(.package // "unknown"),(.version // "unknown")] | @csv' results/sca_cleaned_Snyk.json >> results/summary.csv
-          echo "Snyk SCA CVE count: $COUNT"      
-          # Snyk SBOM components (inventario, count può essere zero CVE)
-          COUNT=$(jq '(.components // .bom.components // []) | length' results/sbom_Snyk.cdx.json 2>/dev/null || echo 0)
-          jq -r --arg repo "$R" '(.components // .bom.components // [])[]? | [$repo,"Snyk","SBOM","NONE","",.name,(.version // "unknown")] | @csv' results/sbom_Snyk.cdx.json >> results/summary.csv
-          echo "Snyk SBOM component count: $COUNT"      
+          jq -r --arg repo "$R" '.vulnerabilities[]? | [$repo,"Snyk","SCA compiled",(.severity // "unknown" | ascii_upcase),.id,(.package // "unknown"),(.version // "unknown"),1] | @csv' results/sca_cleaned_Snyk.json >> results/summary.csv
+          echo "Snyk SCA compiled CVE count: $COUNT"
+
           cat results/summary.csv
 
-
-      # 8️⃣ Upload results
+      # 7️⃣ Upload results
       - name: Set artifact name
         id: set_artifact
         run: |
           ARTIFACT_NAME=$(echo "${{ inputs.src_repository }}" | sed 's#[/:]#_#g')_$(date +%s)
           echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
-
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
