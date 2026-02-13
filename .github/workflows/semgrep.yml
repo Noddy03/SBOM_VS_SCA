@@ -64,8 +64,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-pip golang
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          go install github.com/google/osv-scanner/cmd/osv-scanner@v1.9.0
-          sudo mv ~/go/bin/osv-scanner /usr/local/bin/osv-scanner
+          docker pull ghcr.io/google/osv-scanner:v2.3.1
 
           
 
@@ -159,14 +158,16 @@ jobs:
       # ---------------- REAL OSV ----------------
       - name: OSV scan (SBOM)
         run: |
-          set -e
           mkdir -p results
           echo "ok" > results/osv_status.txt     
           # Only scan if SBOM looks valid
           if jq -e '.components | length > 0' results/sbom.cdx.json > /dev/null 2>&1; then
-            echo "Scanning SBOM with OSV"
-            osv-scanner scan --sbom results/sbom.cdx.json \
-              --format json > results/osv-scan.json || true
+            echo "Scanning SBOM with OSV (Docker)"
+            docker run --rm \
+              -v "$PWD/results":/results \
+              -v "$PWD/project":/src \
+              ghcr.io/google/osv-scanner:v2.3.1 \
+              scan --sbom /results/sbom.cdx.json --format json > results/osv-scan.json || true
           else
             echo "SBOM empty or invalid"
             echo '{"results":[]}' > results/osv-scan.json
