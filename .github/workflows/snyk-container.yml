@@ -89,7 +89,7 @@ jobs:
       - name: Build detailed summary.csv
         run: |
           echo "repo,tool,mode,severity,cve,package,version" > results/summary.csv
-          R=$(echo "${{ inputs.src_repository }}" | sed 's#[/:]#_#g'    
+          R=$(echo "${{ inputs.src_repository }}" | sed 's#[/:]#_#g')    
           # Funzione helper per aggiungere CVE e stampare count
           add_cves() {
             local FILE=$1
