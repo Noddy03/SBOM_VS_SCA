@@ -89,18 +89,33 @@ jobs:
       - name: Build detailed summary.csv
         run: |
           echo "repo,tool,mode,severity,cve,package,version" > results/summary.csv
-          R=$(echo "${{ inputs.src_repository }}" | sed 's#[/:]#_#g')
+          R=$(echo "${{ inputs.src_repository }}" | sed 's#[/:]#_#g'    
+          # Funzione helper per aggiungere CVE e stampare count
+          add_cves() {
+            local FILE=$1
+            local TOOL=$2
+            local MODE=$3
+            local COUNT=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$FILE" 2>/dev/null || echo 0)
+            jq -r --arg repo "$R" --arg tool "$TOOL" --arg mode "$MODE" \
+              '.Results[]?.Vulnerabilities[]? | [$repo,$tool,$mode,.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] | @csv' "$FILE" 2>/dev/null >> results/summary.csv || true
+            echo "$TOOL $MODE CVE count: $COUNT"
+          }      
           # Trivy SCA pre-compile
-          jq -r --arg repo "$R" '.Results[]?.Vulnerabilities[]? | [$repo,"Trivy","SCA pre-compile",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] | @csv' results/trivy_sca_source.json 2>/dev/null >> results/summary.csv || true
+          add_cves results/trivy_sca_source.json "Trivy" "SCA pre-compile"
           # Trivy SCA post-compile
-          jq -r --arg repo "$R" '.Results[]?.Vulnerabilities[]? | [$repo,"Trivy","SCA post-compile",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] | @csv' results/trivy_sca_compiled.json 2>/dev/null >> results/summary.csv || true
+          add_cves results/trivy_sca_compiled.json "Trivy" "SCA post-compile"
           # Trivy SBOM
-          jq -r --arg repo "$R" '.Results[]?.Vulnerabilities[]? | [$repo,"Trivy","SBOM",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] | @csv' results/sbom_vuln_Trivy.json 2>/dev/null >> results/summary.csv || true
+          add_cves results/sbom_vuln_Trivy.json "Trivy" "SBOM"      
           # Snyk SCA
-          jq -r --arg repo "$R" '.vulnerabilities[]? | [$repo,"Snyk","SCA",(.severity // "unknown" | ascii_upcase),.id,(.package // "unknown"),(.version // "unknown")] | @csv' results/sca_cleaned_Snyk.json 2>/dev/null >> results/summary.csv || true
-          # Snyk SBOM components (inventario)
-          jq -r --arg repo "$R" '(.components // .bom.components // [])[]? | [$repo,"Snyk","SBOM","NONE","",.name,(.version // "unknown")] | @csv' results/sbom_Snyk.cdx.json 2>/dev/null >> results/summary.csv || true
+          COUNT=$(jq '[.vulnerabilities[]?] | length' results/sca_cleaned_Snyk.json 2>/dev/null || echo 0)
+          jq -r --arg repo "$R" '.vulnerabilities[]? | [$repo,"Snyk","SCA",(.severity // "unknown" | ascii_upcase),.id,(.package // "unknown"),(.version // "unknown")] | @csv' results/sca_cleaned_Snyk.json >> results/summary.csv
+          echo "Snyk SCA CVE count: $COUNT"      
+          # Snyk SBOM components (inventario, count può essere zero CVE)
+          COUNT=$(jq '(.components // .bom.components // []) | length' results/sbom_Snyk.cdx.json 2>/dev/null || echo 0)
+          jq -r --arg repo "$R" '(.components // .bom.components // [])[]? | [$repo,"Snyk","SBOM","NONE","",.name,(.version // "unknown")] | @csv' results/sbom_Snyk.cdx.json >> results/summary.csv
+          echo "Snyk SBOM component count: $COUNT"      
           cat results/summary.csv
+
 
       # 8️⃣ Upload results
       - name: Set artifact name
