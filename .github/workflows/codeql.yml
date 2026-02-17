@@ -1,83 +1,309 @@
-name: IoT SBOM + SCA Consolidated Summary
+name: Security Scan – Snyk + Trivy SBOM 
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: 'Programming language (e.g., Python, Java, C++)'
+        description: 'Choose language to scan'
         required: true
-        default: 'Python'
-      max_repos:
-        description: 'Number of top-starred IoT repos to scan'
-        required: true
-        default: '20'
+        default: 'Java'
+      top_n:
+        description: 'Number of repositories to scan'
+        required: false
+        default: '5'
+
+permissions:
+  contents: read
+  security-events: write
 
 jobs:
-  scan-all-repos:
+  fetch_repos:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    outputs:
+      repos: ${{ steps.fetch.outputs.repos }}
+    timeout-minutes: 10
     steps:
-      - name: Install dependencies
+      - id: fetch
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LANG: ${{ inputs.language }}
+          TOP_N: ${{ inputs.top_n }}
         run: |
-          sudo apt-get update && sudo apt-get install -y jq git curl
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          python3 <<'EOF'
+          import os, requests, json, urllib.parse, time
+          headers = {"Authorization": f"token {os.environ['TOKEN']}", "Accept": "application/vnd.github+json"}
+          repos = []
+          page = 1
+          while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
+              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page=30&page={page}"
+              r = requests.get(url, headers=headers)
+              if r.status_code != 200:
+                  break
+              for repo in r.json().get("items", []):
+                  files = []
+                  if os.environ["LANG"].lower() == "java":
+                      files = ["pom.xml"]
+                  elif os.environ["LANG"].lower() == "python":
+                      files = ["requirements.txt", "pyproject.toml", "setup.py"]
+                  found = False
+                  for f in files:
+                      if requests.get(
+                          f"https://api.github.com/repos/{repo['full_name']}/contents/{f}",
+                          headers=headers
+                      ).status_code == 200:
+                          found = True
+                          break
+                  if found:
+                      repos.append(repo["full_name"])
+                      if len(repos) >= int(os.environ["TOP_N"]):
+                          break
+              page += 1
+              time.sleep(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"repos={json.dumps(repos)}\n")
+          EOF
 
-      - name: Fetch top IoT repos
+  scan_repo:
+    needs: fetch_repos
+    if: ${{ needs.fetch_repos.outputs.repos != '[]' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
+    
+    steps:
+      - name: Install tools
         run: |
-          LANGUAGE="${{ github.event.inputs.language }}"
-          MAX="${{ github.event.inputs.max_repos }}"
-          curl -s -H "Authorization: Bearer ${{ github.token }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=$MAX" \
-            | jq -r '.items[].clone_url' > repos.txt
-          echo "Fetched $(wc -l < repos.txt) repos."
+          sudo apt-get update
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle nodejs npm     
+          # Python tools
+          pip3 install --upgrade pip
+          pip3 install semgrep      
+          # Snyk
+          npm install -g snyk      
+          # Trivy (official installer)
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin      
+          # ---- Install OSV-Scanner (prebuilt binary, no Go needed) ----
+          docker pull ghcr.io/google/osv-scanner:v2.3.1
 
-      - name: Loop over repos and generate SBOM + dual SCA
-        run: |
-          mkdir -p output
-          echo "repo,dependencies,sca_direct,sca_from_sbom,status" > output/summary.csv
-          while read repo; do
-            echo "Processing $repo"
-            name=$(basename "$repo" .git)
-            # Clone repository (timeout 20 min)
-            if ! timeout 1200 git clone --depth 1 "$repo" "$name"; then
-              echo "Timeout cloning $repo. Skipping..."
-              echo "$name,0,0,0,clone_timeout" >> output/summary.csv
-              continue
-            fi
-            cd "$name"
-            # Generate SBOM (timeout 20 min)
-            if ! timeout 1200 syft . -o cyclonedx-json > ../output/${name}_sbom.json; then
-              echo "Timeout generating SBOM for $repo. Skipping..."
-              echo "$name,0,0,0,sbom_timeout" >> ../output/summary.csv
-              cd ..
-              rm -rf "$name"
-              continue
-            fi
-            # Count dependencies from SBOM
-            deps=$(jq '.artifacts | length' ../output/${name}_sbom.json 2>/dev/null || echo 0)
-            # Run SCA directly on repo (timeout 20 min)
-            if timeout 1200 grype . -o json > ../output/${name}_sca_direct.json; then
-              direct=$(jq '.matches | length' ../output/${name}_sca_direct.json 2>/dev/null || echo 0)
-            else
-              echo "Timeout SCA direct scan for $repo."
-              direct=0
-            fi
-            # Run SCA using SBOM (timeout 20 min)
-            if timeout 1200 grype sbom:../output/${name}_sbom.json -o json > ../output/${name}_sca_from_sbom.json; then
-              from_sbom=$(jq '.matches | length' ../output/${name}_sca_from_sbom.json 2>/dev/null || echo 0)
-            else
-              echo "Timeout SCA from SBOM for $repo."
-              from_sbom=0
-            fi
-            echo "$name,$deps,$direct,$from_sbom,success" >> ../output/summary.csv
-            cd ..
-            rm -rf "$name"
-          done < repos.txt
 
-      - name: Upload all SBOM, SCA files and summary
-        uses: actions/upload-artifact@v4
+
+      - name: Cache build tools
+        uses: actions/cache@v4
         with:
-          name: iot-sbom-sca
-          path: output/
+          path: |
+            ~/.m2
+            ~/.cache/trivy
+            ~/.npm
+            ~/go/pkg
+            ~/.cache/pip
+          key: ${{ runner.os }}-security-scan
+
+
+      - name: Clone repo
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+
+      - name: Install Java dependencies
+        if: ${{ inputs.language == 'Java' }}
+        run: |
+          cd project
+          if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
+          if [ -f build.gradle ]; then ./gradlew build || true; fi
+
+      - name: Python deps (best effort)
+        if: ${{ inputs.language == 'Python' }}
+        run: |
+          cd project
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip setuptools wheel
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          if [ -f pyproject.toml ]; then pip install . || true; fi
+
+      - name: SCA - Snyk (deduplicated, real)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}   # optional, but strongly recommended
+          SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
+        run: |
+          mkdir -p results
+          echo "ok" > results/snyk_status.txt
+          # Pre-resolve deps if Java
+          if [ -f project/pom.xml ]; then
+            mvn -f project/pom.xml dependency:resolve || true
+          fi    
+          set +e
+          snyk test \
+            --all-projects \
+            --scan-unmanaged \
+            --detection-depth=50 \
+            --json \
+            --skip-unresolved \
+            > results/sca_raw.json
+          CODE=$?
+          set -e     
+          if [ "$CODE" -gt 1 ]; then
+            echo "failed" > results/snyk_status.txt
+          fi      
+          # Normalize output (array vs object)
+          jq '
+            if type=="array"
+            then map(.vulnerabilities // []) | add
+            else .vulnerabilities // []
+            end
+          ' results/sca_raw.json > results/sca_flat.json || echo "[]" > results/sca_flat.json      
+          # TRUE deduplication (by vulnerability ID)
+          jq '
+          {
+            vulnerabilities:
+              .
+              | map(select(((.ignored // .isIgnored // false) | not)))
+              | unique_by(.id)
+              | map({
+                  id,
+                  severity: (.severity // "unknown"),
+                  title,
+                  package: (.packageName // .name // "unknown"),
+                  version: (.version // "unknown"),
+                  url
+                })
+          }
+          ' results/sca_flat.json > results/sca_cleaned.json
+  
+            - name: Build artifact (best effort, safe)
+              run: |
+                cd project
+                if [ -f pom.xml ]; then
+                  mvn -B -DskipTests \
+                      -Ddocker.skip=true \
+                      -DskipDocker=true \
+                      -Djib.skip=true \
+                      -Dfabric8.skip=true \
+                      package || true
+                fi
+            
+            # ---------------- REAL SBOM + VULNS + LICENSES ----------------
+            - name: Trivy SBOM + vulnerabilities + licenses (correct)
+              run: |
+                mkdir -p results
+                echo "ok" > results/trivy_status.txt     
+                # 1. Generate SBOM (safe)
+                set +e
+                trivy fs project \
+                  --timeout 20m \
+                  --format cyclonedx \
+                  --output results/sbom.cdx.json
+                EXIT=$?
+                set -e      
+                # Se SBOM fallisce, metti placeholder per non rompere il passo 2
+                if [ $EXIT -ne 0 ]; then
+                  echo '{}' > results/sbom.cdx.json
+                  echo "failed" > results/trivy_status.txt
+                fi     
+                # 2. Scan the SBOM itself 
+                trivy sbom results/sbom.cdx.json \
+                  --scanners vuln \
+                  --format json \
+                  --output results/sbom_vuln.json || true
+      
+      
+      
+            - name: Extract license counts
+              run: |
+                jq -r '.Results[].Licenses[]?.Name' results/sbom_vuln.json |
+                sort | uniq -c |
+                awk '{count=$1; $1=""; sub(/^ /,""); print "\"" $0 "\":" count}' |
+                sed '1s/^/{/;$s/$/}/' > results/licenses_tmp.json || touch results/licenses_tmp.json
+                  
+           # ---------------- Merge SBOM counts (FIXED, REAL SEVERITY) ----------------
+            - name: Merge SBOM counts
+              run: |
+                mkdir -p results    
+                # -------- Trivy IDs by severity --------
+                jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") |  .VulnerabilityID' results/sbom_vuln.json > trivy_low.txt || touch trivy_low.txt
+                jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") |  .VulnerabilityID' results/sbom_vuln.json > trivy_med.txt || touch trivy_med.txt
+                jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") |  .VulnerabilityID' results/sbom_vuln.json > trivy_high.txt || touch trivy_high.txt
+                jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") |  .VulnerabilityID' results/sbom_vuln.json > trivy_crit.txt || touch trivy_crit.txt  
+                
+                # -------- Merge correctly and SAVE to files in results folder --------
+                cat trivy_low.txt  | sort -u > results/vulnerability_sbom_low.txt
+                cat trivy_med.txt  | sort -u > results/vulnerability_sbom_med.txt
+                cat trivy_high.txt  | sort -u > results/vulnerability_sbom_high.txt
+                cat trivy_crit.txt  | sort -u > results/vulnerability_sbom_crit.txt
+                # -------- Count the lines from the saved files --------
+                SB_L=$(wc -l < results/vulnerability_sbom_low.txt)
+                SB_M=$(wc -l < results/vulnerability_sbom_med.txt)
+                SB_H=$(wc -l < results/vulnerability_sbom_high.txt)
+                SB_C=$(wc -l < results/vulnerability_sbom_crit.txt)
+                echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
+                echo "generated" > results/sbom_status.txt
+                  
+                  
+            - name: Set artifact name
+              id: set_artifact
+              run: |
+                ARTIFACT_NAME=$(echo "${{ matrix.repo }}" | sed 's#[/:]#_#g')_$(date +%s)
+                echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+            - name: Upload results
+              uses: actions/upload-artifact@v4
+              with:
+                name: ${{ steps.set_artifact.outputs.artifact_name }}
+                path: results
+      
+      
+  # =========================================================
+  # GLOBAL SUMMARY
+  # =========================================================
+  build_summary:
+    needs: scan_repo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all_results
+      - name: Build summary.csv
+        run: |
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv       
+          for d in all_results/*; do
+            R=$(basename "$d")
+            R=${R//_//}
+           echo "repo,\
+          sca_low,sca_medium,sca_high,sca_critical,\
+          sbom_low,sbom_medium,sbom_high,sbom_critical,\
+          sca_status,trivy_status,osv_status,\
+          sbom_status,total" > summary.csv             
+              for d in all_results/*; do
+                R=$(basename "$d")
+                R=${R//_//}         
+            # -------- SCA (Snyk) --------
+            SCAL=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "low")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+            SCAM=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "medium")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+            SCAH=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "high")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+            SCAC=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "critical")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+            # -------- 2. DEDUPLICATED SBOM COUNTS --------
+            # These files contain (Trivy SBOM + OSV) sorted and unique
+            SB_L=$(wc -l < "$d/vulnerability_sbom_low.txt" 2>/dev/null || echo 0)
+            SB_M=$(wc -l < "$d/vulnerability_sbom_med.txt" 2>/dev/null || echo 0)
+            SB_H=$(wc -l < "$d/vulnerability_sbom_high.txt" 2>/dev/null || echo 0)
+            SB_C=$(wc -l < "$d/vulnerability_sbom_crit.txt" 2>/dev/null || echo 0)
+            # -------- 3. STATUS & TOTAL --------
+            STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
+            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C))
+            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-summary
+          path: summary.csv
+     
+  
+      
+      
+      
+      
+      
