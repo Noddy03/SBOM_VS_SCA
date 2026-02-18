@@ -167,7 +167,7 @@ jobs:
               -v "$PWD/results":/results \
               -v "$PWD/project":/src \
               ghcr.io/google/osv-scanner:v2.3.1 \
-              scan --sbom /results/sbom.cdx.json --format json > results/osv-scan.json || true
+              scan -L /results/sbom.cdx.json --format json > results/osv-scan.json || true
           else
             echo "SBOM empty or invalid"
             echo '{"results":[]}' > results/osv-scan.json
