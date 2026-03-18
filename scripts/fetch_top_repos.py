@@ -2,7 +2,6 @@ import requests
 import json
 import os
 
-# Puoi specificare il linguaggio
 LANGUAGE = os.getenv("LANGUAGE", "C++")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
@@ -18,9 +17,9 @@ if response.status_code != 200:
 data = response.json()
 repos = [repo["full_name"] for repo in data["items"]]
 
-# Salva l'elenco in un file per usarlo nel workflow
+
 os.makedirs("output", exist_ok=True)
 with open("output/top_repos.json", "w") as f:
     json.dump(repos, f, indent=2)
 
-print(f"✅ Saved {len(repos)} repositories to output/top_repos.json")
+print(f" Saved {len(repos)} repositories to output/top_repos.json")
